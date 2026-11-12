@@ -902,22 +902,32 @@ void AiSystem::update(float dt) {
 }
 
 
-// ---- route planning. The original's MOVETO asks a pathfinder for waypoints (FUN_100bf300, state at +200); its
-// search isn't decoded, so this is the port's own: an A* over 6 m cells round the straight line, with steep steps,
-// solid objects and lava (heavily penalised) as the obstacles, then string-pulled to a few waypoints.
+// ---- route planning: the original's MOVETO pathfinder (FUN_100bf020 → FUN_100c3190 search, FUN_100c26a0 expand,
+// FUN_100c2520 walkability, FUN_100c3530 straight-line test), as decoded:
+//  * a 4 m grid (DAT_102689d0) with 8 neighbours; a step costs its squared length (16, diagonals 32) plus the squared
+//    height change (under water, (depth + 1) × the step's cost is added for callers that ask for it);
+//  * f = g + the squared straight-line distance to the goal; nodes are expanded best-f first, at most 2048 of them
+//    (128 a frame in the original); a node within the goal radius (3 m) ends the search, otherwise the path runs
+//    to the best node found (a partial path, result 3);
+//  * a node is blocked by a solid object (the occupancy grid's flags) or by ground steeper than the slope limit.
+//    MOVETO asks with flags 0x38 (FUN_100373c0): no water-depth limit and no water penalty (those are for other
+//    callers), nodes raised to the water surface;
+//  * the path is then shortened by straight-line tests in 2 m steps.
+// The port's occupancy test is Scene::collide; the slope limit (the request's +0xa4) isn't traced, ~42° is used.
 namespace {
-constexpr float kCell = 6.f;
+constexpr float kCell = 4.f;
+constexpr float kMaxRise = 0.9f;   // rise per metre (≈42°)
 }
 bool AiSystem::lineBlocked(const Vec3& from, const Vec3& to, int self) const {
     Vec3 d = flat(to) - flat(from);
     float len = length(d);
     if (len < 1.f) return false;
-    int n = int(len / 4.f) + 1;
+    int n = int(len / 2.f) + 1;   // FUN_100c3530: 2 m steps
     float hPrev = scene_->groundHeight(from.x, from.z);
     for (int i = 1; i <= n; ++i) {
         Vec3 p = from + d * (float(i) / float(n));
         float h = scene_->groundHeight(p.x, p.z);
-        if (std::fabs(h - hPrev) > 0.9f * (len / float(n))) return true;  // steeper than ~42°
+        if (std::fabs(h - hPrev) > kMaxRise * (len / float(n))) return true;
         hPrev = h;
         Vec3 q(p.x, h, p.z);
         if (scene_->collide(q, 2.5f, 8.f, self)) return true;
@@ -929,67 +939,78 @@ bool AiSystem::lineBlocked(const Vec3& from, const Vec3& to, int self) const {
 bool AiSystem::planRoute(const Vec3& from, const Vec3& to, int self, std::vector<Vec3>& out) const {
     out.clear();
     float x0 = std::min(from.x, to.x) - 96.f, z0 = std::min(from.z, to.z) - 96.f;
-    int W = std::min(160, int((std::max(from.x, to.x) + 96.f - x0) / kCell) + 1);
-    int H = std::min(160, int((std::max(from.z, to.z) + 96.f - z0) / kCell) + 1);
+    int W = std::min(256, int((std::max(from.x, to.x) + 96.f - x0) / kCell) + 1);
+    int H = std::min(256, int((std::max(from.z, to.z) + 96.f - z0) / kCell) + 1);
     auto cellOf = [&](const Vec3& p, int& cx, int& cz) {
         cx = std::clamp(int((p.x - x0) / kCell), 0, W - 1), cz = std::clamp(int((p.z - z0) / kCell), 0, H - 1);
     };
     int sx, sz, gx, gz;
     cellOf(from, sx, sz), cellOf(to, gx, gz);
-    // per cell: -1 unknown, 0 free, 1 solid, 2 lava; heights cached
-    std::vector<signed char> kind(size_t(W) * H, -1);
+    std::vector<signed char> kind(size_t(W) * H, -1);  // -1 unknown, 0 free, 1 blocked, 2 lava
     std::vector<float> hgt(size_t(W) * H, 0.f);
+    float water = scene_->mission().hasWater ? scene_->waterLevel() : -1e9f;
     auto centre = [&](int cx, int cz) { return Vec3(x0 + (cx + 0.5f) * kCell, 0, z0 + (cz + 0.5f) * kCell); };
     auto classify = [&](int cx, int cz) {
         size_t i = size_t(cz) * W + cx;
         if (kind[i] < 0) {
             Vec3 c = centre(cx, cz);
             float h = scene_->groundHeight(c.x, c.z);
-            hgt[i] = h;
+            hgt[i] = std::max(h, water);  // request flag 0x20 (+0x3b): nodes sit on the water surface
             Vec3 q(c.x, h, c.z);
             const Surface* s = scene_->surfaceAt(c.x, c.z);
             kind[i] = scene_->collide(q, 2.5f, 8.f, self) ? 1 : (s && s->damage > 0) ? 2 : 0;
         }
         return kind[i];
     };
+    Vec3 goalP(to.x, scene_->groundHeight(to.x, to.z), to.z);
+    auto hcost = [&](int cx, int cz, float h) {  // squared distance to the goal
+        Vec3 c = centre(cx, cz);
+        float dx = c.x - goalP.x, dy = h - goalP.y, dz = c.z - goalP.z;
+        return dx * dx + dy * dy + dz * dz;
+    };
     std::vector<float> g(size_t(W) * H, 1e30f);
     std::vector<int> parent(size_t(W) * H, -1);
+    std::vector<char> closed(size_t(W) * H, 0);
     using QE = std::pair<float, int>;
     std::priority_queue<QE, std::vector<QE>, std::greater<QE>> open;
-    int start = sz * W + sx, goal = gz * W + gx;
+    int start = sz * W + sx;
     classify(sx, sz);
     g[start] = 0;
-    open.push({0.f, start});
+    open.push({hcost(sx, sz, hgt[start]), start});
     int expanded = 0, best = start;
-    float bestH = 1e30f;
-    while (!open.empty() && expanded < 6000) {
+    float bestF = 1e30f;
+    bool reached = false;
+    while (!open.empty() && expanded < 2048) {
         auto [f, cur] = open.top();
         open.pop();
+        if (closed[cur]) continue;
+        closed[cur] = 1;
         int cx = cur % W, cz = cur / W;
-        float hc = float(std::hypot(gx - cx, gz - cz));
-        if (hc < bestH) bestH = hc, best = cur;
-        if (cur == goal) break;
-        if (f > g[cur] + hc * 1.0001f + 1e-3f) continue;  // stale
+        float hc = hcost(cx, cz, hgt[cur]);
+        if (hc <= 9.f || (cx == gx && cz == gz)) { best = cur, reached = true; break; }  // within 3 m
+        if (f < bestF) bestF = f, best = cur;
         ++expanded;
         for (int dz = -1; dz <= 1; ++dz)
             for (int dx = -1; dx <= 1; ++dx) {
                 if (!dx && !dz) continue;
                 int nx = cx + dx, nz = cz + dz;
                 if (nx < 0 || nz < 0 || nx >= W || nz >= H) continue;
-                int k = classify(nx, nz);
-                if (k == 1 && !(nx == gx && nz == gz)) continue;
-                float step = (dx && dz) ? 1.4142f : 1.f;
-                if (std::fabs(hgt[size_t(nz) * W + nx] - hgt[size_t(cur)]) > 0.9f * kCell * step) continue;  // too steep
-                float c = g[cur] + step * (k == 2 ? 12.f : 1.f);
                 int ni = nz * W + nx;
-                if (c < g[ni]) g[ni] = c, parent[ni] = cur, open.push({c + float(std::hypot(gx - nx, gz - nz)), ni});
+                if (closed[ni]) continue;
+                int k = classify(nx, nz);
+                if (k == 1) continue;
+                float step = (dx && dz) ? 2.f * kCell * kCell : kCell * kCell;
+                float dh = hgt[ni] - hgt[cur];
+                if (std::fabs(dh) > kMaxRise * std::sqrt(step)) continue;  // too steep
+                float c = g[cur] + step + dh * dh;
+                if (k == 2) c += 12.f * step;  // lava: the port's addition (the original has no lava test here)
+                if (c < g[ni]) g[ni] = c, parent[ni] = cur, open.push({c + hcost(nx, nz, hgt[ni]), ni});
             }
     }
     if (best == start) return false;
     std::vector<int> cells;
     for (int c = best; c >= 0; c = parent[c]) cells.push_back(c);
     std::reverse(cells.begin(), cells.end());
-    // string-pull: keep a cell only where the straight line from the last kept point stops being clear
     Vec3 last = from;
     for (size_t i = 1; i < cells.size(); ++i) {
         Vec3 c = centre(cells[i] % W, cells[i] / W);
@@ -997,7 +1018,7 @@ bool AiSystem::planRoute(const Vec3& from, const Vec3& to, int self, std::vector
         Vec3 nxt = end ? c : centre(cells[i + 1] % W, cells[i + 1] / W);
         if (end || lineBlocked(last, nxt, self)) out.push_back(c), last = c;
     }
-    if (best == goal) out.back() = Vec3(to.x, 0, to.z);
+    if (reached) out.back() = Vec3(to.x, 0, to.z);
     return !out.empty();
 }
 }  // namespace hg2

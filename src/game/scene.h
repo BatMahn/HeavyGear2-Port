@@ -52,6 +52,7 @@ public:
     // Battle damage: the frame is overdrawn with the definition's damaged skin at this strength (0..1).
     void setFrameDamage(int object, const std::string& frame, const std::string& texture, float amount);
     void setWaterLevel(float y) { waterOffset_ = y - mission_.waterLevel; }  // SetWaterLevel
+    float waterLevel() const { return mission_.waterLevel + waterOffset_; }
     // First object box hit by the segment a->b (returns object index or -1; t = fraction along the segment).
     int raycast(const Vec3& a, const Vec3& b, int ignoreObject, float& t) const;
     void hideObject(int object);

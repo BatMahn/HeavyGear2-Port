@@ -289,7 +289,22 @@ MOVETO (`FUN_100373c0`, gear vtable +0x2b0) asks a pathfinder for waypoints (`FU
 3 empty, 6 no planner, 7 gave up). The follower (`FUN_100bf300`) pops waypoints inside the arrival radius (+0x150) and
 keeps a progress watchdog: the nearest distance so far (+0x24) and a 5 s timer (+0x20) reset whenever it gets
 nearer; when the timer runs out the move fails. The port has the same watchdog (one planned re-route first, then the
-order is dropped so the tactic picks again); the searches themselves aren't decoded. The port plans its own: an A* over 6 m cells round steep steps, solid
+order is dropped so the tactic picks again).
+
+The search (`FUN_100c3190`, decoded 0.22): A* over a 4 m grid (`DAT_102689d0`) with 8 neighbours. A step costs its
+squared length (16, diagonals 32) plus the squared height change; under water it also costs (depth + 1) × the step
+(`FUN_100c26a0`). The heuristic is the squared distance to the goal, so f = g + d². Nodes are expanded best-f first,
+128 a frame (+0x7c), 2048 in all (+0x78); a node inside the goal radius ends the search, otherwise the best node
+found becomes the end of a partial path (result 3). Walkability (`FUN_100c2520`): the occupancy grid's cell flags
+(bits 2–5: 1 open, 2 blocked), water deeper than the request's limit (+0xb8, when wading is off), ground whose normal
+is steeper than the request's slope limit (+0xc4, cosine). Straight-line tests (`FUN_100c3530`) walk the segment in
+2 m steps with a 4 m radius. The goal radius comes out of `FUN_100c0370` (1 + 0.5 × cell = 3 m). MOVETO's request flags are
+0x38 (0x39 with the order's 0x80 bit): bit 3 clears the depth limit, bit 4 the water penalty, bit 5 puts nodes on the
+water surface, bit 6 (not set) would skip the slope test; so gears wade anywhere and only the slope limit applies.
+Not traced: the slope limit's value (the port uses ~42°).
+
+Life Support (perk 22, bit 26 of the perk word +0xc30): nothing in `hg2sim.dll` tests it; it only counts toward the
+gear's threat value in the shell. Backup Life Support (bit 4) is the crew-critical backup. The port plans its own: an A* over 6 m cells round steep steps, solid
 objects and lava, string-pulled to a few waypoints, when a unit is stuck or the next 48 m of its line are blocked.
 
 

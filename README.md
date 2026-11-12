@@ -8,7 +8,7 @@ A native port of **Heavy Gear II** (Activision, 1999) for modern macOS, Linux an
 No game data is included. You need your own copy of Heavy Gear II (see "Setting up the game folder": no
 installation needed).
 
-## Status (v0.21.1) — the whole single-player game
+## Status (v0.23.0) — the whole single-player game
 
 The game now starts in the original shell, drawn from the game's own layouts and artwork:
 
@@ -80,6 +80,12 @@ The game now starts in the original shell, drawn from the game's own layouts and
   `ActivateFreeRange` radii are used; Hold / Go To use the original guard rule; moves give up after 5 s without
   progress like the original's path follower; patrolling units no longer doze off out of sight; braked units
   don't re-plan.
+- **AI, 0.22**: route planning now follows the original pathfinder: a 4 m grid, squared step costs with height and
+  water penalties, a 2048-node budget with partial paths to the nearest reachable point, 2 m straight-line checks.
+  The build workflow has a "Run workflow" button.
+- **0.23**: MOVETO's request flags decoded (gears wade anywhere; path nodes sit on the water surface); Life Support
+  confirmed to have no effect in the original simulation (it only counts toward the threat value). The Windows build
+  was cross-compiled again and runs a D01 skirmish under Wine.
 - **Multiplayer**: free-for-all matches on the instant-action arenas over LAN or the internet, with the port's own
   UDP protocol (the original's ANet / DirectPlay sessions can't be reached any more). Main menu → Multiplayer: one
   player hosts (UDP port 47250; forward it for internet play), the others join by address; each brings the gear set
@@ -361,7 +367,7 @@ builtins it needed that aren't implemented yet.
    damaged skins, collateral damage, emitter rate / speed curves~~
 7. ~~Mission script VM (`Scripting/*.o`), every builtin, unit events, brain settings, weather, lights, unit
    generators, terrain surfaces (lava damage), the tactic table and the original tactics' state machines~~
-   (the MOVETO pathfinder's search is the port's own A*)
+   (the MOVETO pathfinder's A* decoded in 0.22; the gears' slope / depth limits are estimates)
 8. ~~Audio: WAV effects, dialog, footsteps, engine loop, EAR sound objects, music (your CD rips)~~
 9. ~~Shell: menus, briefings, squad and gear selection, debriefings, campaign flow and saves, historical, training,
    instant action (`shell.dll`, `hg2shell.prj`, `*.zfs`), movies (Indeo 5), gear lab weapon refits, threat values and
