@@ -80,6 +80,10 @@ bool Settings::load(const std::string& path) {
         else if (k == "mouse") mouseSpeed = std::clamp(v, 0.25f, 3.f);
         else if (k == "particles") particles = std::clamp(int(v), 0, 2);
         else if (k == "fullscreen") fullscreen = v != 0;
+        else if (k == "msaa") msaa = int(v) >= 8 ? 8 : int(v) >= 4 ? 4 : int(v) >= 2 ? 2 : 1;
+        else if (k == "moviefilter") movieFilter = std::clamp(int(v), 0, 2);
+        else if (k == "movie43") movie43 = v != 0;
+        else if (k == "data") dataDir = line.substr(eq + 1);
     }
     return true;
 }
@@ -88,7 +92,9 @@ bool Settings::save(const std::string& path) const {
     std::ofstream f(path);
     if (!f) return false;
     f << "effects=" << effects << "\ndialog=" << dialog << "\nmusic=" << music << "\nshell=" << shell << "\nexternal=" << externalView
-      << "\ninvert=" << invertMouse << "\nmouse=" << mouseSpeed << "\nparticles=" << particles << "\nfullscreen=" << fullscreen << "\n";
+      << "\ninvert=" << invertMouse << "\nmouse=" << mouseSpeed << "\nparticles=" << particles << "\nfullscreen=" << fullscreen
+      << "\nmsaa=" << msaa << "\nmoviefilter=" << movieFilter << "\nmovie43=" << movie43 << "\n";
+    if (!dataDir.empty()) f << "data=" << dataDir << "\n";
     return true;
 }
 
@@ -489,8 +495,29 @@ void Shell::graphicsOptions() {
         app_.settings.fullscreen = !app_.settings.fullscreen;
         ui_.playSound("general.wav");
     }
+    // the port's own options (right column): anti-aliasing, the movie filter, the movies' 4:3 screen
+    {
+        TextStyle hs;
+        hs.font = "s017016d.ttf", hs.size = 8, hs.just = "center", hs.color = 0x4c8ef8ffu;
+        auto option = [&](float y, const char* title, const std::string& value, auto onClick) {
+            UiRect tr{400, y, 170, 14}, br{400, y + 16, 170, 20};
+            ui_.textBox(title, tr, hs, hs.color);
+            ui_.image("SBTN026U.TGA", br.x, br.y, br.w, br.h, 0xffffffffu, "stretch");
+            ui_.textBox(value, br, st, 0x8cc8ffffu);
+            if (ui_.mouseReleased() && br.contains(ui_.mouseX(), ui_.mouseY())) onClick(), ui_.playSound("general.wav");
+        };
+        int aa = app_.settings.msaa;
+        option(120, "ANTI-ALIASING", aa <= 1 ? "OFF" : std::to_string(aa) + "X MSAA",
+               [&] { app_.settings.msaa = aa <= 1 ? 2 : aa >= 8 ? 1 : aa * 2; });
+        static const char* filters[] = {"OFF", "CRT", "INTERLACED"};
+        option(170, "MOVIE FILTER", filters[std::clamp(app_.settings.movieFilter, 0, 2)],
+               [&] { app_.settings.movieFilter = (app_.settings.movieFilter + 1) % 3; });
+        option(220, "MOVIE SCREEN", app_.settings.movie43 ? "4:3 (ORIGINAL)" : "FILL WINDOW",
+               [&] { app_.settings.movie43 = !app_.settings.movie43; });
+    }
     if (ui_.clicked(b + "accept")) {
         editing = false;
+        app_.r.setSamples(app_.settings.msaa);
         SDL_SetWindowFullscreen(app_.win, app_.settings.fullscreen);
         app_.settings.save(app_.prefDir + "settings.cfg");
         go(Scr::Options);
@@ -1145,7 +1172,10 @@ bool Shell::startMovie(const std::string& name, bool shellMovie, bool fullscreen
     movie_.m = std::move(m);
     movie_.shown = -1;
     movie_.fullscreen = fullscreen;
-    std::pair<int, int> size{movie_.m->width(), movie_.m->height()};
+    // the interlaced filter weaves two fields: twice the frame's lines, the odd ones from the previous frame
+    movie_.interlaced = fullscreen && app_.settings.movieFilter == 2;
+    movie_.prev = Image{};
+    std::pair<int, int> size{movie_.m->width(), movie_.m->height() * (movie_.interlaced ? 2 : 1)};
     auto it = movieTex_.find(size);
     if (it == movieTex_.end()) {
         Image black;
@@ -1178,7 +1208,22 @@ bool Shell::updateMovie() {
         return false;
     }
     if (idx != movie_.shown && movie_.m->frame(idx, movie_.img)) {
-        app_.r.updateTexture(movie_.tex, movie_.img);
+        if (movie_.interlaced) {
+            const Image& c = movie_.img;
+            const Image& p = movie_.prev.w == c.w && movie_.prev.h == c.h ? movie_.prev : c;
+            Image& o = movie_.woven;
+            o.w = c.w, o.h = c.h * 2, o.hasAlpha = false;
+            o.rgba.resize(size_t(o.w) * o.h * 4);
+            size_t row = size_t(c.w) * 4;
+            for (int y = 0; y < c.h; y++) {
+                memcpy(&o.rgba[size_t(2 * y) * row], &c.rgba[size_t(y) * row], row);       // this frame's field
+                memcpy(&o.rgba[size_t(2 * y + 1) * row], &p.rgba[size_t(y) * row], row);   // the last frame's field
+            }
+            app_.r.updateTexture(movie_.tex, o);
+            movie_.prev = c;
+        } else {
+            app_.r.updateTexture(movie_.tex, movie_.img);
+        }
         movie_.shown = idx;
     }
     return true;
@@ -1198,16 +1243,67 @@ bool Shell::fullscreenMovie() {
         return true;          // the key / click is used up by the skip
     }
     if (!updateMovie()) return !movieQueue_.empty();
-    // fill the window (not just the 640x480 frame), keeping the 16:9 picture's aspect
+    // The whole window in UI units, black. The picture (16:9, 320x180) goes either on a 4:3 screen in the middle,
+    // letterboxed as the original showed it on a 640x480 display, or as large as the window allows.
     float W = float(app_.r.width()), H = float(app_.r.height()), s = ui_.scale();
     float ox = (W - 640.f * s) * 0.5f / s, oy = (H - 480.f * s) * 0.5f / s;
     float aw = W / s, ah = H / s;
     ui_.rect(-ox, -oy, aw, ah, 0x000000ffu);
+    float sx = -ox, sy = -oy, sw = aw, sh = ah;  // the "screen"
+    if (app_.settings.movie43) {
+        sh = std::min(ah, aw * 0.75f), sw = sh * 4.f / 3.f;
+        sx = -ox + (aw - sw) * 0.5f, sy = -oy + (ah - sh) * 0.5f;
+    }
     float mw = float(movie_.m->width()), mh = float(movie_.m->height());
-    float k = std::min(aw / mw, ah / mh);
-    float w = mw * k, h = mh * k;
-    if (movie_.shown >= 0) ui_.textureQuad(movie_.tex, -ox + (aw - w) * 0.5f, -oy + (ah - h) * 0.5f, w, h);
+    float k = std::min(sw / mw, sh / mh);
+    float w = mw * k, h = mh * k, mx = sx + (sw - w) * 0.5f, my = sy + (sh - h) * 0.5f;
+    if (movie_.shown >= 0) ui_.textureQuad(movie_.tex, mx, my, w, h);
+    int filter = app_.settings.movieFilter;
+    if (filter && movie_.shown >= 0) {
+        movieFilterTextures();
+        if (filter == 1) {
+            // CRT: a dark gap between the picture's source lines (one scanline per line of the 180), the screen's
+            // edges and corners falling off
+            float period = h / mh, v0 = -(my - sy) / period;
+            ui_.textureQuadUV(scanTex_, sx, sy, sw, sh, 0, v0, 1, v0 + sh / period, 0xffffffffu);
+            ui_.textureQuadUV(vignetteTex_, sx, sy, sw, sh, 0, 0, 1, 1, 0xffffffffu);
+        } else {
+            // interlaced: the two fields woven (above), the second field's lines a little darker
+            float period = h / (mh * 2.f);
+            ui_.textureQuadUV(fieldTex_, mx, my, w, h, 0, 0, 1, h / period, 0xffffffffu);
+        }
+    }
     return true;
+}
+
+void Shell::movieFilterTextures() {
+    if (scanTex_ >= 0) return;
+    Image sc;  // one scanline: 8 rows, bright in the middle, dark between lines (alpha = darkness)
+    sc.w = 4, sc.h = 8, sc.hasAlpha = true;
+    sc.rgba.assign(size_t(sc.w) * sc.h * 4, 0);
+    for (int y = 0; y < sc.h; y++) {
+        float t = std::sin(3.14159f * (float(y) + 0.5f) / float(sc.h));
+        uint8_t a = uint8_t(255.f * 0.7f * std::pow(1.f - t, 1.4f));
+        for (int x = 0; x < sc.w; x++) sc.rgba[(size_t(y) * sc.w + x) * 4 + 3] = a;
+    }
+    scanTex_ = app_.r.createTexture(sc, false);
+    Image f;  // two field lines: the first clear, the second dimmed
+    f.w = 4, f.h = 2, f.hasAlpha = true;
+    f.rgba.assign(size_t(f.w) * f.h * 4, 0);
+    for (int x = 0; x < f.w; x++) f.rgba[(size_t(1) * f.w + x) * 4 + 3] = 70;
+    fieldTex_ = app_.r.createTexture(f, false);
+    Image v;  // the tube's edges: darkening toward the sides and more into the corners
+    v.w = 128, v.h = 96, v.hasAlpha = true;
+    v.rgba.assign(size_t(v.w) * v.h * 4, 0);
+    for (int y = 0; y < v.h; y++)
+        for (int x = 0; x < v.w; x++) {
+            float dx = (float(x) + 0.5f) / float(v.w) * 2.f - 1.f, dy = (float(y) + 0.5f) / float(v.h) * 2.f - 1.f;
+            float e = std::pow(std::pow(std::fabs(dx), 6.f) + std::pow(std::fabs(dy), 6.f), 1.f / 6.f);  // rounded rect
+            float a = std::clamp((e - 0.78f) / 0.22f, 0.f, 1.f);
+            a = a * a * (3.f - 2.f * a) * 0.85f + 0.12f * (dx * dx + dy * dy) * 0.5f;
+            v.rgba[(size_t(y) * v.w + x) * 4 + 3] = uint8_t(255.f * std::min(1.f, a));
+        }
+    vignetteTex_ = app_.r.createTexture(v, false);
 }
 
 // ---------------------------------------------------------------- briefing

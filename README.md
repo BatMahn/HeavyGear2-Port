@@ -8,7 +8,7 @@ A native port of **Heavy Gear II** (Activision, 1999) for modern macOS, Linux an
 No game data is included. You need your own copy of Heavy Gear II (see "Setting up the game folder": no
 installation needed).
 
-## Status (v0.23.0) — the whole single-player game
+## Status (v0.24.0) — the whole single-player game
 
 The game now starts in the original shell, drawn from the game's own layouts and artwork:
 
@@ -83,6 +83,10 @@ The game now starts in the original shell, drawn from the game's own layouts and
 - **AI, 0.22**: route planning now follows the original pathfinder: a 4 m grid, squared step costs with height and
   water penalties, a 2048-node budget with partial paths to the nearest reachable point, 2 m straight-line checks.
   The build workflow has a "Run workflow" button.
+- **0.24**: rain drawn as thin motion-blurred streaks (denser, fainter, fading at the tail); video options in
+  Options → Graphics: anti-aliasing (off / 2x / 4x / 8x MSAA), a movie filter (CRT scanlines and tube edges, or
+  interlaced fields) and the movie screen (the original 4:3 frame, or filling the window); the game folder is picked
+  with a folder dialog at first start.
 - **0.23**: MOVETO's request flags decoded (gears wade anywhere; path nodes sit on the water surface); Life Support
   confirmed to have no effect in the original simulation (it only counts toward the threat value). The Windows build
   was cross-compiled again and runs a D01 skirmish under Wine.
@@ -305,7 +309,9 @@ so nothing else needs installing. Any key or click skips a movie; `--no-movies` 
       music/      your soundtrack rip (optional)
       (plus whatever else came along from Setup\data\: Heavy Gear 2.exe, the DLLs, Anet\ ... - harmless)
 
-Then run `hg2 --data ~/HeavyGear2` (on Windows `hg2.exe --data C:\Games\HeavyGear2`), or set `HG2_DATA` once.
+Then start the game. The first time, it asks for the game folder with your system's folder picker (pick
+`HeavyGear2`, or the CD itself) and remembers it; to change it later, start with `--data <folder>` once. `--data`
+and `HG2_DATA` still work and take precedence.
 
 ## Running
 

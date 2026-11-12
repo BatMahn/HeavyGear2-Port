@@ -62,6 +62,9 @@ public:
               bool background = false, int textureOverride = -1);  // background: no depth test/write (sky);
                                                                  // textureOverride: every batch drawn blended with it
     void endFrame();
+    // Anti-aliasing: 1 (off), 2, 4 or 8 samples; applied from the next frame, clamped to what the GPU supports.
+    void setSamples(int n) { wantSamples_ = n < 2 ? 1 : n; }
+    int samples() const { return samples_; }
     // 2D overlay (HUD) in pixel coordinates, drawn last. Call before beginFrame each frame.
     void setOverlay(const std::vector<Vertex>& verts) { overlay_ = verts, overlayBatches_.clear(); }
     // Textured 2D overlay (shell screens): batches index into `verts`; texture -1 = the HUD font.
@@ -90,6 +93,8 @@ public:
 private:
     SDL_GPUShader* makeShader(bool vertex);
     SDL_GPUGraphicsPipeline* makePipeline(bool blend, bool background = false, bool additive = false);
+    void buildPipelines();
+    void releasePipelines();
     void ensureDepth(int w, int h);
 
     SDL_Window* win_ = nullptr;
@@ -112,6 +117,8 @@ private:
     int font_ = -1;
     SDL_GPUSampler* sampler_ = nullptr;
     SDL_GPUTexture* depth_ = nullptr;
+    SDL_GPUTexture* msaaColor_ = nullptr;  // multisampled scene target, resolved into the swapchain
+    int samples_ = 1, wantSamples_ = 1, msaaW_ = 0, msaaH_ = 0;
     SDL_GPUTexture* offscreen_ = nullptr;
     SDL_GPUTextureFormat colorFmt_ = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
     int depthW_ = 0, depthH_ = 0, w_ = 0, h_ = 0;

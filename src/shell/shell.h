@@ -153,11 +153,13 @@ private:
     bool humOn_ = false;
     struct Playback {
         std::unique_ptr<Movie> m;
-        Image img;
+        Image img, prev, woven;     // prev / woven: the interlaced filter's fields
         int tex = -1, shown = -1;
         Uint64 t0 = 0;
-        bool fullscreen = false;
+        bool fullscreen = false, interlaced = false;
     };
+    int scanTex_ = -1, fieldTex_ = -1, vignetteTex_ = -1;  // movie filter overlays
+    void movieFilterTextures();
     Playback movie_;
     std::vector<std::string> movieQueue_;
     std::map<std::pair<int, int>, int> movieTex_;  // renderer texture per frame size

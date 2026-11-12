@@ -24,6 +24,18 @@ struct FSUniforms {
 };
 }  // namespace
 
+void Renderer::buildPipelines() {
+    opaque_ = makePipeline(false);
+    blended_ = makePipeline(true);
+    background_ = makePipeline(false, true);
+    overlayPipe_ = makePipeline(true, true);
+    additive_ = makePipeline(true, false, true);
+}
+void Renderer::releasePipelines() {
+    for (auto** p : {&opaque_, &blended_, &background_, &overlayPipe_, &additive_})
+        if (*p) SDL_ReleaseGPUGraphicsPipeline(dev_, *p), *p = nullptr;
+}
+
 const char* Renderer::driverName() const { return dev_ ? SDL_GetGPUDeviceDriver(dev_) : "none"; }
 
 SDL_GPUShader* Renderer::makeShader(bool vertex) {
@@ -99,6 +111,8 @@ SDL_GPUGraphicsPipeline* Renderer::makePipeline(bool blend, bool background, boo
     pi.target_info.num_color_targets = 1;
     pi.target_info.depth_stencil_format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
     pi.target_info.has_depth_stencil_target = true;
+    pi.multisample_state.sample_count = SDL_GPUSampleCount(samples_ >= 8 ? SDL_GPU_SAMPLECOUNT_8 : samples_ >= 4 ? SDL_GPU_SAMPLECOUNT_4
+                                                          : samples_ >= 2 ? SDL_GPU_SAMPLECOUNT_2 : SDL_GPU_SAMPLECOUNT_1);
     SDL_GPUGraphicsPipeline* p = SDL_CreateGPUGraphicsPipeline(dev_, &pi);
     SDL_ReleaseGPUShader(dev_, vs);
     SDL_ReleaseGPUShader(dev_, fs);
@@ -137,11 +151,7 @@ bool Renderer::init(SDL_Window* window, bool offscreen, int w, int h, std::strin
         w_ = w;
         h_ = h;
     }
-    opaque_ = makePipeline(false);
-    blended_ = makePipeline(true);
-    background_ = makePipeline(false, true);
-    overlayPipe_ = makePipeline(true, true);
-    additive_ = makePipeline(true, false, true);
+    buildPipelines();
     if (!opaque_ || !blended_ || !background_) {
         if (err) *err = std::string("pipeline: ") + SDL_GetError();
         return false;
@@ -191,6 +201,7 @@ void Renderer::shutdown() {
     textures_.clear();
     meshes_.clear();
     if (depth_) SDL_ReleaseGPUTexture(dev_, depth_);
+    if (msaaColor_) SDL_ReleaseGPUTexture(dev_, msaaColor_);
     if (offscreen_) SDL_ReleaseGPUTexture(dev_, offscreen_);
     if (sampler_) SDL_ReleaseGPUSampler(dev_, sampler_);
     if (opaque_) SDL_ReleaseGPUGraphicsPipeline(dev_, opaque_);
@@ -317,9 +328,42 @@ GpuMesh* Renderer::createMesh(const std::vector<Vertex>& verts, std::vector<Draw
 }
 
 void Renderer::ensureDepth(int w, int h) {
+    // anti-aliasing change: rebuild the pipelines and targets at the new sample count (if the GPU has it)
+    if (wantSamples_ != samples_) {
+        int n = wantSamples_;
+        auto sc = [](int k) { return k >= 8 ? SDL_GPU_SAMPLECOUNT_8 : k >= 4 ? SDL_GPU_SAMPLECOUNT_4 : k >= 2 ? SDL_GPU_SAMPLECOUNT_2 : SDL_GPU_SAMPLECOUNT_1; };
+        while (n > 1 && !(SDL_GPUTextureSupportsSampleCount(dev_, colorFmt_, sc(n)) &&
+                          SDL_GPUTextureSupportsSampleCount(dev_, SDL_GPU_TEXTUREFORMAT_D32_FLOAT, sc(n))))
+            n /= 2;
+        wantSamples_ = n;
+        if (n != samples_) {
+            SDL_WaitForGPUIdle(dev_);
+            releasePipelines();
+            samples_ = n;
+            buildPipelines();
+            if (depth_) SDL_ReleaseGPUTexture(dev_, depth_), depth_ = nullptr;
+            if (msaaColor_) SDL_ReleaseGPUTexture(dev_, msaaColor_), msaaColor_ = nullptr;
+            SDL_Log("renderer: anti-aliasing %dx", samples_);
+        }
+    }
+    SDL_GPUSampleCount count = samples_ >= 8 ? SDL_GPU_SAMPLECOUNT_8 : samples_ >= 4 ? SDL_GPU_SAMPLECOUNT_4
+                             : samples_ >= 2 ? SDL_GPU_SAMPLECOUNT_2 : SDL_GPU_SAMPLECOUNT_1;
+    if (samples_ > 1 && (!msaaColor_ || msaaW_ != w || msaaH_ != h)) {
+        if (msaaColor_) SDL_ReleaseGPUTexture(dev_, msaaColor_);
+        SDL_GPUTextureCreateInfo ci{};
+        ci.type = SDL_GPU_TEXTURETYPE_2D;
+        ci.format = colorFmt_;
+        ci.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
+        ci.width = Uint32(w), ci.height = Uint32(h);
+        ci.layer_count_or_depth = 1, ci.num_levels = 1;
+        ci.sample_count = count;
+        msaaColor_ = SDL_CreateGPUTexture(dev_, &ci);
+        msaaW_ = w, msaaH_ = h;
+    }
     if (depth_ && depthW_ == w && depthH_ == h) return;
     if (depth_) SDL_ReleaseGPUTexture(dev_, depth_);
     SDL_GPUTextureCreateInfo ti{};
+    ti.sample_count = count;
     ti.type = SDL_GPU_TEXTURETYPE_2D;
     ti.format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
     ti.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;
@@ -374,6 +418,11 @@ bool Renderer::beginFrame(const FrameParams& fp) {
     ct.clear_color = {fp.clearColor.x, fp.clearColor.y, fp.clearColor.z, 1};
     ct.load_op = SDL_GPU_LOADOP_CLEAR;
     ct.store_op = SDL_GPU_STOREOP_STORE;
+    if (samples_ > 1 && msaaColor_) {  // draw multisampled, resolve into the window at the end of the pass
+        ct.texture = msaaColor_;
+        ct.store_op = SDL_GPU_STOREOP_RESOLVE;
+        ct.resolve_texture = target;
+    }
     SDL_GPUDepthStencilTargetInfo dt{};
     dt.texture = depth_;
     dt.clear_depth = 1;

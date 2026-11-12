@@ -72,6 +72,10 @@ public:
     bool imageSize(const std::string& name, int& w, int& h);
     void rect(float x, float y, float w, float h, uint32_t rgba);
     // A renderer texture (e.g. a movie frame) stretched over a rectangle.
+    // A textured quad with its own texture coordinates and colour (the sampler repeats: tiled patterns).
+    void textureQuadUV(int tex, float x, float y, float w, float h, float u0, float v0, float u1, float v1, uint32_t rgba) {
+        quad(tex, ox_ + x * s_, oy_ + y * s_, ox_ + (x + w) * s_, oy_ + (y + h) * s_, u0, v0, u1, v1, rgba);
+    }
     void textureQuad(int tex, float x, float y, float w, float h) { quad(tex, ox_ + x * s_, oy_ + y * s_, ox_ + (x + w) * s_, oy_ + (y + h) * s_, 0, 0, 1, 1, 0xffffffff); }
     Renderer* renderer() const { return r_; }
     void frame(float x, float y, float w, float h, uint32_t rgba);

@@ -27,7 +27,8 @@ std::string cstr(const Bytes& b, size_t off, size_t max) {
     return s;
 }
 constexpr float kSizeScale = 4.f;  // size curve units -> metres (matches the original's look at gear scale)
-constexpr size_t kMaxParticles = 4000;
+constexpr size_t kMaxParticles = 8000;
+constexpr int kMaxWeather = 3000;  // drops / flakes kept round the viewer
 }  // namespace
 
 void Particles::init(const FileSystem& fs, Renderer& r, const std::string& detail) {
@@ -215,12 +216,24 @@ void Particles::update(float dt) {
         }
         const ParticleType* t = weatherType_ == 2 ? snow_.get() : rain_.get();
         std::uniform_real_distribution<float> U(-1.f, 1.f);
-        weatherAcc_ += dt * float(weatherLevel_) * (weatherType_ == 2 ? 120.f : 400.f);
-        for (; weatherAcc_ >= 1.f && parts_.size() < kMaxParticles; weatherAcc_ -= 1.f) {
+        int weather = 0;
+        for (auto& p : parts_) weather += p.type == rain_.get() || p.type == snow_.get();
+        bool snow = weatherType_ == 2;
+        // rain: many thin, fast drops in a 24 m box round the viewer, spread through the whole fall height so the
+        // sheet looks even from the first frame; a light slant from the wind
+        weatherAcc_ += dt * float(weatherLevel_) * (snow ? 120.f : 900.f);
+        for (; weatherAcc_ >= 1.f && parts_.size() < kMaxParticles && weather < kMaxWeather; weatherAcc_ -= 1.f, ++weather) {
             Particle q;
-            q.pos = eye_ + Vec3(U(rng_) * 30.f, (weatherType_ == 2 ? 8.f : 15.f) + U(rng_) * 8.f, U(rng_) * 30.f);
-            q.vel = weatherType_ == 2 ? Vec3(U(rng_) * 1.5f, -2.5f, U(rng_) * 1.5f) : Vec3(0.5f, -22.f, 0.3f);
-            q.age = 0, q.life = t->life, q.scale = 1.f, q.spin = 0, q.type = t;
+            if (snow) {
+                q.pos = eye_ + Vec3(U(rng_) * 30.f, 8.f + U(rng_) * 8.f, U(rng_) * 30.f);
+                q.vel = Vec3(U(rng_) * 1.5f, -2.5f, U(rng_) * 1.5f);
+                q.life = t->life;
+            } else {
+                q.pos = eye_ + Vec3(U(rng_) * 24.f, 6.f + U(rng_) * 10.f, U(rng_) * 24.f);
+                q.vel = Vec3(1.5f + U(rng_) * 0.3f, -26.f - U(rng_) * 3.f, 0.8f + U(rng_) * 0.3f);
+                q.life = 0.35f + 0.4f * (U(rng_) * 0.5f + 0.5f);
+            }
+            q.age = 0, q.scale = 1.f, q.spin = 0, q.type = t;
             parts_.push_back(q);
         }
     }
@@ -254,7 +267,7 @@ void Particles::update(float dt) {
     for (auto& p : parts_) {
         p.age += dt;
         p.vel.y -= p.type->gravity * dt;
-        p.vel = p.vel * std::max(0.f, 1.f - 0.6f * dt);  // air drag
+        if (p.type != rain_.get()) p.vel = p.vel * std::max(0.f, 1.f - 0.6f * dt);  // air drag (rain is at terminal speed)
         p.pos += p.vel * dt;
     }
     parts_.erase(std::remove_if(parts_.begin(), parts_.end(), [](const Particle& p) { return p.age >= p.life; }), parts_.end());
@@ -275,9 +288,21 @@ void Particles::submit(const Mat4& view) {
         if (fade < 0.05f) continue;
         float cs = std::cos(p.spin) * sz, sn = std::sin(p.spin) * sz;
         Vec3 ax = right * cs + up * sn, ay = up * cs - right * sn;
-        if (p.type == rain_.get()) {  // rain falls as streaks along its motion
-            Vec3 fwd = cross(right, up), d = normalize(p.vel), side = normalize(cross(d, fwd));
-            ax = side * 0.025f, ay = d * 0.7f;
+        bool streak = p.type == rain_.get();
+        float tailAlpha = 1.f;
+        if (streak) {
+            // a drop is drawn as a thin motion-blurred streak: about 30 ms of travel long, its width kept near a
+            // pixel at any distance, faint (rain reads as a sheet, not as bars), fading at the tail and close up
+            Vec3 toEye = eye_ - p.pos;
+            float dist = length(toEye);
+            if (dist < 2.f) continue;
+            Vec3 d = normalize(p.vel), side = cross(d, toEye * (1.f / dist));
+            if (length(side) < 1e-3f) continue;
+            side = normalize(side);
+            ax = side * std::max(0.004f, dist * 0.0011f);
+            ay = d * (length(p.vel) * 0.016f);  // half length: 2 × 16 ms
+            fade = std::min(1.f, (dist - 2.f) / 4.f) * 0.45f;
+            tailAlpha = 0.f;
         }
         Vertex v{};
         v.normal[1] = 1;
@@ -296,6 +321,7 @@ void Particles::submit(const Mat4& view) {
         float cu1 = cu + p.type->cellW, cv1 = cv + p.type->cellH;
         Vertex a = mk(p.pos - ax - ay, cu, cv1), b = mk(p.pos + ax - ay, cu1, cv1), cc = mk(p.pos + ax + ay, cu1, cv),
                d = mk(p.pos - ax + ay, cu, cv);
+        if (streak) a.color[3] = b.color[3] = uint8_t(float(a.color[3]) * tailAlpha);  // -ay is the tail (ay points along the fall)
         auto& dst = byTex[{p.type->tex, (p.type->flags & 0x100) != 0}];
         dst.insert(dst.end(), {a, b, cc, a, cc, d});
     }

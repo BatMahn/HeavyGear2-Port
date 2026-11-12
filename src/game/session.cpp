@@ -1032,7 +1032,8 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             player.update(1.f / 30.f, pin);
             ai.update(1.f / 30.f);
             combat.update(1.f / 30.f);
-            particles.setWeather(world.weatherType, world.weatherPreset % 5);
+            if (const char* w = getenv("HG2_WEATHER")) particles.setWeather(atoi(w), atoi(strchr(w, ':') ? strchr(w, ':') + 1 : "3"));  // test: "1:3"
+            else particles.setWeather(world.weatherType, world.weatherPreset % 5);
             particles.setViewer(frameParams().eye);
             particles.update(1.f / 30.f);
             fountains.update(1.f / 30.f, player.position(), spawnUnit, unitAlive);
@@ -1277,7 +1278,8 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             }
         netStep(dt, fired, fmz, faim);
         combat.update(dt);
-        particles.setWeather(world.weatherType, world.weatherPreset % 5);
+        if (const char* w = getenv("HG2_WEATHER")) particles.setWeather(atoi(w), atoi(strchr(w, ':') ? strchr(w, ':') + 1 : "3"));  // test: "1:3"
+        else particles.setWeather(world.weatherType, world.weatherPreset % 5);
         particles.setViewer(frameParams().eye);
         particles.update(dt);
         fountains.update(dt, player.position(), spawnUnit, unitAlive);

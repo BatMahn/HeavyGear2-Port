@@ -92,7 +92,23 @@ int main(int argc, char** argv) {
             return a == "--help" || a == "-h" ? 0 : 1;
         }
     }
-    if (app.data.empty()) {  // next to the program, or a data folder there
+    if (const char* pref = SDL_GetPrefPath("BatMahn", "HG2Port")) {
+        app.prefDir = pref;
+        SDL_free(const_cast<char*>(pref));
+    }
+    app.settings.load(app.prefDir + "settings.cfg");
+    // the game folder: --data / HG2_DATA, else the folder picked last time, else next to the program, else ask
+    auto resolve = [](const std::string& d) -> std::string {  // the folder itself, or the CD's / an image's layout
+        if (d.empty()) return {};
+        for (const std::string& c : {d, d + "/Setup/data", d + "/setup/data", d + "/data"})
+            if (looksLikeData(c)) return c;
+        return {};
+    };
+    if (!app.data.empty()) {
+        if (std::string r = resolve(app.data); !r.empty()) app.data = r;
+    } else if (std::string r = resolve(app.settings.dataDir); !r.empty()) {
+        app.data = r;
+    } else {
         const char* base = SDL_GetBasePath();
         std::string b = base ? base : "./";
         for (const std::string& c : {b + "data", b, b + "../Resources/data", std::string("data"), std::string(".")})
@@ -101,11 +117,47 @@ int main(int argc, char** argv) {
                 break;
             }
     }
+    if (app.data.empty() && shot.empty()) {
+        // first start: ask for the folder with the system's folder picker and remember it
+        SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS);
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "Heavy Gear II",
+                                 "Choose your Heavy Gear II game folder: the one with simpack.prj (see the README's "
+                                 "\"Setting up the game folder\"), or the Heavy Gear II CD itself.",
+                                 nullptr);
+        for (;;) {
+            struct Pick { bool done = false; std::string path; } pick;
+            const char* home = SDL_getenv("HOME");
+            SDL_ShowOpenFolderDialog(
+                [](void* ud, const char* const* list, int) {
+                    auto* p = static_cast<Pick*>(ud);
+                    if (list && list[0]) p->path = list[0];
+                    p->done = true;
+                },
+                &pick, nullptr, home, false);
+            while (!pick.done) {
+                SDL_Event ev;
+                while (SDL_PollEvent(&ev)) {}
+                SDL_Delay(20);
+            }
+            if (pick.path.empty()) break;  // cancelled
+            if (std::string r = resolve(pick.path); !r.empty()) {
+                app.data = r;
+                app.settings.dataDir = r;
+                app.settings.save(app.prefDir + "settings.cfg");
+                break;
+            }
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "Heavy Gear II",
+                                     ("No Heavy Gear II data in\n" + pick.path +
+                                      "\n\nPick the folder that holds simpack.prj and simpack.map (the CD's Setup\\data, "
+                                      "or a copy of it).").c_str(),
+                                     nullptr);
+        }
+    }
     if (app.data.empty()) {
         usage();
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Heavy Gear II",
-                                 "Heavy Gear II data not found.\nStart the game with --data <your Heavy Gear II folder> "
-                                 "or set HG2_DATA.",
+                                 "Heavy Gear II data not found.\nStart the game again and pick your Heavy Gear II folder, "
+                                 "or use --data <folder> / HG2_DATA.",
                                  nullptr);
         return 1;
     }
@@ -113,11 +165,6 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Could not find Heavy Gear II data (simpack.prj/simpack.map) in %s\n", app.data.c_str());
         return 1;
     }
-    if (const char* pref = SDL_GetPrefPath("BatMahn", "HG2Port")) {
-        app.prefDir = pref;
-        SDL_free(const_cast<char*>(pref));
-    }
-    app.settings.load(app.prefDir + "settings.cfg");
     if (forceFull) app.settings.fullscreen = true;
     app.offscreen = !shot.empty();
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
@@ -138,6 +185,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     SDL_Log("GPU driver: %s", app.r.driverName());
+    app.r.setSamples(app.offscreen ? 1 : app.settings.msaa);
     if (!app.offscreen && app.audio.init(app.fs)) {
         app.audioOk = true;
         app.applyVolumes();

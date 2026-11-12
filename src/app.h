@@ -18,6 +18,10 @@ struct Settings {
     float mouseSpeed = 1.0f;     // 0.25 .. 3
     int particles = 2;           // 0 off, 1 reduced, 2 full
     bool fullscreen = false;
+    int msaa = 4;                // anti-aliasing samples: 1 (off), 2, 4, 8
+    int movieFilter = 0;         // full-screen movies: 0 off, 1 CRT, 2 interlaced
+    bool movie43 = true;         // show the movies on a 4:3 screen (as the original did), not filling the window
+    std::string dataDir;         // the game folder picked at first start
     bool load(const std::string& path);
     bool save(const std::string& path) const;
 };
