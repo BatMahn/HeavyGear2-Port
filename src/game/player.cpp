@@ -75,13 +75,18 @@ bool Player::fire(int trigger) {
     if (size_t(state_) >= ecy_.states.size()) return false;
     for (auto& t : ecy_.states[size_t(state_)].transitions) {
         if (t.trigger != trigger || t.target < 0 || size_t(t.target) >= ecy_.states.size()) continue;
-        int len = std::max(1, scene_->animLength(object_, set_));
+        bool fromCycle = loop_ && (state_ == sWalk_ || state_ == sRun_);
+        // stand <-> walk: the stance and the stride differ by a metre at the feet; cross-fade (port: 0.2 s)
+        if (t.target == sWalk_ || t.target == sIdle_ || t.target == sRun_) fadeSet_ = set_, fadeFrame_ = frame_, fadeLen_ = 0, fadeWeight_ = 1.f;
+        int len = std::max(1, loop_ ? scene_->animCycle(object_, set_) : scene_->animLength(object_, set_));
         float phase = loop_ ? frame_ / float(len) : 0.f;
         state_ = t.target;
         set_ = t.events.empty() ? t.target : t.events[0].id;
         loop_ = ecy_.states[size_t(state_)].type != 0;
-        // cycles hand over at the same phase (walk <-> run); one-shots start at the beginning
-        frame_ = loop_ ? phase * float(std::max(1, scene_->animLength(object_, set_))) : 0.f;
+        // cycles hand over at the same phase (walk <-> run); a kind-1 transition from elsewhere starts the cycle
+        // at its event's phase (stand -> walk: 0.3); one-shots start at the beginning
+        if (loop_ && !fromCycle && t.kind == 1 && !t.events.empty()) phase = t.events[0].b;
+        frame_ = loop_ ? phase * float(std::max(1, scene_->animCycle(object_, set_))) : 0.f;
         return true;
     }
     return false;
@@ -167,13 +172,19 @@ void Player::update(float dt, const PlayerInput& in) {
         len = std::max(1, scene_->animLength(object_, set_));
         done = !loop_ && frame_ >= float(len - 1);
         settled = loop_ || done;
-        // locomotion within the current posture
+        // locomotion within the current posture. Standing up, the original picks the cycle from the body's speed
+        // (FUN_10064700 / FUN_10064d20's caller): trigger 1 (stop) once |v| is under 1 % of the top speed with no
+        // throttle, else 2 (walk) up to the walk speed (+0x10b4) and 3 (run) above it. Walk <-> run waits for one
+        // of the transition's sync points (see advanceCycle).
+        const float vmaxNow = sms_ ? run * 1.5f : run;
+        const float vabs = std::fabs(speed_);
+        const bool rolling = moving || vabs > 0.01f * vmaxNow;
+        wantCycle_ = -1;
         if (!sms_ && settled) {
-            if (state_ == sIdle_ && moving) fire(kTrigWalk);
-            else if (state_ == sWalk_ && !moving) fire(kTrigStop);
-            else if (state_ == sWalk_ && in.run && thr > 0 && sRun_ >= 0) fire(kTrigRun);
-            else if (state_ == sRun_ && !moving) fire(kTrigStop);
-            else if (state_ == sRun_ && (!in.run || thr <= 0)) fire(kTrigWalk);
+            if (state_ == sIdle_ && rolling) fire(kTrigWalk);
+            else if ((state_ == sWalk_ || state_ == sRun_) && !rolling) fire(kTrigStop);
+            else if (state_ == sWalk_ && sRun_ >= 0 && speed_ > walk * speedScale + 0.01f) wantCycle_ = kTrigRun;
+            else if (state_ == sRun_ && (speed_ <= walk * speedScale || speed_ < 0)) wantCycle_ = kTrigWalk;
             else if (state_ == sKneel_ && moving && sKneelWalk_ >= 0) fire(kTrigWalk);
             else if (state_ == sKneelWalk_ && !moving) fire(kTrigStop);
             else if (state_ == sProne_ && moving && sCrawl_ >= 0) fire(kTrigWalk);
@@ -195,7 +206,7 @@ void Player::update(float dt, const PlayerInput& in) {
         target = speed_, targetStrafe = strafe_;
     } else if (sms_) {
         target = thr * run * 1.5f;
-    } else if (!ecy || state_ == sWalk_ || state_ == sRun_) {
+    } else if (!ecy || state_ == sWalk_ || state_ == sRun_ || state_ == sIdle_) {
         target = thr > 0 ? thr * (in.run ? run : walk) : thr * walk * 0.6f;
         targetStrafe = str * walk * 0.6f;
     } else if (state_ == sKneelWalk_) {
@@ -204,47 +215,57 @@ void Player::update(float dt, const PlayerInput& in) {
         target = thr * walk * 0.2f;
     }
     target *= speedScale, targetStrafe *= speedScale;
-    float accel = sms_ ? 5.f : 8.f;  // m/s^2
-    if (speed_ < target) speed_ = std::min(target, speed_ + accel * dt);
-    else speed_ = std::max(target, speed_ - accel * 1.5f * dt);
-    if (strafe_ < targetStrafe) strafe_ = std::min(targetStrafe, strafe_ + accel * dt);
-    else strafe_ = std::max(targetStrafe, strafe_ - accel * 1.5f * dt);
     float turnRate = (60.f + 6.f * float(def_.maneuverability)) * kDeg * (sms_ ? 0.6f : 1.f);
     if (postureCode() == 0) turnRate *= 0.4f;
     turnRate *= turnScale;
     if (!air_) yaw_ += in.turn * turnRate * dt;
     // models face -Z; world = local * rotY(yaw). With the left-handed view, screen right is (-cos, 0, sin).
     Vec3 fwd(-std::sin(yaw_), 0, -std::cos(yaw_)), right(-std::cos(yaw_), 0, std::sin(yaw_));
-    pos_ += fwd * (speed_ * dt) + right * (strafe_ * dt);
-    // Slope force (FUN_1003cc30, gear vtable +0x268, while grounded): with the ground normal n in the gear's frame,
-    // a = n_h·|n_h| · k · g (g = 20, k = min(3 / n_y², 6), on skates min(5 / n_y², 9)) along each horizontal axis;
-    // on ground flatter than n_y 0.8 (36.9°) the sideways part is dropped, and the forward part too while there is
-    // no throttle. The drive (traction-limited to μ·g = 2 × 20, FUN_1003c8f0) holds against it on an axis the gear
-    // is driving along, so only the excess moves it: walking gears can't climb much past ~39°, skating ones ~32°,
-    // and a gear standing on ground steeper than 36.9° slides down.
-    if (!air_ && ecy) {
-        Vec3 n = scene_->groundNormal(pos_.x, pos_.z);
-        float ny = n.y < 1e-5f ? 1.f : n.y;
-        float k = sms_ ? std::min(5.f / (ny * ny), 9.f) : std::min(3.f / (ny * ny), 6.f);
-        float nf = dot(n, fwd), nr = dot(n, right);
-        float aF = nf * std::fabs(nf) * k * 20.f, aR = nr * std::fabs(nr) * k * 20.f;
-        if (ny > 0.8f) {
-            aR = 0;
-            if (std::fabs(thr) < 0.05f) aF = 0;
-        }
-        auto excess = [](float a, bool driven) {
-            const float traction = 40.f;
-            return driven ? std::copysign(std::max(0.f, std::fabs(a) - traction), a) : a;
-        };
-        aF = excess(aF, std::fabs(thr) > 0.05f), aR = excess(aR, std::fabs(str) > 0.05f);
-        Vec3 a = fwd * aF + right * aR;
-        slide_ += a * dt;
-        slide_ = slide_ * std::exp(-(length(a) > 0.01f ? 1.5f : 8.f) * dt);  // ground drag / grip once it levels out
-        float sv = length(slide_);
-        if (sv > 20.f) slide_ = slide_ * (20.f / sv);
-        pos_ += slide_ * dt;
-    } else if (!air_) {
-        slide_ = Vec3();
+    if (!air_) drive(dt, target, targetStrafe, std::fabs(thr) > 0.05f, std::fabs(in.turn) > 0.05f, ecy, fwd, right);
+
+    // animation: advance the set, and on the ground let a locomotion cycle's root motion carry the body
+    float prevPhase = 0;
+    if (!ecy) {  // no state machine: plain stand / walk / run sets
+        int want = std::fabs(speed_) < 0.3f ? 0 : (speed_ > walk * 1.15f ? 2 : 1);
+        if (want != set_) set_ = want, frame_ = 0;
+        loop_ = true;
+    }
+    len = std::max(1, loop_ ? scene_->animCycle(object_, set_) : scene_->animLength(object_, set_));
+    float rate = 30.f;  // XB keys are 30 per second
+    bool cycle = !ecy ? set_ != 0
+                      : loop_ && !sms_ && !air_ && state_ != sIdle_ && state_ != sKneel_ && state_ != sProne_;
+    prevPhase = frame_ / float(len);
+    int shown = set_;
+    Vec3 travel;  // model-space root motion this step
+    float travelShare = 0;  // the part of it that is the body's forward motion
+    if (sms_) {
+        frame_ = std::fmod(frame_, float(len));
+    } else if (cycle) {
+        // FUN_10064d20: the cycle plays at speed / stride cycles a second (FUN_10055290 with FUN_100344e0's inverse
+        // stride), and the body moves by the root's travel over the step, not by velocity × dt
+        float v = std::max(std::fabs(speed_), std::fabs(strafe_));
+        travelShare = v > 1e-3f ? std::fabs(speed_) / v : 0.f;
+        travel = advanceCycle(dt, std::copysign(v, speed_ < -0.1f ? -1.f : 1.f));
+        shown = set_, len = std::max(1, scene_->animCycle(object_, set_));
+    } else if (ecy && state_ == sIdle_ && loop_ && std::fabs(in.turn) > 0.1f && sWalk_ >= 0) {
+        // turning on the spot: step with the walk cycle at a slow pace
+        shown = 1, rate = 18.f * std::fabs(in.turn), len = std::max(1, scene_->animCycle(object_, shown));
+        cycle = true;
+        if (idleSet_ != shown) frame_ = 0, idleSet_ = shown;
+        frame_ = std::fmod(frame_ + rate * dt + float(len), float(len));
+    } else {
+        if (idleSet_ != set_ && state_ == sIdle_) frame_ = 0, idleSet_ = set_;
+        if (loop_) frame_ = std::fmod(frame_ + rate * dt + float(len), float(len));
+        else frame_ = std::min(frame_ + rate * dt, float(len - 1));
+    }
+
+    // horizontal motion: root motion for a walking cycle (scaled to the forward share when sidestepping), velocity
+    // otherwise; sideways velocity (sidestep, slides) always
+    if (cycle && !air_ && travelShare > 0 && shown == set_) {
+        Vec3 w = Mat4::rotY(yaw_).transformDir(travel);
+        pos_ += Vec3(w.x, 0, w.z) * travelShare + right * (strafe_ * dt);
+    } else {
+        pos_ += fwd * (speed_ * dt) + right * (strafe_ * dt);
     }
     pos_.x = std::max(1.f, std::min(4095.f, pos_.x));
     pos_.z = std::max(1.f, std::min(4095.f, pos_.z));
@@ -280,47 +301,24 @@ void Player::update(float dt, const PlayerInput& in) {
         pos_.y = ground;
     }
 
-    // animation
-    float prevPhase = 0;
-    if (!ecy) {  // no state machine: plain stand / walk / run sets
-        int want = std::fabs(speed_) < 0.3f ? 0 : (speed_ > walk * 1.15f ? 2 : 1);
-        if (want != set_) set_ = want, frame_ = 0;
-        loop_ = true;
-    }
-    len = std::max(1, loop_ ? scene_->animCycle(object_, set_) : scene_->animLength(object_, set_));
-    float rate = 30.f;  // XB keys are 30 per second
-    bool cycle = !ecy ? set_ != 0
-                      : loop_ && !sms_ && !air_ && state_ != sIdle_ && state_ != sKneel_ && state_ != sProne_;
-    if (sms_) {
-        rate = 0;
-    } else if (cycle) {
-        float ref = (ecy ? state_ == sRun_ : set_ == 2) ? run : state_ == sKneelWalk_ ? walk * 0.35f : state_ == sCrawl_ ? walk * 0.2f : walk;
-        float v = std::max(std::fabs(speed_), std::fabs(strafe_));
-        // the cycle's own pace: its root travel (stride) over its length; play it so the feet keep up with the ground
-        float stride = scene_->animStride(object_, set_);
-        if (stride > 0.5f) ref = stride / (float(len) / 30.f);
-        rate *= std::clamp(v / std::max(0.5f, ref), 0.3f, 3.f);
-        if (speed_ < -0.1f) rate = -rate;
-    }
-    prevPhase = frame_ / float(len);
-    int shown = set_;
-    if (ecy && state_ == sIdle_ && loop_ && !sms_ && std::fabs(in.turn) > 0.1f && sWalk_ >= 0) {
-        // turning on the spot: step with the walk cycle at a slow pace
-        shown = 1, rate = 18.f * std::fabs(in.turn), len = std::max(1, scene_->animCycle(object_, shown));
-        cycle = true;
-        if (idleSet_ != shown) frame_ = 0, idleSet_ = shown;
-    } else if (idleSet_ != set_ && state_ == sIdle_) {
-        frame_ = 0, idleSet_ = set_;
-    }
-    if (loop_) frame_ = std::fmod(frame_ + rate * dt + float(len), float(len));
-    else frame_ = std::min(frame_ + rate * dt, float(len - 1));
     scene_->setObjectPose(object_, pos_, yaw_, shown, frame_);
+    if (fadeSet_ >= 0 && shown == set_ && fadeWeight_ > 0) {
+        fadeWeight_ -= dt / 0.2f;
+        // walk <-> run: the faded cycle keeps step with the new one (they switched at the same phase); stand <-> walk:
+        // the old pose holds
+        float ph = frame_ / float(std::max(1, scene_->animCycle(object_, set_)));
+        scene_->setObjectFade(object_, fadeSet_, fadeLen_ > 0 ? ph * float(fadeLen_) : fadeFrame_, std::max(0.f, fadeWeight_));
+        if (fadeWeight_ <= 0) fadeSet_ = -1;
+    } else if (fadeSet_ >= 0) {
+        fadeSet_ = -1;
+        scene_->setObjectFade(object_, -1, 0, 0);
+    }
     if (getenv("HG2_FOOTDBG") && object_ == atoi(getenv("HG2_FOOTDBG"))) {
         Vec3 l, r;
         const char* fl = getenv("HG2_FOOTL") ? getenv("HG2_FOOTL") : "frm-lld"; const char* frr = getenv("HG2_FOOTR") ? getenv("HG2_FOOTR") : "frm-rld";
         if (scene_->frameBottom(object_, fl, l) && scene_->frameBottom(object_, frr, r))
-            SDL_Log("foot %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f speed %.2f set %d frame %.1f", pos_.x, pos_.y, pos_.z, l.x, l.y, l.z,
-                    r.x, r.y, r.z, speed_, shown, frame_);
+            SDL_Log("foot %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f speed %.2f set %d frame %.1f side %.2f slope %.1f yaw %.4f", pos_.x, pos_.y, pos_.z, l.x, l.y, l.z,
+                    r.x, r.y, r.z, speed_, shown, frame_, strafe_, std::acos(std::min(1.f, scene_->groundNormal(pos_.x, pos_.z).y)) / kDeg, yaw_);
     }
     if (reactSet_ >= 0) {
         reactFrame_ += 30.f * dt;
@@ -338,6 +336,139 @@ void Player::update(float dt, const PlayerInput& in) {
         float v = std::min(1.f, std::fabs(speed_) / std::max(1.f, run));
         audio->setLoop(motor_, soundVolume * (0.12f + 0.3f * v), &pos_, 400.f);
     }
+}
+
+void Player::drive(float dt, float target, float targetStrafe, bool throttle, bool turning, bool ecy, const Vec3& fwd,
+                   const Vec3& right) {
+    // The ground part of the physics step FUN_1003af10 (gear class vtable 0x101434a0, constants set in FUN_10060270
+    // from the gear's Maneuverability m), as accelerations on the local velocity (forward speed_, sideways strafe_).
+    // The step is at most 1/10 s.
+    dt = std::min(dt, 0.1f);
+    if (dt <= 0) return;
+    const float m = float(def_.maneuverability);
+    const float drivek = 20.f + 2.f * m;    // +0xf58: drive per unit throttle
+    const float dragk = 20.f + 2.f * m;     // +0xf60: forward resistance
+    const float sidek = 400.f + 30.f * m;   // +0xf68: sideways resistance
+    const float g = 20.f, mu = 2.f;         // DAT_10163ae8, +0xff0
+    float vmax = (sms_ ? def_.maxRunSpeed * 1.5f : def_.maxRunSpeed) * std::max(0.1f, speedScale);  // +0x270
+    vmax = std::max(1.f, vmax);
+    // FUN_1003cc30 (vtable +0x268): with the ground normal n (the triangle under the body's centre, FUN_1003db20 /
+    // the terrain tile's plane query) in the gear's frame, n_h |n_h| × k × g on each horizontal axis,
+    // k = min(3 / n_y^2, 6) (skates min(5 / n_y^2, 9)). On ground flatter than n_y 0.8 (36.9°) the sideways part is
+    // dropped, and the forward part too with no throttle. It is added after the traction cap below, so with the drive
+    // at most 20 a gear can't climb past ~30° (60 tan^2 = 20), and on faces steeper than 36.9° the slope beats the
+    // 40 of traction and the gear slides until the ground levels out.
+    float sF = 0, sR = 0;
+    if (ecy) {
+        Vec3 n = scene_->groundNormal(pos_.x, pos_.z);
+        float ny = n.y < 1e-5f ? 1.f : n.y;
+        float k = sms_ ? std::min(5.f / (ny * ny), 9.f) : std::min(3.f / (ny * ny), 6.f);
+        float nf = dot(n, fwd), nr = dot(n, right);
+        sF = nf * std::fabs(nf) * k * g, sR = nr * std::fabs(nr) * k * g;
+        if (ny > 0.8f) {
+            sR = 0;
+            if (!throttle) sF = 0;
+        }
+    }
+    // FUN_1003c0b0: forward drive = drivek × throttle, throttle in -1..1. The port's input asks for a speed: the
+    // throttle that holds it on the flat (drive = resistance: throttle = r^2 = (target / vmax)^2), plus what a pilot
+    // adds to hold it against the slope and to close the gap, never past full throttle.
+    float u = target / vmax;
+    float aF = 0;
+    if (throttle) {
+        float t = u * std::fabs(u) - sF / drivek + (target - speed_) / vmax;
+        aF = drivek * std::clamp(t, -1.f, 1.f);
+    }
+    // FUN_1003c5f0: forward resistance on r = v / vmax, r |r| plus 2 r with no throttle; r × 10 while the body isn't
+    // in a moving state (+0x124a clear: stand, crouching), so a standing gear stops dead. Past r = 2 the velocity
+    // is scaled back by 1 / r. It never reverses the speed within a step.
+    float r = speed_ / vmax;
+    if (ecy && (state_ == sIdle_ || state_ == sKneel_ || state_ == sProne_)) r *= 10.f;
+    if (r > 2.f) speed_ /= r, strafe_ /= r;
+    float drag = dragk * (r * std::fabs(r) + (throttle ? 0.f : 2.f * r));
+    drag = std::copysign(std::min(std::fabs(drag), std::fabs(speed_) / dt), drag);
+    aF -= drag;
+    // FUN_1003c750: sideways resistance sidek × v_side / vmax (v_side clamped to ±20), never reversing within a step;
+    // the port's sidestep is a commanded sideways speed, so it resists the difference
+    float vs = strafe_ - targetStrafe;
+    float aR = -sidek * std::clamp(vs, -20.f, 20.f) / vmax;
+    aR = std::copysign(std::min(std::fabs(aR), std::fabs(vs) / dt), aR);
+    // FUN_1003c8f0: drive and resistance together are capped at the traction mu × g; the slope force comes after
+    float mag = std::hypot(aF, aR);
+    if (mag > mu * g) aF *= mu * g / mag, aR *= mu * g / mag;
+    aF += sF, aR += sR;
+    speed_ += aF * dt;
+    strafe_ += aR * dt;
+    // FUN_1003af10: with no throttle or turn and under 0.05 m/s the body is put at rest
+    if (!throttle && !turning && std::fabs(targetStrafe) < 1e-3f && std::hypot(speed_, strafe_) < 0.05f) speed_ = 0, strafe_ = 0;
+}
+
+float Player::cycleStride(int set) {
+    for (auto& [k, v] : strides_)
+        if (k == set) return v;
+    int len = std::max(1, scene_->animCycle(object_, set));
+    Vec3 t = scene_->animTravel(object_, set, float(len));
+    float s = std::hypot(t.x, t.z);
+    strides_.push_back({set, s});
+    return s;
+}
+
+Vec3 Player::advanceCycle(float dt, float v) {
+    auto travel = [&](int set, int len, float from, float to) {  // root travel from key `from` to `to` (unwrapped)
+        auto T = [&](float f) { return scene_->animTravel(object_, set, f); };
+        if (to >= float(len)) return (T(float(len)) - T(from)) + T(to - float(len));
+        if (to < 0) return (Vec3() - T(from)) + (T(to + float(len)) - T(float(len)));
+        return T(to) - T(from);
+    };
+    auto rateFor = [&](int set, int len) {
+        // FUN_10064d20 sets the cycle's rate to speed × 1 / stride (FUN_100344e0): one loop per stride travelled
+        float stride = cycleStride(set);
+        float r;
+        if (stride > 0.5f) {
+            r = v * float(len) / stride;
+        } else {  // no root motion: pace by the state's nominal speed
+            float ref = state_ == sRun_ ? def_.maxRunSpeed : state_ == sKneelWalk_ ? def_.maxWalkSpeed * 0.35f
+                      : state_ == sCrawl_ ? def_.maxWalkSpeed * 0.2f : def_.maxWalkSpeed;
+            r = 30.f * v / std::max(0.5f, ref);
+        }
+        return std::clamp(r, -90.f, 90.f);
+    };
+    int len = std::max(1, scene_->animCycle(object_, set_));
+    frame_ = std::fmod(std::max(0.f, frame_), float(len));
+    float rate = rateFor(set_, len);
+    float f0 = frame_, f1 = f0 + rate * dt;
+    if (wantCycle_ >= 0 && size_t(state_) < ecy_.states.size()) {
+        for (auto& t : ecy_.states[size_t(state_)].transitions) {
+            if (t.trigger != wantCycle_ || t.target < 0 || size_t(t.target) >= ecy_.states.size()) continue;
+            if (t.kind != 1 || t.events.empty()) {  // no sync points: switch now, at the same phase
+                fire(wantCycle_);
+                wantCycle_ = -1;
+                return advanceCycle(dt, v);
+            }
+            // a kind-1 transition (walk <-> run) waits for the cycle to reach one of its events' phases a, and starts
+            // the target at phase b (a = b = 0.05 / 0.3 / 0.55 / 0.8 on the gears: the foot plants)
+            for (auto& e : t.events) {
+                float p = e.a * float(len), hit = 0;
+                bool found = false;
+                for (float q : {p - float(len), p, p + float(len)})
+                    if ((rate > 0 && q > f0 && q <= f1) || (rate < 0 && q < f0 && q >= f1)) hit = q, found = true;
+                if (!found) continue;
+                Vec3 out = travel(set_, len, f0, hit);
+                float rest = rate != 0 ? (f1 - hit) / rate : 0.f;  // time left after the switch
+                fadeSet_ = set_, fadeLen_ = len, fadeWeight_ = 1.f;  // cross-fade the old cycle out (port: 0.2 s)
+                state_ = t.target, set_ = e.id, loop_ = ecy_.states[size_t(state_)].type != 0, wantCycle_ = -1;
+                int nlen = std::max(1, scene_->animCycle(object_, set_));
+                float g0 = std::fmod(e.b, 1.f) * float(nlen), g1 = g0 + rateFor(set_, nlen) * rest;
+                out += travel(set_, nlen, g0, g1);
+                frame_ = std::fmod(g1 + float(nlen), float(nlen));
+                return out;
+            }
+            break;
+        }
+    }
+    Vec3 out = travel(set_, len, f0, f1);
+    frame_ = std::fmod(f1 + float(len), float(len));
+    return out;
 }
 
 void Player::sounds(float prevPhase) {

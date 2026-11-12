@@ -65,6 +65,9 @@ public:
     virtual void weather(int type, int preset) { (void)type, (void)preset; }  // type -1: keep; preset -1: keep
     // Kill (FUN_100d3e20): destroyed the normal way (explosion, wreck, event 5), unlike InstantDeath's removal.
     virtual void destroyUnit(int unit) { (void)unit; }
+    virtual void setSmoking(int unit, int level) { (void)unit, (void)level; }
+    // SetGlobalWindVariables (FUN_100d3980 -> FUN_10124c00): the particles' wind and its gust strength
+    virtual void wind(float x, float y, float z, float gust) { (void)x, (void)y, (void)z, (void)gust; }
     // ArtilleryStrike (FUN_100d8b20): after `delay` seconds, `count` shells half a second apart land within 15 m of p.
     virtual void artilleryStrike(const float p[3], float delay, int count) { (void)p, (void)delay, (void)count; }
 
@@ -105,10 +108,14 @@ public:
     int selectedCheckpoint = -1;
     std::string screenText;
     float screenTextUntil = 0;
-    // Cinematic camera (ControlCamera): moves along a mission path for `duration` seconds looking at a unit,
-    // a point or another path, then raises `endSig` on the calling script (`skipSig` when skipped).
+    // Cinematic camera (ControlCamera): moves along a mission path for `duration` seconds looking at a unit, a point or
+    // another path. When the time runs out it raises `endSig` on the calling script but stays the view (finished) until
+    // something switches the view (FUN_10092ff0): ControlCamera(), another camera kind, or the user's view key, which
+    // raise `skipSig` instead if the camera had not finished yet. `kind` is the original's camera object (FUN_10092ff0
+    // case 2..5): starting the same kind again just re-arms it, no signal for the old run.
     struct Cinematic {
-        bool active = false;
+        bool active = false, finished = false;
+        int kind = 0;
         const MissionPath* path = nullptr;
         const MissionPath* lookPath = nullptr;
         int lookUnit = -1;
@@ -119,20 +126,23 @@ public:
         ScriptVM* vm = nullptr;
     } cinematic;
     bool cinematicCamera(float eye[3], float at[3]);
-    void skipCinematic();
+    // The view leaves the scripted camera (FUN_10092ff0 case 0/1: cockpit or external view): raises the camera's
+    // pending signal and ends cinematic mode (+0x521). ControlCamera(), the user's view toggle and the skip key.
+    void releaseCamera();
+    void skipCinematic() { releaseCamera(); }
+    // SetCinematicControl(on) (FUN_10092f70, +0x521): letterbox, no reticle or HUD, brains stand down. Cleared only by
+    // SetCinematicControl(0) or a switch to the cockpit / external view (FUN_10092ff0 case 0 and 1).
     bool cinematicMode = false;
     // AllowCinematicCombat (FUN_100d67e0, DAT_10268824): brains keep fighting while cinematicMode is on.
     bool allowCinematicCombat = false;
-    // Brains stand down during cinematic mode unless combat is allowed (FUN_100b9ae0 checks +0x521). Held only while a
-    // scripted camera runs: some missions (S1J) never clear the mode themselves, and the port doesn't know yet what in
-    // the original ends it when a camera path runs out.
-    bool combatHold() const { return cinematicMode && cinematic.active && !allowCinematicCombat; }
+    // FUN_100b9ae0: a brain only picks targets / engages when +0x521 is clear or DAT_10268824 is set.
+    bool combatHold() const { return cinematicMode && !allowCinematicCombat; }
     // BeginFade: screen fades in from black (in = true) or out to black over `time`, then raises `signal`.
     struct Fade { bool active = false, in = false; float time = 1, t = 0; int signal = -1; ScriptVM* vm = nullptr; } fade;
     float fadeAlpha() const;  // 0 clear .. 1 black
     int focusOf(ScriptVM* vm) const;  // SetCinematicControl(on): letterboxed, no HUD
     const Mission* mission() const { return mission_; }
-    void startCinematic(ScriptVM& vm, const std::string& path, int endSig, int skipSig, float duration);
+    void startCinematic(ScriptVM& vm, int kind, const std::string& path, int endSig, int skipSig, float duration);
     const std::string& message(int index) const;  // the mission's UserMessageFile line
     bool checkpointPosition(int id, float out[3]);
     void selectCheckpoint(int id);

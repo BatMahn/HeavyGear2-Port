@@ -620,7 +620,7 @@ void Combat::update(float dt) {
             }
         }
         // damaged gears smoke (DAMAGEL light / DAMAGEH heavy)
-        if (particles && u.hp > 0 && u.maxHp > 0 && u.hp < u.maxHp * 0.5f && (u.smokeTimer -= dt) <= 0) {
+        if (particles && !smoking_.count(obj) && u.hp > 0 && u.maxHp > 0 && u.hp < u.maxHp * 0.5f && (u.smokeTimer -= dt) <= 0) {
             u.smokeTimer = 0.6f;
             Vec3 at;
             if (!scene_->frameWorld(obj, "bdb", at) && !scene_->frameWorld(obj, "bda", at)) {
@@ -629,6 +629,17 @@ void Combat::update(float dt) {
             }
             particles->spawn(u.hp < u.maxHp * 0.25f ? "DAMAGEH" : "DAMAGEL", at, 0.7f);
         }
+    }
+    // script smoke (SetSmoking): attached at the unit's damage frame, or 0.65 x its radius above the origin
+    for (auto& [obj, level] : smoking_) {
+        if (level == 0 || !particles || scene_->objectHidden(obj) || (smokeTimers_[obj] -= dt) > 0) continue;
+        smokeTimers_[obj] = 0.6f;
+        Vec3 at;
+        if (!scene_->frameWorld(obj, "bdb", at) && !scene_->frameWorld(obj, "bda", at)) {
+            if (!scene_->objectPosition(obj, at)) continue;
+            at.y += 0.65f * std::max(2.f, scene_->objectRadius(obj));
+        }
+        particles->spawn(level == 2 ? "DAMAGEH" : "DAMAGEL", at, 1.5f);
     }
     for (size_t i = 0; i < shots_.size();) {
         Shot& s = shots_[i];
@@ -658,6 +669,7 @@ void Combat::update(float dt) {
         if (dead) shots_.erase(shots_.begin() + long(i));
         else i++;
     }
+    updateShells(dt);
     for (size_t i = 0; i < flashes_.size();) {
         flashes_[i].age += dt;
         if (flashes_[i].age > 0.35f) flashes_.erase(flashes_.begin() + long(i));
@@ -670,6 +682,8 @@ void Combat::draw() {
         if (s.beam) scene_->drawExtra(beam_, along(s.pos, s.vel, length(s.vel), 0.25f), false, 0.8f);
         else scene_->drawExtra(tracer_, along(s.pos - normalize(s.vel) * 3.f, s.vel, 3.f, 0.18f), false);
     }
+    for (auto& s : shells_)
+        if (length(s.vel) > 1.f) scene_->drawExtra(tracer_, along(s.pos - normalize(s.vel) * 2.f, s.vel, 2.f, 0.3f), false);
     for (auto& f : flashes_) {
         float sz = f.size * (0.4f + f.age * 3.f);
         scene_->drawExtra(flash_, along(f.pos - Vec3(0, sz * 0.5f, 0), Vec3(0, 1, 0), sz, sz), false,
@@ -709,14 +723,50 @@ void Combat::destroy(int object) {
 }
 
 void Combat::artilleryShell(const Vec3& p) {
-    // the shell's weapon comes from a run-time table; a heavy field mortar's blast stands in (Damages 25, radius 20)
-    static WeaponDef shell = [] {
-        WeaponDef w;
-        w.name = "Artillery", w.damage = 25.f, w.collateralRadius = 20.f, w.mortarAngle = -25.f;
-        return w;
-    }();
-    if (audio) audio->play("explrg01.wav", 1.f, &p, 800.f);
-    impact(p, shell, -1, -1, 1.f);
+    // the shell (vtable 0x10140a08) carries no MstrWpns weapon: ammo class 0x1f (mortar, medium) picks the
+    // MTMOM trail and the MEMOG / MEMOO explosions from the effect tables FUN_100e4ca0 fills; blast radius 30,
+    // damage word 0x190080 >> 14 = 100, doubled by the explosion = 200 (Damages 20)
+    shells_.push_back({p, Vec3(0, 0, 0)});
+}
+
+void Combat::blast(const Vec3& p, float radius, float damage, int object) {
+    if (particles) particles->spawn(object >= 0 ? "MEMOO" : "MEMOG", p, 1.f);
+    else flashes_.push_back({p, 0.f, 6.f});
+    if (audio) audio->play("expdyna2.wav", 1.f, &p, 800.f);
+    const auto& objs = scene_->mission().objects;
+    for (size_t i = 0; i < objs.size(); i++) {
+        if (!units_.count(int(i)) && !structure_.count(int(i))) continue;
+        Vec3 q;
+        if (!scene_->objectPosition(int(i), q) || scene_->objectHidden(int(i))) continue;
+        float dist = int(i) == object ? 0.f : length(q - p);
+        if (dist <= radius) blasts_.push_back({int(i), dist / 60.f, damage, p});
+    }
+    if (getenv("HG2_DEBUG")) SDL_Log("blast at %.0f %.0f %.0f (object %d): %zu in range", p.x, p.y, p.z, object, blasts_.size());
+}
+
+void Combat::updateShells(float dt) {
+    for (size_t i = 0; i < shells_.size();) {
+        Shell& s = shells_[i];
+        s.vel.y -= 20.f * dt;  // FUN_100e7910: 20 m/s^2
+        Vec3 next = s.pos + s.vel * dt;
+        if (particles && (s.trail -= dt) <= 0) s.trail = 0.05f, particles->spawn("MTMOM", s.pos, 1.f, Vec3(0, 1, 0), 0.3f);
+        float tg = scene_->terrainRay(s.pos, next), to;
+        int obj = scene_->raycast(s.pos, next, -1, to);
+        float t = std::min(tg, to);
+        if (t <= 1.f || s.pos.y < -1000.f) {
+            blast(s.pos + (next - s.pos) * std::min(t, 1.f), 30.f, 200.f, to <= tg ? obj : -1);
+            shells_.erase(shells_.begin() + long(i));
+            continue;
+        }
+        s.pos = next;
+        i++;
+    }
+    for (size_t i = 0; i < blasts_.size();) {
+        if ((blasts_[i].wait -= dt) > 0) { i++; continue; }
+        Blast b = blasts_[i];
+        blasts_.erase(blasts_.begin() + long(i));
+        if (!scene_->objectHidden(b.object)) applyDamage(b.object, -1, b.damage, b.at);
+    }
 }
 }  // namespace hg2
 

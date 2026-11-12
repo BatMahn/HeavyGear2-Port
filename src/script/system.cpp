@@ -235,23 +235,28 @@ void samplePath(const MissionPath& p, float f, float out[3]) {
 }
 }  // namespace
 
-void ScriptSystem::startCinematic(ScriptVM& vm, const std::string& path, int endSig, int skipSig, float duration) {
+void ScriptSystem::startCinematic(ScriptVM& vm, int kind, const std::string& path, int endSig, int skipSig, float duration) {
     if (endSig > 0x3f) endSig = -1;
     if (skipSig > 0x3f) skipSig = -1;
     const MissionPath* p = mission_ ? mission_->path(path) : nullptr;
-    if (!p) {
+    if (!p) {  // FUN_100d5f10 etc.: "Path %s does not exist", the skip signal goes out, the view stays as it was
         log("camera path " + path + " does not exist");
-        if (endSig >= 0) vm.signal(endSig);
+        if (skipSig >= 0) vm.signal(skipSig);
         return;
     }
+    // FUN_10092ff0: switching from another camera object raises that one's pending signal
+    if (cinematic.active && cinematic.kind != kind) {
+        int sig = cinematic.finished ? -1 : cinematic.skipSig;
+        if (sig >= 0 && cinematic.vm) cinematic.vm->signal(sig);
+    }
     cinematic = Cinematic{};
-    cinematic.active = true, cinematic.path = p, cinematic.vm = &vm;
+    cinematic.active = true, cinematic.kind = kind, cinematic.path = p, cinematic.vm = &vm;
     cinematic.endSig = endSig, cinematic.skipSig = skipSig;
     cinematic.duration = duration > 0 ? duration : 5.f;
     if (verbose)
-        SDL_Log("[script] camera on path %s (%zu points, %.0f,%.0f,%.0f .. %.0f,%.0f,%.0f) for %.1fs (end signal %d)", path.c_str(),
+        SDL_Log("[script] camera on path %s (%zu points, %.0f,%.0f,%.0f .. %.0f,%.0f,%.0f) for %.1fs (end signal %d, skip %d)", path.c_str(),
                 p->points.size(), p->points.front()[0], p->points.front()[1], p->points.front()[2], p->points.back()[0],
-                p->points.back()[1], p->points.back()[2], cinematic.duration, endSig);
+                p->points.back()[1], p->points.back()[2], cinematic.duration, endSig, skipSig);
 }
 
 bool ScriptSystem::cinematicCamera(float eye[3], float at[3]) {
@@ -272,11 +277,14 @@ bool ScriptSystem::cinematicCamera(float eye[3], float at[3]) {
     return true;
 }
 
-void ScriptSystem::skipCinematic() {
-    if (!cinematic.active) return;
-    cinematic.active = false;
-    int sig = cinematic.skipSig >= 0 ? cinematic.skipSig : cinematic.endSig;
-    if (sig >= 0 && cinematic.vm) cinematic.vm->signal(sig);
+void ScriptSystem::releaseCamera() {
+    if (cinematic.active) {
+        int sig = cinematic.finished ? -1 : cinematic.skipSig;  // a finished camera already raised its end signal
+        cinematic.active = false;
+        if (sig >= 0 && cinematic.vm) cinematic.vm->signal(sig);
+    }
+    if (verbose && cinematicMode) SDL_Log("[script] cinematic mode 0 (view back to the user)");
+    cinematicMode = false;
 }
 
 int ScriptSystem::focusOf(ScriptVM* vm) const {
@@ -329,8 +337,10 @@ void ScriptSystem::update(float dt) {
         fadeHold_ = !fade.in;  // stays black after a fade out
         if (fade.signal >= 0 && fade.vm) fade.vm->signal(fade.signal);
     }
-    if (cinematic.active && (cinematic.t += dt) >= cinematic.duration) {
-        cinematic.active = false;
+    // FUN_10093490: the current camera reports finished (timer run out, FUN_1007d2a0) -> its end signal, once
+    if (cinematic.active && !cinematic.finished && (cinematic.t += dt) >= cinematic.duration) {
+        cinematic.finished = true, cinematic.t = cinematic.duration;
+        if (verbose) SDL_Log("[script] camera finished (end signal %d)", cinematic.endSig);
         if (cinematic.endSig >= 0 && cinematic.vm) cinematic.vm->signal(cinematic.endSig);
     }
     // focus notification: event 23 on the watching script when its focus unit comes within range
@@ -462,30 +472,32 @@ void ScriptSystem::bindBuiltins() {
     for (int ov : {0, 1})
         V::bind("QueueDialog", ov, [](V& vm, const uint8_t* t, ScriptValue&) { g_sys->world().queueDialog(vm.strings().get(argI(t, 8))); });
     V::bind("QueueDialog", 2, [](V& vm, const uint8_t* t, ScriptValue&) { g_sys->world().queueDialog(vm.strings().get(argI(t, 12))); });
-    // ControlCamera: ov0 ends the cinematic; the others share (-4 duration, -8 end signal, -0xc skip signal).
+    // ControlCamera: ov0 ends the cinematic; the others share (-4 duration, -8 skip signal, -0xc end signal): the
+    // camera's setup (vtable +0x18, FUN_1007d2d0) stores -0xc at +0x14 (raised when it finishes, FUN_10093490) and -8
+    // at +0x18 (raised when the view is switched away first, FUN_10092ff0; also when the path doesn't exist).
     // ControlCamera() (FUN_100d5ef0 -> FUN_10092ff0(0)): back to the cockpit view, which also ends cinematic mode (+0x521)
     V::bind("ControlCamera", 0, [](V&, const uint8_t*, ScriptValue&) {
-        g_sys->cinematic.active = false, g_sys->cinematicMode = false;
+        g_sys->releaseCamera();
         if (g_sys->verbose) SDL_Log("[script] camera back to the user");
     });
     V::bind("ControlCamera", 1, [](V& vm, const uint8_t* t, ScriptValue&) {
-        g_sys->startCinematic(vm, vm.strings().get(argI(t, 0x10)), argI(t, 8), argI(t, 0xc), argF(t, 4));
+        g_sys->startCinematic(vm, 3, vm.strings().get(argI(t, 0x10)), argI(t, 0xc), argI(t, 8), argF(t, 4));
     });
     V::bind("ControlCamera", 2, [](V& vm, const uint8_t* t, ScriptValue&) {
-        g_sys->startCinematic(vm, vm.strings().get(argI(t, 0x1c)), argI(t, 8), argI(t, 0xc), argF(t, 4));
+        g_sys->startCinematic(vm, 2, vm.strings().get(argI(t, 0x1c)), argI(t, 0xc), argI(t, 8), argF(t, 4));
         auto& c = g_sys->cinematic;
         c.hasLookPoint = true, c.lookPoint[0] = argF(t, 0x18), c.lookPoint[1] = argF(t, 0x14), c.lookPoint[2] = argF(t, 0x10);
     });
     V::bind("ControlCamera", 3, [](V& vm, const uint8_t* t, ScriptValue&) {
-        g_sys->startCinematic(vm, vm.strings().get(argI(t, 0x14)), argI(t, 8), argI(t, 0xc), argF(t, 4));
+        g_sys->startCinematic(vm, 4, vm.strings().get(argI(t, 0x14)), argI(t, 0xc), argI(t, 8), argF(t, 4));
         g_sys->cinematic.lookUnit = unitName(vm, t, 0x10);
     });
     V::bind("ControlCamera", 4, [](V& vm, const uint8_t* t, ScriptValue&) {
-        g_sys->startCinematic(vm, vm.strings().get(argI(t, 0x14)), argI(t, 8), argI(t, 0xc), argF(t, 4));
+        g_sys->startCinematic(vm, 4, vm.strings().get(argI(t, 0x14)), argI(t, 0xc), argI(t, 8), argF(t, 4));
         g_sys->cinematic.lookUnit = unitRef(vm, argI(t, 0x10));
     });
     V::bind("ControlCamera", 5, [](V& vm, const uint8_t* t, ScriptValue&) {
-        g_sys->startCinematic(vm, vm.strings().get(argI(t, 0x18)), argI(t, 8), argI(t, 0xc), argF(t, 4));
+        g_sys->startCinematic(vm, 5, vm.strings().get(argI(t, 0x18)), argI(t, 0xc), argI(t, 8), argF(t, 4));
         if (g_sys->cinematic.active && g_sys->mission())
             g_sys->cinematic.lookPath = g_sys->mission()->path(vm.strings().get(argI(t, 0x10)));
     });
@@ -501,13 +513,14 @@ void ScriptSystem::bindBuiltins() {
         g_sys->cinematicMode = argI(t, 4) != 0;
         if (g_sys->verbose) SDL_Log("[script] cinematic mode %d", int(g_sys->cinematicMode));
     });
-    // SetWeaponConstraints(unit, pitch-, pitch+, yaw-, yaw+) in degrees (FUN_100d6b90 / FUN_100d6c10 -> vtable +0x1a4,
-    // which only the turret class implements, FUN_100ec400: pitch joint (-a, b), yaw joint (-c, d)). Yaw only here.
+    // SetWeaponConstraints(unit, a, b, c, d) in degrees (FUN_100d6b90 / FUN_100d6c10, x pi/180 -> vtable +0x1a4, which
+    // only the turret class implements, FUN_100ec400): pitch joint JXA (+0xd98) limits [-a, b], yaw joint JYA (+0xd9c)
+    // limits [-c, d]. Positive joint angles turn the gun down / to the unit's left (see docs/FORMATS.md).
     V::bind("SetWeaponConstraints", 0, [](V& vm, const uint8_t* t, ScriptValue&) {
-        g_sys->world().unitCommand(unitRef(vm, argI(t, 0x14)), "weaponArc", argF(t, 8), argF(t, 4));
+        g_sys->world().unitCommand(unitRef(vm, argI(t, 0x14)), "weaponArc", argF(t, 0x10), argF(t, 0xc), argF(t, 8), argF(t, 4));
     });
     V::bind("SetWeaponConstraints", 1, [](V& vm, const uint8_t* t, ScriptValue&) {
-        g_sys->world().unitCommand(unitName(vm, t, 0x14), "weaponArc", argF(t, 8), argF(t, 4));
+        g_sys->world().unitCommand(unitName(vm, t, 0x14), "weaponArc", argF(t, 0x10), argF(t, 0xc), argF(t, 8), argF(t, 4));
     });
     // ---- brain settings and unit orders (0.7)
     auto cmd = [](int unit, const char* c, float a = 0, float b = 0, float cc = 0, float d = 0, const std::string& str = std::string()) {
@@ -575,12 +588,18 @@ void ScriptSystem::bindBuiltins() {
     V::bind("ActivateLight", 0, [](V& vm, const uint8_t* t, ScriptValue&) { g_sys->world().activateLight(vm.strings().get(argI(t, 8)), argI(t, 4) != 0); });
     V::bind("SetWeatherType", 0, [](V&, const uint8_t* t, ScriptValue&) { g_sys->world().weather(argI(t, 4), -1); });
     V::bind("SetWeather", 0, [](V&, const uint8_t* t, ScriptValue&) { g_sys->world().weather(-1, argI(t, 4)); });
+    // SetGlobalWindVariables(vector, gust) (FUN_100d3980 -> FUN_10124c00): wind velocity and gust strength for particles.
+    V::bind("SetGlobalWindVariables", 0, [](V&, const uint8_t* t, ScriptValue&) {
+        g_sys->world().wind(argF(t, 0x10), argF(t, 0xc), argF(t, 8), argF(t, 4));
+    });
+    // SetSmoking(unit, level) (FUN_100d3a40 / FUN_100d3a80): unit +0xbe0; 0 = none, 1 light, 2 heavy smoke.
+    V::bind("SetSmoking", 0, [](V& vm, const uint8_t* t, ScriptValue&) { g_sys->world().setSmoking(unitRef(vm, argI(t, 8)), argI(t, 4)); });
+    V::bind("SetSmoking", 1, [](V& vm, const uint8_t* t, ScriptValue&) { g_sys->world().setSmoking(unitName(vm, t, 8), argI(t, 4)); });
     // Accepted without effect in the port:
-    //  SetGlobalWindVariables (FUN_100d3980) wind for particles; SetSmoking (FUN_100d3a40) a damaged unit's smoke;
     //  ActivateTacticalAccess (FUN_100d4070) enables the tactical map view (+0x611), which the port doesn't have;
     //  SetMoveAvoid (FUN_100d3f90) unit flag 0x10000 that nothing in the sim reads; SaveMission (FUN_100d4380) calls
     //  FUN_1008db90, which only returns 1; Defend (FUN_100d8b10) is an empty function in the original.
-    for (const char* n : {"SetGlobalWindVariables", "ActivateTacticalAccess", "SetSmoking", "SetTacticalClass", "SetTactic",
+    for (const char* n : {"ActivateTacticalAccess", "SetTacticalClass", "SetTactic",
                           "BestTactic", "SquadCombatTactic", "SquadNonCombatTactic", "ChangeWeapon", "SetMoveAvoid",
                           "SaveMission", "Defend"})
         for (int ov = 0; ov < 3; ov++) V::bind(n, ov, [](V&, const uint8_t*, ScriptValue&) {});

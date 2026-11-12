@@ -336,6 +336,8 @@ void ScriptVM::callNative(int sym) {
     pending_ = 0;
     ScriptValue& r0 = reg_[0];
     auto it = natives().find({nm, s.overload});
+    static const bool trace = getenv("HG2_BTRACE") != nullptr;  // test: log every builtin call with its script line
+    if (trace && nm != "GetTimeStep" && nm != "Wait") fprintf(stderr, "[bt] %s %s/%d\n", where().c_str(), nm.c_str(), s.overload);
     if (it != natives().end()) it->second(*this, stack_.data() + sp_, r0);
     else host_.unimplemented(*this, nm, s.overload);
 }

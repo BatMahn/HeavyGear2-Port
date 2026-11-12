@@ -54,6 +54,10 @@ public:
     size_t live() const { return parts_.size(); }
     // Precipitation around the viewer (SetWeatherType 1 rain / 2 snow, SetWeather preset: level = preset % 5).
     void setWeather(int type, int level) { weatherType_ = type, weatherLevel_ = level; }
+    // Wind (SetGlobalWindVariables / FUN_10124c00): particles drift toward the wind velocity, scaled per particle by
+    // 1 - gust * (b - 128) / 128 where b = byte(dot(position, wind) + a running phase) (FUN_10127c90): gusts travel
+    // along the wind as a 256-step sawtooth.
+    void setWind(const Vec3& w, float gust) { wind_ = w, gust_ = gust; }
     void setViewer(const Vec3& eye) { eye_ = eye; }
     // A glow drawn this frame only (mission lights).
     void flare(const Vec3& pos, const uint8_t rgb[3], float size) { flares_.push_back({pos, {rgb[0], rgb[1], rgb[2]}, size}); }
@@ -83,6 +87,8 @@ private:
     std::mt19937 rng_{1234};
     int weatherType_ = 0, weatherLevel_ = 0;
     Vec3 eye_;
+    Vec3 wind_;
+    float gust_ = 0, windPhase_ = 0;
     float weatherAcc_ = 0;
     std::unique_ptr<ParticleType> rain_, snow_;
     struct Flare { Vec3 pos; uint8_t rgb[3]; float size; };

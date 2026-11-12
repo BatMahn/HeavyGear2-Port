@@ -61,7 +61,7 @@ public:
     void speed(int object, float kph);
     void attack(int object, int target);
     void notifyRange(int object, float r);
-    void command(int object, const std::string& cmd, float a, float b, float c, const std::string& s);
+    void command(int object, const std::string& cmd, float a, float b, float c, const std::string& s, float d = 0);
     void hitBy(int object, int shooter);  // remember the attacker, wake up
     void hitReaction(int object, int level) { if (Unit* u = find(object)) u->body.hitReaction(level); }
     // Squad mates: keep a formation slot (leader-relative: x right, z behind) and fight what comes close.
@@ -148,8 +148,17 @@ private:
         bool cinematic = false;     // SetCinematicControl(unit): script-driven, no targets of its own (brain +0x198)
         bool autoAim = true;        // AutoAim (brain +0xe8): the gunner tracks and shoots its target
         bool arc = false;           // SetWeaponConstraints on a turret (FUN_100ec400): yaw limits about its placement
-        float arcMin = 0, arcMax = 0, arcHome = 0;
+        float arcMin = 0, arcMax = 0, arcHome = 0;  // radians, positive = to the right of the placement
+        // turret gun elevation limits (pitch joint JXA): +-30 degrees from the turret's setup (FUN_100eb0c0) until
+        // SetWeaponConstraints; positive = up
+        float pitchMin = -0.5235988f, pitchMax = 0.5235988f, gunPitch = 0;
+        // AutoScan (brain +0xe9, on by default; off while a target is set, back on when it is dropped or on
+        // AutoPilot): an idle gear sweeps its torso (FUN_10037e30)
+        bool autoScan = true;
+        int lastTarget2 = -1;
+        float scanGoal = 0, scanPause = 0;
     };
+    void scan(Unit& u, float dt);
     Unit* find(int object);
     const Unit* find(int object) const;
     bool positionOf(int object, Vec3& out) const;

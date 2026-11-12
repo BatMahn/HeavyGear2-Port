@@ -187,10 +187,11 @@ void Scene::walkPose(const Instance& i, const std::function<void(int, const Fram
     const AnimSet* set = i.sets && size_t(i.set) < i.sets->size() ? &(*i.sets)[size_t(i.set)] : nullptr;
     float t = i.frame >= 0 ? i.frame : time_ * 30.f;
     if (i.frame < 0 && set && set->length > 0) t = std::fmod(t, float(set->length));
+    const AnimSet* fade = i.fadeSet >= 0 && i.fadeWeight > 0 && i.sets && size_t(i.fadeSet) < i.sets->size() ? &(*i.sets)[size_t(i.fadeSet)] : nullptr;
     const AnimSet* over = i.overlaySet >= 0 && i.sets && size_t(i.overlaySet) < i.sets->size() ? &(*i.sets)[size_t(i.overlaySet)] : nullptr;
     // Locomotion sets carry root motion: the top frame walks forward through the cycle (7.5 m over a Jaguar's walk) and
-    // jumps back when it loops. The body's own movement already carries the gear, so the top frames' horizontal
-    // travel is taken out (its height - the step's bob - stays); Player sets the playback rate from that stride.
+    // jumps back when it loops. As in FUN_10064d20 the top frames' horizontal travel is taken out here (its height -
+    // the step's bob - stays) and Player moves the body by it instead (animTravel), playing the cycle at speed / stride.
     std::function<void(int, const Mat4&, bool, bool, int)> walk = [&](int fi, const Mat4& parent, bool hiddenBranch, bool inOverlay, int depth) {
         bool top = depth <= 1;  // the model's root and its children (the body, frm-bda, carries the travel)
         while (fi >= 0 && fi < int(m.frames.size())) {
@@ -219,7 +220,18 @@ void Scene::walkPose(const Instance& i, const std::function<void(int, const Fram
                 Mat4 l0 = animLocal(tr, frameMatrix(f), 0.f);
                 local.m[3][0] = l0.m[3][0], local.m[3][2] = l0.m[3][2];
             }
+            if (fade && !(ov && over)) {  // cross-fade from the previous cycle
+                const AnimTrack* ftr = nullptr;
+                std::string n = lower(f.name);
+                for (auto& trk : fade->tracks)
+                    if (trk.frame == n) {
+                        ftr = &trk;
+                        break;
+                    }
+                if (ftr || tr) local = animLocalBlend(ftr, i.fadeFrame, tr, ft, frameMatrix(f), 1.f - i.fadeWeight, top);
+            }
             if (i.twist != 0 && frameIs(f.name, "tst")) local = Mat4::rotY(i.twist) * local;
+            if (i.pitch != 0 && frameIs(f.name, "xa")) local = Mat4::rotX(i.pitch) * local;  // rotX(+) lifts -Z
             Mat4 w = local * parent;
             bool hid = hiddenBranch;
             for (auto& h : i.hiddenFrames) hid = hid || frameIs(f.name, h);
@@ -268,35 +280,37 @@ int cycleEnd(const AnimSet& set) {
 }
 }  // namespace
 
-float Scene::animStride(int object, int animSet) const {
+Vec3 Scene::animTravel(int object, int animSet, float t) const {
+    // what walkPose takes out of the top frames at time t (their horizontal travel since the set's first key), in the
+    // model's space: the root's own, plus each child's turned by the root's posed rotation
     for (auto& i : instances_) {
         if (i.object != object || !i.rig || !i.sets || animSet < 0 || size_t(animSet) >= i.sets->size()) continue;
         const AnimSet& set = (*i.sets)[size_t(animSet)];
         const Model& m = i.rig->model;
-        float best = 0;
-        std::vector<int> topFrames;  // the root level and its children
-        for (int fi = 0; fi >= 0 && fi < int(m.frames.size()); fi = m.frames[size_t(fi)].sibling) {
-            topFrames.push_back(fi);
-            for (int c = m.frames[size_t(fi)].child; c >= 0 && c < int(m.frames.size()); c = m.frames[size_t(c)].sibling) topFrames.push_back(c);
-        }
-        for (int fi : topFrames)
+        auto track = [&](int fi) -> const AnimTrack* {
+            std::string n = lower(m.frames[size_t(fi)].name);
             for (auto& trk : set.tracks)
-                if (lower(m.frames[size_t(fi)].name) == trk.frame && !trk.pos.empty()) {
-                    Mat4 a = animLocal(&trk, frameMatrix(m.frames[size_t(fi)]), 0.f);
-                    Mat4 b = animLocal(&trk, frameMatrix(m.frames[size_t(fi)]), float(cycleEnd(set)));
-                    best = std::max(best, std::hypot(b.m[3][0] - a.m[3][0], b.m[3][2] - a.m[3][2]));
-                }
-        if (getenv("HG2_STRIDEDBG"))
-            for (size_t fi = 0; fi < m.frames.size(); fi++)
-                for (auto& trk : set.tracks)
-                    if (lower(m.frames[fi].name) == trk.frame && !trk.pos.empty()) {
-                        Mat4 a = animLocal(&trk, frameMatrix(m.frames[fi]), 0.f), b = animLocal(&trk, frameMatrix(m.frames[fi]), float(set.length));
-                        SDL_Log("stride set %d frame %zu %s top %d d=(%.2f %.2f %.2f) len %d", animSet, fi, m.frames[fi].name.c_str(), 0,
-                                b.m[3][0] - a.m[3][0], b.m[3][1] - a.m[3][1], b.m[3][2] - a.m[3][2], set.length);
-                    }
-        return best;
+                if (trk.frame == n) return &trk;
+            return nullptr;
+        };
+        Vec3 sum;
+        for (int fi = 0; fi >= 0 && fi < int(m.frames.size()); fi = m.frames[size_t(fi)].sibling) {
+            const AnimTrack* tr = track(fi);
+            Mat4 local = animLocal(tr, frameMatrix(m.frames[size_t(fi)]), t);
+            if (tr && !tr->pos.empty()) {
+                Mat4 l0 = animLocal(tr, frameMatrix(m.frames[size_t(fi)]), 0.f);
+                sum += Vec3(local.m[3][0] - l0.m[3][0], 0, local.m[3][2] - l0.m[3][2]);
+            }
+            for (int c = m.frames[size_t(fi)].child; c >= 0 && c < int(m.frames.size()); c = m.frames[size_t(c)].sibling) {
+                const AnimTrack* ct = track(c);
+                if (!ct || ct->pos.empty()) continue;
+                Mat4 a = animLocal(ct, frameMatrix(m.frames[size_t(c)]), t), b = animLocal(ct, frameMatrix(m.frames[size_t(c)]), 0.f);
+                sum += local.transformDir(Vec3(a.m[3][0] - b.m[3][0], 0, a.m[3][2] - b.m[3][2]));
+            }
+        }
+        return sum;
     }
-    return 0;
+    return Vec3();
 }
 
 bool Scene::frameBottom(int object, const std::string& frame, Vec3& out) const {
@@ -421,7 +435,9 @@ void Scene::buildTerrain() {
         for (int ix = 0; ix + 1 < t.dim; ix++)
             for (int iz = 0; iz + 1 < t.dim; iz++) {
                 Vertex a = vtx(ix, iz), b = vtx(ix + 1, iz), c = vtx(ix + 1, iz + 1), d = vtx(ix, iz + 1);
-                dst.insert(dst.end(), {a, b, c, a, c, d});
+                // each cell's own diagonal (attribute bit 15), as Terrain::sample follows it
+                if (Terrain::mainDiagonal(t, ix, iz)) dst.insert(dst.end(), {a, b, c, a, c, d});
+                else dst.insert(dst.end(), {a, b, d, b, c, d});
             }
     }
     std::vector<Vertex> all;
@@ -451,6 +467,11 @@ void Scene::addInstance(size_t index) {
         Mat4 world = rot * Mat4::translate(Vec3(float(o.pos[0]), float(o.pos[1]), float(o.pos[2])));
         inst.world = world;
         inst.object = int(index);
+        // Not drawn in game: the spawn points (0x56-0x59; FUN_10085570 / FUN_100883d0 build them as team 1-4 markers that
+        // only join the world's spawn list at +0x2860, never the object list that is drawn) and objects carrying
+        // Light_Information (0x43): the factory makes the light, gives it the object's name and placement and then
+        // releases the object itself (lampicon.m is the editor's icon).
+        if ((o.type >= 0x56 && o.type <= 0x59) || o.isLight) inst.noDraw = true;
         if (inst.mesh) {
             std::string key = upper(mdl);
             while (!key.empty() && key[0] == '@') key.erase(0, 1);
@@ -463,6 +484,11 @@ void Scene::addInstance(size_t index) {
             // Tree_Object: only the trunk stands in the way; gears brush through branches and crowns.
             const CollShape* cs = bi == boxes_.end() || marker ? nullptr : o.type == 0x47 ? &bi->second.trunk : &bi->second.full;
             if (cs && !cs->boxes.empty()) inst.boxes = cs;
+            // Jeeps (0x4e) and hovertanks (0x4f): the world collision pass (FUN_100a0b00 -> vtable +0x88 on both
+            // objects) reaches them like any unit, but their contact handler is the empty FUN_10004590 (gears note the
+            // other object, FUN_10036280; the base vehicle flags itself, FUN_100045c0) and nothing pushes units apart, so
+            // nothing is stopped by them: their boxes take hits only.
+            if (o.type == 0x4e || o.type == 0x4f) inst.solid = false;
             // rigid inverse: transpose the rotation, rotate the negated translation
             Mat4 inv = Mat4::identity();
             for (int r2 = 0; r2 < 3; r2++)
@@ -605,6 +631,11 @@ void Scene::setObjectPose(int object, const Vec3& pos, float yaw, int animSet, f
         }
 }
 
+void Scene::setObjectFade(int object, int animSet, float frame, float weight) {
+    for (auto& i : instances_)
+        if (i.object == object) i.fadeSet = weight > 0 ? animSet : -1, i.fadeFrame = frame, i.fadeWeight = weight;
+}
+
 void Scene::setObjectOverlay(int object, int animSet, float frame, const std::string& rootFrame) {
     for (auto& i : instances_)
         if (i.object == object) i.overlaySet = animSet, i.overlayFrame = frame, i.overlayRoot = lower(rootFrame);
@@ -618,7 +649,7 @@ void Scene::clearDamage(int object) {
 bool Scene::collide(Vec3& pos, float radius, float height, int ignoreObject) const {
     bool hit = false;
     for (auto& i : instances_) {
-        if (!i.boxes || i.object == ignoreObject || i.hidden) continue;
+        if (!i.boxes || !i.solid || i.object == ignoreObject || i.hidden) continue;
         Vec3 lp = i.inv.transformPoint(pos);
         bool hitHere = false;
         // boxes reaching above the knee (1.2 m step) and below the head; others are stepped over / walked under
@@ -699,6 +730,10 @@ void Scene::setObjectTwist(int object, float yaw) {
     for (auto& i : instances_)
         if (i.object == object) i.twist = yaw;
 }
+void Scene::setObjectPitch(int object, float up) {
+    for (auto& i : instances_)
+        if (i.object == object) i.pitch = up;
+}
 
 void Scene::setObjectDrawn(int object, bool drawn) {
     for (auto& i : instances_)
@@ -708,7 +743,7 @@ void Scene::setObjectDrawn(int object, bool drawn) {
 float Scene::supportHeight(const Vec3& pos, float step, int ignoreObject) const {
     float best = groundHeight(pos.x, pos.z);
     for (auto& i : instances_) {
-        if (!i.boxes || i.object == ignoreObject || i.hidden) continue;
+        if (!i.boxes || !i.solid || i.object == ignoreObject || i.hidden) continue;
         Vec3 lp = i.inv.transformPoint(pos);
         i.boxes->query(Vec3(lp.x, -1e9f, lp.z), Vec3(lp.x, lp.y + step, lp.z), [&](const CollBox& b) {
             if (lp.x < b.lo.x || lp.x > b.hi.x || lp.z < b.lo.z || lp.z > b.hi.z) return;

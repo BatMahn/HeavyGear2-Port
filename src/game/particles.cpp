@@ -264,10 +264,20 @@ void Particles::update(float dt) {
     streams_.erase(std::remove_if(streams_.begin(), streams_.end(),
                                   [](const Stream& s) { return s.t > std::max(0.05f, s.part.emitter ? s.part.emitter->duration : 1.f); }),
                    streams_.end());
+    float windSpeed = length(wind_);
+    windPhase_ = std::fmod(windPhase_ + windSpeed * windSpeed * dt, 256.f);
     for (auto& p : parts_) {
         p.age += dt;
         p.vel.y -= p.type->gravity * dt;
-        if (p.type != rain_.get()) p.vel = p.vel * std::max(0.f, 1.f - 0.6f * dt);  // air drag (rain is at terminal speed)
+        if (p.type != rain_.get()) {  // air drag toward the wind (rain is at terminal speed)
+            Vec3 air;
+            if (windSpeed > 0.1f) {
+                float b = std::fmod(dot(p.pos, wind_) - windPhase_, 256.f);
+                if (b < 0) b += 256.f;
+                air = wind_ * (1.f - gust_ * (std::floor(b) - 128.f) / 128.f);
+            }
+            p.vel = p.vel + (air - p.vel) * std::min(1.f, 0.6f * dt);
+        }
         p.pos += p.vel * dt;
     }
     parts_.erase(std::remove_if(parts_.begin(), parts_.end(), [](const Particle& p) { return p.age >= p.life; }), parts_.end());

@@ -36,9 +36,13 @@ public:
     // A second animation set played on one branch of the model (ECY kind-3 transitions: hit reactions on the
     // body, "BDB"); set < 0 removes it.
     void setObjectOverlay(int object, int animSet, float frame, const std::string& rootFrame);
+    // Fade the pose from another set (weight 1 .. 0) into the current one; animSet < 0 ends it.
+    void setObjectFade(int object, int animSet, float frame, float weight);
     int animLength(int object, int animSet) const;
-    float animStride(int object, int animSet) const;
-    int animCycle(int object, int animSet) const;  // a looping set's length without its trailing padding keys  // the top frame's horizontal travel over the set (root motion)
+    int animCycle(int object, int animSet) const;  // a looping set's length without its trailing padding keys
+    // The root motion walkPose strips from a locomotion set at key time t: the top frames' horizontal travel since
+    // the first key, in model space (models face -Z). Player moves the body by its change from frame to frame.
+    Vec3 animTravel(int object, int animSet, float t) const;
     // Pushes a vertical cylinder (feet at pos.y, given radius/height) out of static object boxes.
     // Returns true if it hit something.
     bool collide(Vec3& pos, float radius, float height, int ignoreObject) const;
@@ -47,6 +51,7 @@ public:
     void setObjectDrawn(int object, bool drawn);
     int addObject(const MissionObject& o);  // spawned at run time (fountains); returns its object index
     void setObjectTwist(int object, float yaw);  // rotates the torso-twist frame (frm-tst)
+    void setObjectPitch(int object, float up);   // raises a turret's gun on its pitch-joint frame (frm-xa)
     // Rigged units: world position of a frame (e.g. "frm-hp1", "frm-POV"), the nearest of several frames to a
     // point, whether a frame hangs under another, and hiding a frame with everything attached to it.
     bool frameWorld(int object, const std::string& frame, Vec3& out) const;
@@ -113,9 +118,13 @@ private:
         const CollShape* boxes = nullptr;  // static collision volumes (nullptr: none - rigged units, markers)
         bool hidden = false;
         bool noDraw = false;   // still collides / takes hits (player in cockpit view)
+        bool solid = true;     // its boxes block movement and can be stood on (otherwise they only take hits)
         float twist = 0;
+        float pitch = 0;  // turret gun elevation (frm-xa), radians up
         int overlaySet = -1;
         float overlayFrame = 0;
+        int fadeSet = -1;      // set being faded out (walk <-> run), its key time and remaining weight
+        float fadeFrame = 0, fadeWeight = 0;
         std::string overlayRoot;  // lower case
         std::vector<std::string> hiddenFrames;
         std::vector<std::pair<std::string, float>> damagedFrames;  // lower-case frame name, strength

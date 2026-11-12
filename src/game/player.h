@@ -24,8 +24,8 @@ public:
     bool initObject(const FileSystem& fs, Scene& scene, int object);  // any gear / vehicle object
     bool canWalk() const { return !ecy_.states.empty(); }
     void setYaw(float y) { yaw_ = y; }
-    void teleport(const Vec3& p) { pos_ = p, vy_ = 0, air_ = false, slide_ = Vec3(); }
-    void halt() { speed_ = 0, strafe_ = 0, slide_ = Vec3(); }  // FullStop: motion zeroed on the spot
+    void teleport(const Vec3& p) { pos_ = p, vy_ = 0, air_ = false; }
+    void halt() { speed_ = 0, strafe_ = 0; }  // FullStop: motion zeroed on the spot
     void update(float dt, const PlayerInput& in);
     bool active() const { return object_ >= 0; }
     int object() const { return object_; }
@@ -70,6 +70,12 @@ private:
     void resolveStates();
     int stateOf(int from, int trigger) const;
     void sounds(float prevPhase);
+    // Ground drive, resistance, traction and slope forces (FUN_1003af10's force terms) on the local velocity.
+    void drive(float dt, float target, float targetStrafe, bool throttle, bool turning, bool ecy, const Vec3& fwd, const Vec3& right);
+    // Play the current locomotion cycle for dt at body speed v (signed); returns the model-space root travel. Takes a
+    // pending walk <-> run change (wantCycle_) at the transition's sync points.
+    Vec3 advanceCycle(float dt, float v);
+    float cycleStride(int set);  // a cycle's root travel per loop (m), cached
 
     Scene* scene_ = nullptr;
     int object_ = -1;
@@ -79,7 +85,10 @@ private:
     float footprint_ = 1.4f;  // half the distance between the feet (ground probes)
     float yaw_ = 0, speed_ = 0, strafe_ = 0, vy_ = 0, frame_ = 0;
     bool air_ = false, sms_ = false, lockForward_ = false;
-    Vec3 slide_;  // downhill slide velocity on steep ground (the original's slope force, FUN_1003cc30)
+    int wantCycle_ = -1;
+    int fadeSet_ = -1, fadeLen_ = 1;  // cycle being cross-faded out after a walk <-> run switch
+    float fadeWeight_ = 0, fadeFrame_ = 0;  // fadeLen_ 0: the old pose holds at fadeFrame_  // walk / run trigger waiting for a sync point
+    std::vector<std::pair<int, float>> strides_;  // cycleStride cache
     int wantPosture_ = -1;
     bool dead_ = false;
     int reactSet_ = -1;

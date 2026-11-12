@@ -229,7 +229,7 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
         void setInvincible(int u, bool on) override { if (combat) combat->setInvincible(u, on); }
         Scene* sceneRW = nullptr;
         int unitRelation(int u, int ref) override { return ai ? ai->relation(u, ref) : -1; }
-        void unitCommand(int u, const std::string& c, float a, float b, float cc, float, const std::string& str) override {
+        void unitCommand(int u, const std::string& c, float a, float b, float cc, float d, const std::string& str) override {
             if (c == "water") {
                 if (sceneRW) sceneRW->setWaterLevel(a);
             } else if (c == "instantDeath") {
@@ -247,13 +247,20 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             } else if (c == "fullStop" && pl && u == player) {
                 pl->halt();
             } else if (ai) {
-                ai->command(u, c, a, b, cc, str);
+                ai->command(u, c, a, b, cc, str, d);
             }
         }
         void destroyUnit(int u) override {  // Kill: the ordinary destruction (explosion, wreck, event 5)
             if (combat && u >= 0) combat->destroy(u);
         }
-        struct Strike { Vec3 p; float wait; int left; };
+        void setSmoking(int u, int level) override {
+            if (getenv("HG2_DEBUG")) SDL_Log("SetSmoking %d -> %d", u, level);
+            if (combat && u >= 0) combat->setSmoking(u, level);
+        }
+        Vec3 windV = Vec3(6.f, 0.f, 0.f);  // the particle system's start-up wind (FUN_101246e0): (6, 0, 0), gust 1.5
+        float gust = 1.5f;
+        void wind(float x, float y, float z, float g) override { windV = Vec3(x, y, z), gust = g; }
+        struct Strike { Vec3 p; float wait; int left; float timer = 0.5f; };
         std::vector<Strike> strikes;
         void artilleryStrike(const float p[3], float delay, int count) override {
             if (count > 0) strikes.push_back({Vec3(p[0], p[1], p[2]), delay, count});
@@ -425,14 +432,16 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
     player.particles = &particles;
     ai.setParticles(&particles);
     world.sceneRW = &scene;
-    // ArtilleryStrike shells (the "Artillery" object, FUN_100349d0 / FUN_10034a50): after the delay one every 0.5 s,
-    // dropped from 150 m within +-15 m of the point
+    // ArtilleryStrike (the "Artillery" object, FUN_100348b0 / FUN_100349d0 / FUN_10034a50): once the delay has run
+    // a 0.5 s timer starts; each time it runs out a shell is released at rest 150 m above the script's point,
+    // offset by 0..30 m (-15) in x and z, until `count` have gone
     auto updateStrikes = [&](float dt) {
         for (auto& st : world.strikes) {
-            if ((st.wait -= dt) > 0 || st.left <= 0) continue;
+            if (st.left <= 0 || (st.wait -= dt) > 0) continue;
+            if ((st.timer -= dt) >= 0) continue;
             float x = st.p.x + float(rand() % 30000) * 0.001f - 15.f, z = st.p.z + float(rand() % 30000) * 0.001f - 15.f;
-            combat.artilleryShell(Vec3(x, scene.groundHeight(x, z), z));
-            st.left--, st.wait = 0.5f;
+            combat.artilleryShell(Vec3(x, st.p.y + 150.f, z));
+            st.left--, st.timer = 0.5f;
         }
         world.strikes.erase(std::remove_if(world.strikes.begin(), world.strikes.end(), [](const World::Strike& st) { return st.left <= 0; }),
                             world.strikes.end());
@@ -1018,7 +1027,12 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             pin.throttle = T.startX >= 0 ? 0.f : 1.f;
             pin.run = f > T.driveFrames / 2;
             pin.turn = T.startX >= 0 ? 0.f : 0.3f;
-            if (T.startX >= 0 && f % 3 == 0 && !getenv("HG2_DRIVETO")) {  // test mode: hold position and fire forward
+            const bool straight = getenv("HG2_STRAIGHT") != nullptr;  // test: straight line, walk / run / coast / run
+            if (straight) {
+                int q = f * 4 / std::max(1, T.driveFrames);
+                pin.turn = 0, pin.throttle = q == 2 ? 0.f : 1.f, pin.run = q == 1 || q == 3;
+            }
+            if (T.startX >= 0 && f % 3 == 0 && !getenv("HG2_DRIVETO") && !straight) {  // test mode: hold position and fire forward
                 Vec3 mz, aim;
                 aimPoint(mz, aim);
                 combat.fire(mz, aim);
@@ -1063,6 +1077,7 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             combat.update(1.f / 30.f);
             if (const char* w = getenv("HG2_WEATHER")) particles.setWeather(atoi(w), atoi(strchr(w, ':') ? strchr(w, ':') + 1 : "3"));  // test: "1:3"
             else particles.setWeather(world.weatherType, world.weatherPreset % 5);
+        particles.setWind(world.windV, world.gust);
             particles.setViewer(frameParams().eye);
             particles.update(1.f / 30.f);
             fountains.update(1.f / 30.f, player.position(), spawnUnit, unitAlive);
@@ -1204,7 +1219,10 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
                 else if ((kc == SDLK_KP_ENTER || kc == SDLK_SPACE) && scripts.cinematic.active) scripts.skipCinematic();
                 else if (kc == SDLK_KP_ENTER || kc == SDLK_SPACE) edge.jump = chase;
                 else if (kc == SDLK_KP_0 || kc == SDLK_INSERT || kc == SDLK_R) edge.toggleSkates = true;
-                else if (kc == SDLK_C) external = !external, app.settings.externalView = external;
+                else if (kc == SDLK_C) {  // view toggle (FUN_10093490 -> FUN_10092ff0(0/1)): also leaves a scripted camera
+                    external = !external, app.settings.externalView = external;
+                    if (scripts.cinematic.active || scripts.cinematicMode) scripts.releaseCamera();
+                }
                 else if (kc == SDLK_N) scripts.stepCheckpoint(1);
                 else if (kc == SDLK_M && audio) audio->musicVolume = audio->musicVolume > 0 ? 0.f : app.settings.music;
                 else if (kc == SDLK_B) scripts.stepCheckpoint(-1);
@@ -1311,6 +1329,7 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
         combat.update(dt);
         if (const char* w = getenv("HG2_WEATHER")) particles.setWeather(atoi(w), atoi(strchr(w, ':') ? strchr(w, ':') + 1 : "3"));  // test: "1:3"
         else particles.setWeather(world.weatherType, world.weatherPreset % 5);
+        particles.setWind(world.windV, world.gust);
         particles.setViewer(frameParams().eye);
         particles.update(dt);
         fountains.update(dt, player.position(), spawnUnit, unitAlive);
@@ -1323,6 +1342,18 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
         }
         drainCombatEvents();
         if (getenv("HG2_AIDBG") && int(scripts.time() / 10) != int((scripts.time() - dt) / 10)) ai.dump();
+        if (const char* ws = getenv("HG2_WSIGNAL")) {  // test automation: "t:sig[:unit]" sends a world (or unit) signal once at t s
+            static bool sent = false;
+            float at = 0;
+            int sig = -1;
+            char unit[64] = {};
+            int n = sscanf(ws, "%f:%d:%63s", &at, &sig, unit);
+            if (!sent && n >= 2 && scripts.time() > at) {
+                sent = true;
+                if (n == 3) scripts.unitSignal(world.findUnit(unit), sig);
+                else scripts.worldSignal(sig);
+            }
+        }
         if (const char* ae = getenv("HG2_AUTOEND"))  // test automation: succeed after n seconds
             if (scripts.time() > float(atof(ae)) && world.endCode < 0) world.missionOver(1, 1.f);
         // the user's gear destroyed with no script ending the mission: failure after a while

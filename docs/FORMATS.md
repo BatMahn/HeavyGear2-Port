@@ -82,6 +82,13 @@ heights) is the world **Z** axis, not X. Read that way, every mission's objects 
 < 1 m on H01, H03, S01, D01) instead of 7–26 m off. `loadTerrain` transposes the grid on load; the texture UVs keep
 the file's axes.
 
+**Cell diagonals** (`FUN_10097670` normal / `FUN_10097ed0` height+plane, terrain tile vtable 0x10147100 +0x34 / +0x2c,
+queried by `FUN_10095940`): each grid cell is two triangles, and bit 15 (`0x8000`) of the attribute word at the cell's
+low corner picks the diagonal: set → (ix, iz)-(ix+1, iz+1), clear → (ix+1, iz)-(ix, iz+1). The triangle is picked by
+the nearer of the two off-diagonal corners; height and normal are that triangle's plane (no smoothing, no averaging).
+Most cells have the bit clear (H01: 3162 of 65536 set), so the default split is the anti-diagonal. The port's
+`Terrain::sample` / `normal` and the drawn mesh follow it.
+
 ## .XB animation library (`FUN_10013a70`, sets `FUN_100143b0`)
 `u32 crc; u32 size; u32 nsets;` each set: repeated `0x0d` Animation: `STR frame; u32 tok; while tok == 0x0e: { u32 keyType (0 rot, 1 scale, 2 pos); u32 n; n × { i32 time; f32[4 or 3] } ; tok = u32 }; u32 next` until next != 0x0d.
 Rotation keys are quaternions stored (w,x,y,z); the engine's row-vector matrix equals the conjugate's D3DX matrix.
@@ -319,15 +326,45 @@ ChickenWalkers and Mounts set 30° (`FUN_10035460`, `FUN_10041220`, `FUN_1006f62
 So gears and the other walkers avoid ground steeper than 30° and water deeper than their radius (unless Amphibious) and
 pay (depth + 1) × step for wading; only hovers path across water freely.
 
-Slope force on a grounded gear (`FUN_1003cc30`, gear vtable +0x268, summed in the physics step `FUN_1003af10`): with
-the ground normal n (+0xfc0, from `FUN_10095940`) turned into the gear's frame, the force on each horizontal axis is
-n·|n| × k × mass × 20 (g, `DAT_10163ae8`), k = min(3 / n_y², 6) or, on skates (+0x13e0, getter vtable +0x2d4),
-min(5 / n_y², 9). Where n_y > 0.8 (flatter than 36.9°) the sideways part is dropped, and the forward part too while
-the throttle (+0xf48) is zero. The drive and resistance forces are capped at the traction μ × mass × g with μ = 2
-(+0xff0, `FUN_1003c8f0`), the slope force is added after that cap: a walking gear can't climb faces much steeper than
-~39° (3 tan²θ × 20 = 40), a skating one ~32°, and a gear standing on ground steeper than 36.9° slides. Standing on an
-object needs a contact normal · up > 0.7 (`FUN_1003db20`). The port applies the same numbers to a slide velocity
-(only the part beyond the traction on an axis the gear is driving along), damped by its own drag.
+Gear ground physics (`FUN_1003af10`, the gear class's vtable 0x101434a0 +0x24c; per-gear constants from its init
+`FUN_10060270`, m = the def's Maneuverability `0x94`, all forces × mass so they read as accelerations). The step is at
+most 1/10 s. On the gear's local velocity (z forward = -z model axis, x sideways):
+- drive (`FUN_1003c0b0`, +0x258): drivek × throttle on z, drivek = 20 + 2m (+0xf58), throttle (+0xf48) -1..1.
+- forward resistance (`FUN_1003c5f0`, +0x260): r = v / vmax, vmax (+0x270) = top speed byte × 6 × 0.278 (skate speed
+  `+0xbfc` on skates); r × 4 with +0x1249 and × 10 with +0x124a clear (stand / posture changes: `FUN_10064d20` sets
+  +0x124a in the moving states). Past r = 2 the whole velocity is scaled by 1 / r. Force = dragk (r|r| + 2r with no
+  throttle), dragk = 20 + 2m (+0xf60), limited to |v| / dt so it never reverses the speed. Steady state on the flat:
+  r = √throttle.
+- sideways resistance (`FUN_1003c750`): sidek × clamp(v_x, ±20) / vmax, sidek = 400 + 30m (+0xf68), same |v| / dt limit.
+- traction cap (`FUN_1003c8f0`, +0x270): the horizontal sum of the three above is scaled down to μ g = 2 × 20 (+0xff0,
+  `DAT_10163ae8`); airborne it is zeroed.
+- gravity (`FUN_1003d1f0`), then the slope force (`FUN_1003cc30`, +0x268) **after** the cap: with the ground normal n
+  (+0xfc0, the terrain triangle under the body's centre from `FUN_10095940`, or the contact normal of an object stood
+  on, `FUN_1003db20`, which needs n · up > 0.7) in the gear's frame, n_h |n_h| × k × g on each horizontal axis,
+  k = min(3 / n_y², 6), on skates (+0x13e0, getter +0x2d4) min(5 / n_y², 9). Where n_y > 0.8 (flatter than 36.9°)
+  the sideways part is dropped, and the forward part too while the throttle is zero.
+- with no throttle and no turn, |v| < 0.05 (`DAT_10163af0`) puts the body at rest.
+So a gear standing on ground steeper than 36.9° slides (the slope beats the 40 of traction) until the ground levels
+out, and with the drive at most 20 + 2m a gear can't climb faces past ~30° (60 tan²θ = 20) - the same 30° slope
+limit the path planner uses for gears. The port asks for a speed rather than a throttle, so it sets the throttle a
+pilot would: the flat-ground value (target / vmax)², plus what holds the speed against the slope, clamped to full.
+
+Locomotion animation (`FUN_10064d20`, gear vtable +0x2fc, called first in the physics step): in the walk / run states
+it advances the animation (anim object vtable +0x78), takes the root's travel over the step (the difference of the
+anim's root position before and after, +0x30 / +0x48), cancels it on the displayed root, and sets the cycle's rate to
+speed × FUN_100344e0 = speed / stride (fast inverse square root of the cycle's root travel, 8 when the travel is under
+0.125) through `FUN_10055290` - one loop per stride travelled. Its result (root travel − v_z dt, plus the sideways
+travel) is added to the position when grounded, so the body moves exactly by the animation's root motion and the
+planted foot stays put however the speed changes. Walk / run is picked from the speed (`FUN_10064700`): ECY trigger 1
+(stop) under 1 % of vmax with no turn, 2 (walk) up to the walk speed (+0x10b4), 3 (run) above it.
+
+.ECY transition events `(set, a, b)`: walk → run and run → walk are kind 1 with events at a = b = 0.05, 0.30, 0.55,
+0.80 (sync points: the switch waits for the cycle to reach one of the phases a and starts the target cycle at b);
+stand → walk is kind 1 `(1, 0, 0.3)`; walk → stand is kind 0 with a = 0.15, 0.25, 0.35, 0.65, 0.75, 0.85. The
+transition's f32 is 35 (walk → run, walk → stand), 15 (run → walk, stand → walk). The runtime that consumes them is a
+table-built machine (`FUN_10030960` → handlers `FUN_10030310`..`FUN_10030920` emitting opcode edges through
+`FUN_10016230`), not decoded further; the port takes the sync points as above and cross-fades 0.2 s on stand <-> walk
+and walk <-> run (the stand pose's feet are ~1 m from any walk pose).
 
 Life Support (perk 22, bit 26 of the perk word +0xc30): nothing in `hg2sim.dll` tests it; it only counts toward the
 gear's threat value in the shell. Backup Life Support (bit 4) is the crew-critical backup. The port plans its own: an A* over 4 m cells round ground steeper than the unit's slope limit, deep water, solid
@@ -369,3 +406,65 @@ Models wider than 200 m (Gomorrah's city, `epl10005.m`) get one grid per mesh. O
 `[5] & ~0x40000`) and Plane_NoColl (0x61) `[5] & ~0x40000`; Ghosts_Object (0x13d) only clears its targetable flag
 (`+0x1a`) and still collides. Tree_Object (0x47) instances collide with the part rising from the base (the trunk).
 `hg2extract <data> collaudit` compares the volumes with the old one-box-per-mesh scheme; `HG2_COLLVIEW=1` draws them.
+
+## Cinematic mode and scripted cameras
+- `+0x521` on the sim (`DAT_10164724`) is cinematic mode. Writers: the constructor (`FUN_1008331c`, 0),
+  `SetCinematicControl(on)` (`FUN_100d67b0` → `FUN_10092f70`: also sets the letterbox scale `DAT_101d3ab0` to 1/15 or
+  1.0), and the view switch `FUN_10092ff0` cases 0 (cockpit) and 1 (external; not case 8, the death camera), which clear
+  it. `FUN_10092ff0(0/1)` runs from `ControlCamera()` (`FUN_100d5ef0`), the user's internal/external view key
+  (`FUN_10093490`, `DAT_10297090`, handled even while `+0x520` user control is off), the player switch `FUN_10093e60`,
+  the tactical map closing and a gear flag check in `FUN_10094700`. A camera path running out does **not** end it.
+- Readers: reticle / HUD (`FUN_10134ba0`), brains (`FUN_100b9ae0`: targets only when `+0x521 == 0 || DAT_10268824`,
+  the `AllowCinematicCombat` flag), map key (`FUN_10093490`), sim speed scale `FUN_10076780`, sounds.
+- Camera objects: `+0x283c` (ov2, case 2), `+0x2840` (ov1, case 3), `+0x2844` (ov3/ov4, case 4), `+0x2848` (ov5, case 5).
+  Setup (vtable +0x18 → `FUN_1007d2d0`) stores the script's `-0xc` argument at `+0x14` and `-8` at `+0x18`; `-4` > 0
+  is a timer at `+0xc` (flag `+0x10`). `finished` (vtable +0x14, `FUN_1007d2a0`) = timer < 0, else the path-end flag
+  `DAT_101fce48`. Each frame `FUN_10093490` raises `+0x14` (end signal) once when the current camera finishes, then
+  clears both (`FUN_1007c4e0`); the camera stays the view. `FUN_10092ff0` switching from one camera object to another
+  raises its `+0x14` if finished, else `+0x18` (interrupted). A missing path / unit raises `-8` at once.
+  So `ControlCamera(path, ..., unit, endSig = -0xc, skipSig = -8, time = -4)`; S1J's end handler (signal 37) does
+  `ControlCamera(); SetUserControl(1); SetCinematicControl(0)`, its skip handler (38) only restores control.
+
+## SetWeaponConstraints (`FUN_100d6b90` / `FUN_100d6c10` → vtable +0x1a4)
+- `(unit, a, b, c, d)` degrees × π/180 (`DAT_101486b4`); only turrets implement +0x1a4 (`FUN_100ec400`): pitch joint
+  `+0xd98` limits `[-a, b]`, yaw joint `+0xd9c` limits `[-c, d]` (joint `+0x16c` min, `+0x170` max, angle `+0x164`).
+- Turret setup `FUN_100eb0c0`: pitch joint "JXA" on frame `-XA` about the object's X basis, default ±30°
+  (`0x3f060a90`); yaw joint "JYA" on frame `-YA` about Y, unlimited (±1e30). Joints (`FUN_1006e360`, tracker
+  `FUN_1006e910`) turn by quaternion keys at 0, 90, 180, 270° about the axis (`FUN_10022640`); the quaternion matrix
+  (`FUN_100226c0`) is the standard one stored row-major and applied to row vectors, i.e. a rotation by −θ. With models
+  facing −Z: positive pitch angle = gun down, positive yaw angle = toward the unit's +X, its left. So elevation runs
+  −b .. a and the turn to the right −d .. c. Shipped scripts (S01, S09, S27) use symmetric yaw (±90°); S01 sets pitch
+  (20, 30) and (40, 50).
+
+## Artillery, markers, unit contact, script effects (0.25.x)
+- **ArtilleryStrike(pos, delay, count)** (`FUN_100d8b20` → the "Artillery" object `FUN_100348b0`): +0x138 delay,
+  +0x13c elapsed, +0x140 shells fired, +0x144 count, +0x148/+0x14c a 0.5 s interval/timer. Once elapsed > delay the
+  timer runs down and each time it passes 0 a shell is made (`FUN_10034a50`; the delay grows by 0.2 per shell, which
+  never catches up). The shell (vtable 0x10140a08, base `FUN_100e51e0`) carries **no MstrWpns weapon**: it starts at
+  rest 150 m above the script's point, offset by `rand() % 30000 × 0.001 − 15` m in x and z, falls under 20 m/s²
+  (`FUN_100e7910`), has ammo class byte 0x1f (+0x1d8; class 3 mortar, size 1 medium) and blast size 30 (+0x1cc),
+  flags/damage word 0x190080 (+0x154). The class byte indexes the effect tables `FUN_100e4ca0` fills at start
+  (`0x1026935c` 8-byte rows {trail row, explosion row}; trails `0x10269470` 3 × {S,M,L}: MTMI, MTBA, MTMO, MTPA;
+  explosions `0x10269330` pairs {ground, object}: MEMIG/MEMIO, MEMOG/MEMOO, MEGRG/MEGRO, MEING/MEINO), so the shell
+  trails MTMOM and bursts as MEMOG on the ground (vtable +0xe8) or MEMOO on an object (+0xe4), with `expdyna2.wav`.
+  The burst (`FUN_100f3140`) is an object of radius 30 living 30/60 = 0.5 s; everything it touches (`FUN_100f36e0`)
+  takes `(word >> 14) × 2` = **200** damage (Damages 20, no falloff, event 0xe) after distance / 60 s
+  (`FUN_100f3430`), plus a 6000-unit push over 0.3 s that the port leaves out.
+- **Spawn points** 0x56–0x59 (team 1–4, unit class with vtable 0x10146580, +0xd98 = team) only join the world's spawn
+  list (+0x2860) and are never added to the drawn object list; **Light_Information** (0x43) makes the light
+  (`FUN_1001aed0`, spot when the first flag is 1), copies the object's name and placement to it and releases the object
+  (its `lampicon.m` is the editor icon). Neither is drawn in game.
+- **Unit contact**: all unit classes share the vehicle base flags (`[4] | 2`, `[5] | 0x10010000`, `[4] & ~0x10000`).
+  The world collision pass (`FUN_100a0b00` / `FUN_100214c0`) calls vtable +0x88 on both objects: gears note the other
+  object at brain +0x1b4 (`FUN_10036280`), the vehicle base sets +0x130 (`FUN_100045c0`), Jeeps (0x101449b8) and
+  hovertanks (0x10144368) have the empty `FUN_10004590`. Nothing pushes units apart; the port gives Jeeps and hovers
+  hit boxes that do not block movement.
+- **SetSmoking(unit, level)** (`FUN_100d3a40`): unit +0xbe0; non-zero → `FUN_100561e0(level − 1)` attaches DAMAGEL (0)
+  or DAMAGEH (1; anything else → 0) at 1.5× scale to the damage frame or 0.65 × radius above the origin; 0 removes it.
+- **SetGlobalWindVariables(vec, gust)** (`FUN_10124c00`): wind at 0x1026d200, |wind| at 0x10296bb0, gust 0x10296bc8.
+  Start-up value (6, 0, 0), gust 1.5 (`FUN_101246e0`). Particles relax toward `wind × (1 − gust × (b − 128) / 128)`
+  with `b = byte(dot(pos, wind) + phase)` at their type's +0x110 rate (`FUN_10127c90`; the port keeps its own drag rate).
+- **AutoScan(unit, on)** (`FUN_100d7470` → brain +0xe9; set by default, cleared while a target is assigned
+  `FUN_100503c0`, set again on dropping it or AutoPilot): the idle sweep `FUN_10037e30` turns the torso at π/2 rad/s
+  (+0x13b8) to yaw goals of `rand × π/2 / 32767` on alternate sides and pitch goals of `rand × 0.3 / 32767`, resting
+  `0.5 + 3 × rand / 32767` s at each.

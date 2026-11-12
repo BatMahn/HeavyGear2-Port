@@ -116,7 +116,7 @@ void AiSystem::notifyRange(int o, float r) {
     if (Unit* u = find(o)) u->enemyRange = std::max(0.f, r);
 }
 
-void AiSystem::command(int o, const std::string& c, float a, float b, float cc, const std::string& s) {
+void AiSystem::command(int o, const std::string& c, float a, float b, float cc, const std::string& s, float d) {
     (void)b, (void)cc;
     Unit* u = find(o);
     if (!u) return;
@@ -142,13 +142,33 @@ void AiSystem::command(int o, const std::string& c, float a, float b, float cc, 
     else if (c == "autoSleep") u->autoSleep = a != 0, u->dozing = u->dozing && a != 0;
     else if (c == "autopilot") {  // back to the brain's own behaviour; FUN_100d7280 also resets auto aim and cinematic control
         u->asleep = false, u->forced = -1, u->drive = 0, u->braked = false;
-        u->autoAim = true, u->cinematic = false;
+        u->autoAim = true, u->cinematic = false, u->autoScan = true;
     } else if (c == "fullStop") u->body.halt();       // FUN_100d44f0: +0x158(0,0), orders kept
     else if (c == "cinematicControl") u->cinematic = a != 0;  // FUN_100d66d0
     else if (c == "autoAim") u->autoAim = a != 0;      // FUN_100d7390
-    else if (c == "weaponArc" && !u->mobile) {         // FUN_100d6b90 -> FUN_100ec400: yaw joint limits (-c, d) degrees
-        u->arc = true, u->arcMin = -a * 0.01745329f, u->arcMax = b * 0.01745329f, u->arcHome = u->body.yaw();
+    else if (c == "autoScan") u->autoScan = a != 0;    // FUN_100d7470 -> FUN_100504c0: brain +0xe9
+    else if (c == "weaponArc" && !u->mobile) {  // SetWeaponConstraints(a, b, cc, d) -> FUN_100ec400
+        // pitch joint [-a, b] (positive = gun down): elevation -b .. a; yaw joint [-cc, d] (positive = to the left):
+        // the port's yaw grows to the right, so the turn from the placement runs -d .. cc
+        const float k = 0.01745329f;
+        u->pitchMin = -b * k, u->pitchMax = a * k;
+        u->arc = true, u->arcMin = -d * k, u->arcMax = cc * k, u->arcHome = u->body.yaw();
     }
+}
+
+// Idle sensor sweep (FUN_10037e30, per frame while +0xe9 is set, the unit has its twist joints and no target): the
+// torso turns at pi/2 rad/s (+0x13b8) to a yaw goal of up to pi/2 on alternate sides (rand * pi/2 / 32767, sign
+// flipped each time), with a pitch goal of up to 0.3 rad likewise (the port's gears have no torso pitch); once there it
+// rests 0.5 + 3 * rand / 32767 s before picking the next goal. The joints' own limits clamp the swing.
+void AiSystem::scan(Unit& u, float dt) {
+    if (!u.autoScan || u.target >= 0 || u.type != 0x48 || u.cinematic || !combat_->alive(u.object)) return;
+    if (u.scanPause > 1e-5f) {
+        if ((u.scanPause -= dt) > 1e-5f) return;
+        u.scanGoal = float(rand() % 32768) * (1.5707964f / 32767.f) * (u.scanGoal < 0 ? 1.f : -1.f);
+    }
+    float goal = std::clamp(u.scanGoal, -1.2f, 1.2f), cur = u.body.twist, step = 1.5707964f * dt;
+    if (std::fabs(goal - cur) <= 1e-5f) u.scanPause = 0.5f + float(rand() % 32768) * (3.f / 32767.f);
+    else u.body.twist = std::fabs(goal - cur) > step ? cur + (goal > cur ? step : -step) : goal;
 }
 
 void AiSystem::hitBy(int o, int shooter) {
@@ -408,6 +428,11 @@ void AiSystem::update(float dt) {
             if (combat != u.inCombat) event(u.object, combat ? EV_COMBAT_START : EV_COMBAT_END);
             u.inCombat = combat;
         }
+        // a target switches the scan off (FUN_100503c0 / FUN_10050440 clear +0xe9), losing it switches it back on
+        if (u.target >= 0) u.autoScan = false;
+        else if (u.lastTarget2 >= 0) u.autoScan = true;
+        u.lastTarget2 = u.target;
+        scan(u, dt);
         if (u.asleep) {
             u.body.update(dt, PlayerInput{});
             continue;
@@ -490,6 +515,14 @@ void AiSystem::update(float dt) {
                 Vec3 d = tp - me;
                 float rel = wrap(std::atan2(-d.x, -d.z) - u.arcHome);
                 if (rel < u.arcMin || rel > u.arcMax) canFire = false;
+            }
+            if (!u.mobile) {  // the gun's pitch joint: elevation to the target, clamped to the joint's limits
+                Vec3 mz;
+                if (!combat_->muzzle(u.object, mz)) mz = me + Vec3(0, 3.f, 0);
+                Vec3 d = tp + Vec3(0, 2.f, 0) - mz;
+                float elev = std::atan2(d.y, std::sqrt(d.x * d.x + d.z * d.z));
+                if (elev < u.pitchMin || elev > u.pitchMax) canFire = false;
+                u.gunPitch = std::clamp(elev, u.pitchMin, u.pitchMax);
             }
             std::uniform_real_distribution<float> R(0.f, 1.f);
             // ---- choose a combat tactic: the script's, else one of the unit class's from the tactic table
@@ -907,6 +940,10 @@ void AiSystem::update(float dt) {
             float y = u.body.yaw() + in.turn * 1.2f * dt;
             if (u.arc) y = u.arcHome + std::clamp(wrap(y - u.arcHome), u.arcMin, u.arcMax);
             u.body.setYaw(y);
+            if (u.target < 0) u.gunPitch *= std::max(0.f, 1.f - dt);  // the gun settles back level
+            scene_->setObjectPitch(u.object, u.gunPitch);               // pitch joint frame (frm-xa)
+            if (getenv("HG2_TURRETDBG") && int(u.clock) != int(u.clock - dt))
+                SDL_Log("turret %d target %d yaw %.2f home %.2f arc %d [%.2f %.2f] pitch %.2f [%.2f %.2f]", u.object, u.target, u.body.yaw(), u.arcHome, u.arc, u.arcMin, u.arcMax, u.gunPitch, u.pitchMin, u.pitchMax);
             in = PlayerInput{};
         }
         if (getenv("HG2_UNITDBG") && u.object == atoi(getenv("HG2_UNITDBG")) && int(u.clock * 2) != int((u.clock - dt) * 2))

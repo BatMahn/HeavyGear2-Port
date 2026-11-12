@@ -63,6 +63,8 @@ struct AnimSet {
 bool loadAnimSets(const Bytes& data, std::vector<AnimSet>& out);
 // Local matrix for a frame at time t (falls back to the frame's own matrix when untracked).
 Mat4 animLocal(const AnimTrack* tr, const Mat4& base, float t);
+// Cross-fade between two tracks (w = weight of b); stripXZ takes out each one's horizontal travel (root motion).
+Mat4 animLocalBlend(const AnimTrack* a, float ta, const AnimTrack* b, float tb, const Mat4& base, float w, bool stripXZ);
 
 struct TerrainTile {
     int32_t x0, z0, x1, z1;
@@ -82,6 +84,9 @@ struct Terrain {
     float sample(float x, float z) const;  // bilinear world height using each tile's own grid
     // Unit normal of the drawn triangle under a point (the plane `sample` follows).
     Vec3 normal(float x, float z) const;
+    // A cell's diagonal: true splits it (ix, iz)-(ix+1, iz+1), false (ix+1, iz)-(ix, iz+1) (attribute bit 15).
+    static bool mainDiagonal(const TerrainTile& t, int ix, int iz);
+    static Vec3 triNormal(const float* xs, const float* zs, const float* hs, float step);  // upward, unnormalised
     // Surface type (index into the mission's Surfaces table) at the nearest height sample: bits 8..10 of the
     // sample's attribute word (FUN_100974e0).
     int surfaceAt(float x, float z) const;

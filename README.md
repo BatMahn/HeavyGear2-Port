@@ -8,7 +8,7 @@ A native port of **Heavy Gear II** (Activision, 1999) for modern macOS, Linux an
 No game data is included. You need your own copy of Heavy Gear II (see "Setting up the game folder": no
 installation needed).
 
-## Status (v0.25.0) — the whole single-player game
+## Status (v0.26.0) — the whole single-player game
 
 The game now starts in the original shell, drawn from the game's own layouts and artwork:
 
@@ -83,6 +83,12 @@ The game now starts in the original shell, drawn from the game's own layouts and
 - **AI, 0.22**: route planning now follows the original pathfinder: a 4 m grid, squared step costs with height and
   water penalties, a 2048-node budget with partial paths to the nearest reachable point, 2 m straight-line checks.
   The build workflow has a "Run workflow" button.
+- **0.26**: scripted cameras send the right end signal, so cut-scene mode (letterbox, hidden reticle) ends as in the
+  original (S1J); the AI stands down for the whole cut-scene mode; turret weapon arcs with the original's sign and gun
+  pitch limits; gear locomotion from the original (moved by the cycle's root motion at speed / stride, walk / run by
+  speed with sync points), decoded ground physics (drive, resistance, traction cap, slope force) and per-cell terrain
+  diagonals; artillery strikes as the original (MEMOG shells from 150 m, 200 damage within 30 m); editor markers and
+  light icons hidden; jeeps / hovers don't block movement; SetSmoking, wind on particles and the idle torso sweep.
 - **0.25**: every builtin the mission scripts call is bound (Kill, FullStop, GetUnitDistance, Position, Teleport onto
   a unit, ArtilleryStrike, Persistent, cinematic control, AutoIgnore / AutoAbort, AutoAim, SetWeaponConstraints);
   collision built from the drawn geometry (column boxes that follow overhangs, arches and dropships, trunk-only trees,

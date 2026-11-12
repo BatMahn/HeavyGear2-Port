@@ -107,7 +107,11 @@ public:
     std::vector<int> damaged;    // units that dropped below half their hit points
     void kill(int object);       // InstantDeath
     void destroy(int object);    // Kill: destroyed as if shot (explosion, wreck)
-    void artilleryShell(const Vec3& p);  // one ArtilleryStrike shell landing at p
+    // one ArtilleryStrike shell (FUN_10034a50): released at rest at p and falling under 20 m/s^2 until it hits
+    void artilleryShell(const Vec3& p);
+    // SetSmoking (FUN_100d3a40 / FUN_100d3a80): the unit's smoke level (+0xbe0); 0 puts it out, otherwise
+    // FUN_100561e0 attaches DAMAGEL (level 1, and anything out of range) or DAMAGEH (2) at 1.5x scale
+    void setSmoking(int object, int level) { smoking_[object] = level; }
     void grow(size_t objects) { if (damage.size() < objects) damage.resize(objects, 0.f); }
     // Per-part damage (gears with a Damage_Hierarchy): health 0..1 of a region (H head, T torso, A/a right/left
     // arm, L/l right/left leg; 1 if the unit has no such parts), movement left after leg damage, sensors working.
@@ -177,6 +181,16 @@ private:
         if (w & m) w = (w & ~m) | ((((w & m) >> shift) - 1) << shift);
     }
     struct Flash { Vec3 pos; float age, size; };
+    struct Shell { Vec3 pos, vel; float trail = 0; };       // ArtilleryStrike shells in flight
+    struct Blast { int object; float wait, damage; Vec3 at; };  // explosion damage on its way (dist / 60 s)
+    std::vector<Shell> shells_;
+    std::map<int, int> smoking_;          // script-set smoke levels (override the damage smoke)
+    std::map<int, float> smokeTimers_;
+    std::vector<Blast> blasts_;
+    // area explosion (FUN_100f3140 / FUN_100f36e0 / FUN_100f3430): every unit or structure within `radius`
+    // takes the full `damage`, delayed by its distance / 60
+    void blast(const Vec3& p, float radius, float damage, int object);
+    void updateShells(float dt);
     void impact(const Vec3& p, const WeaponDef& w, int object, int shooter, float scale = 1.f);
     void applyDamage(int object, int shooter, float d, const Vec3& p);
     void destroyObject(int object, const Vec3& p);

@@ -326,6 +326,36 @@ Mat4 animLocal(const AnimTrack* tr, const Mat4& base, float t) {
     return m;
 }
 
+Mat4 animLocalBlend(const AnimTrack* a, float ta, const AnimTrack* b, float tb, const Mat4& base, float w, bool stripXZ) {
+    // w = the weight of b. Rotations slerp, positions lerp.
+    Mat4 ma = animLocal(a, base, ta), mb = animLocal(b, base, tb);
+    if (stripXZ) {
+        if (a && !a->pos.empty()) { Mat4 z = animLocal(a, base, 0.f); ma.m[3][0] = z.m[3][0], ma.m[3][2] = z.m[3][2]; }
+        if (b && !b->pos.empty()) { Mat4 z = animLocal(b, base, 0.f); mb.m[3][0] = z.m[3][0], mb.m[3][2] = z.m[3][2]; }
+    }
+    if (w <= 0) return ma;
+    if (w >= 1) return mb;
+    Mat4 m = ma;
+    if (a && b && !a->rot.empty() && !b->rot.empty()) {
+        float qa[4], qb[4], q[4];
+        sampleKeys(a->rot, ta, 4, qa, true), sampleKeys(b->rot, tb, 4, qb, true);
+        AnimKey ka{}, kb{};
+        memcpy(ka.v, qa, sizeof qa), memcpy(kb.v, qb, sizeof qb);
+        ka.time = 0, kb.time = 1;
+        std::vector<AnimKey> two{ka, kb};
+        sampleKeys(two, w, 4, q, true);
+        AnimTrack t;
+        t.rot = {ka};
+        memcpy(t.rot[0].v, q, sizeof q);
+        m = animLocal(&t, base, 0.f);
+    } else {
+        for (int r = 0; r < 3; r++)
+            for (int c = 0; c < 3; c++) m.m[r][c] = ma.m[r][c] + (mb.m[r][c] - ma.m[r][c]) * w;
+    }
+    for (int c = 0; c < 3; c++) m.m[3][c] = ma.m[3][c] + (mb.m[3][c] - ma.m[3][c]) * w;
+    return m;
+}
+
 // ------------------------------------------------------------------ terrain
 bool loadTerrain(const Bytes& data, Terrain& out) {
     Reader r(data);
@@ -386,6 +416,34 @@ float Terrain::height(int gx, int gz) const {
     return tiles[size_t(tx) * 128 + tz].heightAt(lx * 16, lz * 16);
 }
 
+namespace {
+// The triangle of a terrain cell under (fx, fz) in 0..1 cell coordinates, as three corners (cell-relative grid
+// offsets) and their heights. Each cell picks its own diagonal (FUN_10097670 / FUN_10097ed0, the tile's height and
+// plane queries): bit 15 of the cell's low-corner attribute word splits it along (ix, iz)-(ix+1, iz+1); without it
+// (most cells) the split runs (ix+1, iz)-(ix, iz+1). The drawn mesh follows the same rule (Scene::buildTerrain).
+struct CellTri {
+    float x[3], z[3], h[3];
+};
+CellTri cellTriangle(const TerrainTile& t, int ix, int iz, float fx, float fz) {
+    auto H = [&](int a, int b) { return t.h[size_t(a) * t.dim + b] * 0.01f; };
+    CellTri r;
+    auto set = [&](int k, int a, int b) { r.x[k] = float(a), r.z[k] = float(b), r.h[k] = H(ix + a, iz + b); };
+    if (Terrain::mainDiagonal(t, ix, iz)) {
+        if (fx >= fz) set(0, 0, 0), set(1, 1, 0), set(2, 1, 1);
+        else set(0, 0, 0), set(1, 1, 1), set(2, 0, 1);
+    } else {
+        if (fx + fz <= 1.f) set(0, 0, 0), set(1, 1, 0), set(2, 0, 1);
+        else set(0, 1, 0), set(1, 1, 1), set(2, 0, 1);
+    }
+    return r;
+}
+}  // namespace
+
+bool Terrain::mainDiagonal(const TerrainTile& t, int ix, int iz) {
+    size_t k = size_t(ix) * size_t(t.dim) + size_t(iz);
+    return k < t.attr.size() && (t.attr[k] & 0x8000) != 0;
+}
+
 float Terrain::sample(float x, float z) const {
     x = std::max(0.f, std::min(4095.99f, x));
     z = std::max(0.f, std::min(4095.99f, z));
@@ -394,11 +452,17 @@ float Terrain::sample(float x, float z) const {
     float lx = (x - t.x0) / t.step, lz = (z - t.z0) / t.step;
     int ix = std::min(t.dim - 2, int(lx)), iz = std::min(t.dim - 2, int(lz));
     float fx = lx - ix, fz = lz - iz;
-    auto H = [&](int a, int b) { return t.h[size_t(a) * t.dim + b] * 0.01f; };
-    // the drawn mesh splits each cell along (ix, iz)-(ix+1, iz+1) (Scene::buildTerrain): follow its triangles, so what
-    // stands on the ground meets the surface that's drawn
-    float a = H(ix, iz), b = H(ix + 1, iz), c = H(ix + 1, iz + 1), d = H(ix, iz + 1);
-    return fx >= fz ? a + (b - a) * fx + (c - b) * fz : a + (d - a) * fz + (c - d) * fx;
+    // follow the drawn triangle, so what stands on the ground meets the surface that's drawn
+    CellTri c = cellTriangle(t, ix, iz, fx, fz);
+    Vec3 n = triNormal(c.x, c.z, c.h, 1.f);
+    return c.h[0] - (n.x * (fx - c.x[0]) + n.z * (fz - c.z[0])) / n.y;
+}
+
+Vec3 Terrain::triNormal(const float* xs, const float* zs, const float* hs, float step) {
+    Vec3 a(xs[0] * step, hs[0], zs[0] * step), b(xs[1] * step, hs[1], zs[1] * step), c(xs[2] * step, hs[2], zs[2] * step);
+    Vec3 n = cross(c - a, b - a);
+    if (n.y < 0) n = n * -1.f;
+    return n;
 }
 
 Vec3 Terrain::normal(float x, float z) const {
@@ -408,11 +472,8 @@ Vec3 Terrain::normal(float x, float z) const {
     const TerrainTile& t = tiles[size_t(int(x) / 32) * 128 + size_t(int(z) / 32)];
     float lx = (x - t.x0) / t.step, lz = (z - t.z0) / t.step;
     int ix = std::min(t.dim - 2, int(lx)), iz = std::min(t.dim - 2, int(lz));
-    float fx = lx - ix, fz = lz - iz;
-    auto H = [&](int a, int b) { return t.h[size_t(a) * t.dim + b] * 0.01f; };
-    float a = H(ix, iz), b = H(ix + 1, iz), c = H(ix + 1, iz + 1), d = H(ix, iz + 1);
-    float dx = fx >= fz ? b - a : c - d, dz = fx >= fz ? c - b : d - a;  // rise per grid step
-    return normalize(Vec3(-dx / float(t.step), 1.f, -dz / float(t.step)));
+    CellTri c = cellTriangle(t, ix, iz, lx - ix, lz - iz);
+    return normalize(triNormal(c.x, c.z, c.h, float(t.step)));
 }
 
 int Terrain::surfaceAt(float x, float z) const {
