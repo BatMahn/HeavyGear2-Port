@@ -71,6 +71,24 @@ uint64_t ScriptSystem::instructions() const {
     return n;
 }
 
+std::set<std::string> ScriptSystem::calledNatives(bool unboundOnly) const {
+    // Every program declares the whole builtin table; only symbols named by a call instruction
+    // (op 2 via symbol, op 3 linked native) are actually used.
+    std::set<std::string> out;
+    for (auto& p : programs_)
+        for (auto& in : p->code) {
+            if ((in.op != 2 && in.op != 3) || !in.operand) continue;
+            int32_t sym;
+            memcpy(&sym, in.operand, 4);
+            if (sym < 0 || size_t(sym) >= p->symbols.size()) continue;
+            const auto& s = p->symbols[size_t(sym)];
+            if (s.kind != 1 || (s.resolved && !s.native)) continue;
+            const std::string& nm = strings_.get(s.name);
+            if (!unboundOnly || !ScriptVM::isBound(nm, s.overload)) out.insert(nm + "/" + std::to_string(s.overload));
+        }
+    return out;
+}
+
 std::shared_ptr<ScriptProgram> ScriptSystem::program(const std::string& name, std::string* err) {
     std::string base = name;
     size_t dot = base.rfind('.');
@@ -148,6 +166,7 @@ bool ScriptSystem::load(const Mission& m, std::string* err) {
     for (auto& c : checkpoints) c = Checkpoint{};
     selectedCheckpoint = -1;
     cinematicMode = false;
+    allowCinematicCombat = false;
     fade = Fade{};
     fadeHold_ = false;
     focus_.clear();
@@ -337,6 +356,22 @@ void ScriptSystem::update(float dt) {
         i.vm->tick();
     }
     current_ = nullptr;
+    // A unit's script is dropped once the unit is dead and its handlers (the death event among them) have run,
+    // unless the script made itself Persistent (FUN_100ba4e0 loop: brain +0x194 bit 0). The user's gear keeps its
+    // script (the mission ends with it anyway, and network play revives it). One update of grace lets the death
+    // event raised after this frame's tick still reach the script.
+    int user = world_.playerUnit();
+    for (auto& i : vms_) {
+        if (i.unit < 0 || i.unit == user || i.vm->persistent || i.vm->terminated()) continue;
+        if (world_.isAlive(i.unit) || i.vm->pending()) {
+            i.deadTicks = 0;
+            continue;
+        }
+        if (++i.deadTicks >= 2) {
+            if (verbose) SDL_Log("[script] %s: unit %d dead, script dropped", i.vm->where().c_str(), i.unit);
+            i.vm->terminate();
+        }
+    }
 }
 
 // ------------------------------------------------------------------ builtins
@@ -428,7 +463,11 @@ void ScriptSystem::bindBuiltins() {
         V::bind("QueueDialog", ov, [](V& vm, const uint8_t* t, ScriptValue&) { g_sys->world().queueDialog(vm.strings().get(argI(t, 8))); });
     V::bind("QueueDialog", 2, [](V& vm, const uint8_t* t, ScriptValue&) { g_sys->world().queueDialog(vm.strings().get(argI(t, 12))); });
     // ControlCamera: ov0 ends the cinematic; the others share (-4 duration, -8 end signal, -0xc skip signal).
-    V::bind("ControlCamera", 0, [](V&, const uint8_t*, ScriptValue&) { g_sys->cinematic.active = false; });
+    // ControlCamera() (FUN_100d5ef0 -> FUN_10092ff0(0)): back to the cockpit view, which also ends cinematic mode (+0x521)
+    V::bind("ControlCamera", 0, [](V&, const uint8_t*, ScriptValue&) {
+        g_sys->cinematic.active = false, g_sys->cinematicMode = false;
+        if (g_sys->verbose) SDL_Log("[script] camera back to the user");
+    });
     V::bind("ControlCamera", 1, [](V& vm, const uint8_t* t, ScriptValue&) {
         g_sys->startCinematic(vm, vm.strings().get(argI(t, 0x10)), argI(t, 8), argI(t, 0xc), argF(t, 4));
     });
@@ -450,9 +489,26 @@ void ScriptSystem::bindBuiltins() {
         if (g_sys->cinematic.active && g_sys->mission())
             g_sys->cinematic.lookPath = g_sys->mission()->path(vm.strings().get(argI(t, 0x10)));
     });
-    V::bind("SetCinematicControl", 0, [](V&, const uint8_t*, ScriptValue&) {});  // per-unit brain flag
-    V::bind("SetCinematicControl", 1, [](V&, const uint8_t*, ScriptValue&) {});
-    V::bind("SetCinematicControl", 2, [](V&, const uint8_t* t, ScriptValue&) { g_sys->cinematicMode = argI(t, 4) != 0; });
+    // SetCinematicControl(unit, on) (FUN_100d66d0 / FUN_100d6710): brain +0x198, the unit only does what its script
+    // orders (AutoPilot clears it); SetCinematicControl(on) (FUN_100d67b0 -> FUN_10092f70) is the global cinematic mode.
+    V::bind("SetCinematicControl", 0, [](V& vm, const uint8_t* t, ScriptValue&) {
+        g_sys->world().unitCommand(unitRef(vm, argI(t, 8)), "cinematicControl", float(argI(t, 4) != 0));
+    });
+    V::bind("SetCinematicControl", 1, [](V& vm, const uint8_t* t, ScriptValue&) {
+        g_sys->world().unitCommand(unitName(vm, t, 8), "cinematicControl", float(argI(t, 4) != 0));
+    });
+    V::bind("SetCinematicControl", 2, [](V&, const uint8_t* t, ScriptValue&) {
+        g_sys->cinematicMode = argI(t, 4) != 0;
+        if (g_sys->verbose) SDL_Log("[script] cinematic mode %d", int(g_sys->cinematicMode));
+    });
+    // SetWeaponConstraints(unit, pitch-, pitch+, yaw-, yaw+) in degrees (FUN_100d6b90 / FUN_100d6c10 -> vtable +0x1a4,
+    // which only the turret class implements, FUN_100ec400: pitch joint (-a, b), yaw joint (-c, d)). Yaw only here.
+    V::bind("SetWeaponConstraints", 0, [](V& vm, const uint8_t* t, ScriptValue&) {
+        g_sys->world().unitCommand(unitRef(vm, argI(t, 0x14)), "weaponArc", argF(t, 8), argF(t, 4));
+    });
+    V::bind("SetWeaponConstraints", 1, [](V& vm, const uint8_t* t, ScriptValue&) {
+        g_sys->world().unitCommand(unitName(vm, t, 0x14), "weaponArc", argF(t, 8), argF(t, 4));
+    });
     // ---- brain settings and unit orders (0.7)
     auto cmd = [](int unit, const char* c, float a = 0, float b = 0, float cc = 0, float d = 0, const std::string& str = std::string()) {
         if (unit >= 0) g_sys->world().unitCommand(unit, c, a, b, cc, d, str);
@@ -519,11 +575,66 @@ void ScriptSystem::bindBuiltins() {
     V::bind("ActivateLight", 0, [](V& vm, const uint8_t* t, ScriptValue&) { g_sys->world().activateLight(vm.strings().get(argI(t, 8)), argI(t, 4) != 0); });
     V::bind("SetWeatherType", 0, [](V&, const uint8_t* t, ScriptValue&) { g_sys->world().weather(argI(t, 4), -1); });
     V::bind("SetWeather", 0, [](V&, const uint8_t* t, ScriptValue&) { g_sys->world().weather(-1, argI(t, 4)); });
-    for (const char* n : {"SetGlobalWindVariables",
-                          "AutoIgnore", "AutoAbort", "ActivateTacticalAccess", "SetWeaponConstraints", "SetSmoking",
-                          "SetTacticalClass", "SetTactic", "BestTactic", "SquadCombatTactic", "SquadNonCombatTactic",
-                          "AllowCinematicCombat", "ChangeWeapon", "SetMoveAvoid"})
+    // Accepted without effect in the port:
+    //  SetGlobalWindVariables (FUN_100d3980) wind for particles; SetSmoking (FUN_100d3a40) a damaged unit's smoke;
+    //  ActivateTacticalAccess (FUN_100d4070) enables the tactical map view (+0x611), which the port doesn't have;
+    //  SetMoveAvoid (FUN_100d3f90) unit flag 0x10000 that nothing in the sim reads; SaveMission (FUN_100d4380) calls
+    //  FUN_1008db90, which only returns 1; Defend (FUN_100d8b10) is an empty function in the original.
+    for (const char* n : {"SetGlobalWindVariables", "ActivateTacticalAccess", "SetSmoking", "SetTacticalClass", "SetTactic",
+                          "BestTactic", "SquadCombatTactic", "SquadNonCombatTactic", "ChangeWeapon", "SetMoveAvoid",
+                          "SaveMission", "Defend"})
         for (int ov = 0; ov < 3; ov++) V::bind(n, ov, [](V&, const uint8_t*, ScriptValue&) {});
+    // AutoIgnore (FUN_100d7310) / AutoAbort (FUN_100d7370): event-slot flags of the running script.
+    V::bind("AutoIgnore", 0, [](V& vm, const uint8_t* t, ScriptValue&) { vm.eventFlags(argI(t, 4), 0, 0x18); });
+    V::bind("AutoAbort", 0, [](V& vm, const uint8_t* t, ScriptValue&) { vm.eventFlags(argI(t, 4), 0x10, 0); });
+    V::bind("AllowCinematicCombat", 0, [](V&, const uint8_t* t, ScriptValue&) { g_sys->allowCinematicCombat = argI(t, 4) != 0; });
+    // Persistent (FUN_100d3d40): the script keeps running after its unit is destroyed.
+    V::bind("Persistent", 0, [](V& vm, const uint8_t* t, ScriptValue&) { vm.persistent = argI(t, 4) != 0; });
+    // Kill (FUN_100d3e20 / FUN_100d3e50): vtable +200, the unit's ordinary destruction.
+    V::bind("Kill", 0, [](V& vm, const uint8_t* t, ScriptValue&) { g_sys->world().destroyUnit(unitRef(vm, argI(t, 4))); });
+    V::bind("Kill", 1, [](V& vm, const uint8_t* t, ScriptValue&) { g_sys->world().destroyUnit(unitName(vm, t, 4)); });
+    // FullStop (FUN_100d44f0 / FUN_100d4530): motion zeroed (+0x158(0,0)); unlike FullBrake the orders stay.
+    V::bind("FullStop", 0, [=](V& vm, const uint8_t* t, ScriptValue&) { cmd(unitRef(vm, argI(t, 4)), "fullStop"); });
+    V::bind("FullStop", 1, [=](V& vm, const uint8_t* t, ScriptValue&) { cmd(unitName(vm, t, 4), "fullStop"); });
+    // GetUnitDistance (FUN_100d4840 / FUN_100d4920): from the script's unit to the given one; 0 if either is missing.
+    auto distance = [](V& vm, int unit, ScriptValue& r) {
+        float a[3], b[3];
+        bool ok = vm.owner() >= 0 && unit >= 0 && g_sys->world().unitPosition(vm.owner(), a) && g_sys->world().unitPosition(unit, b);
+        r.setFloat(ok ? std::sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) + (a[2] - b[2]) * (a[2] - b[2])) : 0.f);
+    };
+    V::bind("GetUnitDistance", 0, [=](V& vm, const uint8_t* t, ScriptValue& r) { distance(vm, unitName(vm, t, 4), r); });
+    V::bind("GetUnitDistance", 1, [=](V& vm, const uint8_t* t, ScriptValue& r) { distance(vm, unitRef(vm, argI(t, 4)), r); });
+    // Position (FUN_100d6cf0 / FUN_100d6da0): SetMovementMode and SetStandingMode in one (both nibbles of +0x1d0).
+    V::bind("Position", 0, [=](V& vm, const uint8_t* t, ScriptValue&) {
+        int u = unitRef(vm, argI(t, 8));
+        cmd(u, "movementMode", float(argI(t, 4))), cmd(u, "standingMode", float(argI(t, 4)));
+    });
+    V::bind("Position", 1, [=](V& vm, const uint8_t* t, ScriptValue&) {
+        int u = unitName(vm, t, 8);
+        cmd(u, "movementMode", float(argI(t, 4))), cmd(u, "standingMode", float(argI(t, 4)));
+    });
+    // Teleport onto another unit (FUN_100d4cd0 ref/ref, FUN_100d4d30 ref/name, FUN_100d4df0 name/ref,
+    // FUN_100d4eb0 name/name): the mover (-8) takes the other unit's (-4) placement.
+    auto teleportTo = [=](int mover, int onto) {
+        float p[3];
+        if (mover < 0 || onto < 0 || !g_sys->world().unitPosition(onto, p)) return;
+        cmd(mover, "teleport", p[0], p[1], p[2]);
+    };
+    V::bind("Teleport", 4, [=](V& vm, const uint8_t* t, ScriptValue&) { teleportTo(unitRef(vm, argI(t, 8)), unitRef(vm, argI(t, 4))); });
+    V::bind("Teleport", 5, [=](V& vm, const uint8_t* t, ScriptValue&) { teleportTo(unitRef(vm, argI(t, 8)), unitName(vm, t, 4)); });
+    V::bind("Teleport", 6, [=](V& vm, const uint8_t* t, ScriptValue&) { teleportTo(unitName(vm, t, 8), unitRef(vm, argI(t, 4))); });
+    V::bind("Teleport", 7, [=](V& vm, const uint8_t* t, ScriptValue&) { teleportTo(unitName(vm, t, 8), unitName(vm, t, 4)); });
+    // ArtilleryStrike(position, delay, shells) (FUN_100d8b20 -> the "Artillery" object, FUN_100348b0 / FUN_100349d0).
+    V::bind("ArtilleryStrike", 0, [](V&, const uint8_t* t, ScriptValue&) {
+        float p[3] = {argF(t, 0x14), argF(t, 0x10), argF(t, 0xc)};
+        float delay = argF(t, 8);
+        int count = argI(t, 4);
+        // tolerate an int delay / a float count
+        if (int32_t di = argI(t, 8); di > 0 && di < 100000) delay = float(di);
+        if (count > 100000 || count < 0) count = int(argF(t, 4));
+        if (g_sys->verbose) SDL_Log("[script] artillery at %.0f,%.0f,%.0f in %.1fs, %d shells", p[0], p[1], p[2], delay, count);
+        g_sys->world().artilleryStrike(p, std::max(0.f, delay), std::max(0, std::min(count, 200)));
+    });
     V::bind("FlushDialog", 0, [](V&, const uint8_t*, ScriptValue&) { g_sys->world().flushDialog(); });
     // Objectives (FUN_10133a40 / FUN_10133ad0): 8 slots of text + status.
     auto setObjective = [](int slot, const std::string* text, int status) {

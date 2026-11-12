@@ -283,8 +283,11 @@ void Particles::submit(const Mat4& view) {
         float sz = std::min(6.f, p.type->size[i] * kSizeScale * p.scale * 0.5f);
         if (sz <= 0.001f || c[3] <= 0.004f) continue;
         // sprites right in front of the viewer fade out instead of filling the screen
-        float near = length(p.pos - eye_) / std::max(1.f, sz * 3.f);
+        float dEye = length(p.pos - eye_), near = dEye / std::max(1.f, sz * 3.f);
         float fade = std::min(1.f, near * near);
+        // and anything within a few metres of the camera thins out (the chase camera sits low behind the gear, where
+        // its own foot dust would otherwise fill the view)
+        fade *= std::clamp((dEye - 2.f) / 8.f, 0.f, 1.f);
         if (fade < 0.05f) continue;
         float cs = std::cos(p.spin) * sz, sn = std::sin(p.spin) * sz;
         Vec3 ax = right * cs + up * sn, ay = up * cs - right * sn;

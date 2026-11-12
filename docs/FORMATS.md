@@ -298,13 +298,39 @@ squared length (16, diagonals 32) plus the squared height change; under water it
 found becomes the end of a partial path (result 3). Walkability (`FUN_100c2520`): the occupancy grid's cell flags
 (bits 2–5: 1 open, 2 blocked), water deeper than the request's limit (+0xb8, when wading is off), ground whose normal
 is steeper than the request's slope limit (+0xc4, cosine). Straight-line tests (`FUN_100c3530`) walk the segment in
-2 m steps with a 4 m radius. The goal radius comes out of `FUN_100c0370` (1 + 0.5 × cell = 3 m). MOVETO's request flags are
-0x38 (0x39 with the order's 0x80 bit): bit 3 clears the depth limit, bit 4 the water penalty, bit 5 puts nodes on the
-water surface, bit 6 (not set) would skip the slope test; so gears wade anywhere and only the slope limit applies.
-Not traced: the slope limit's value (the port uses ~42°).
+2 m steps with a 4 m radius. The goal radius comes out of `FUN_100c0370` (1 + 0.5 × cell = 3 m).
+
+The request's limits: MOVETO allocates the follower with `FUN_100bec30(slope)`, which builds the request with `FUN_100bff80(slope)` → request +0xa4 (copied to
+the search's +0xc4); `FUN_100c0220` then fills +0xa0 with the world pointer (`DAT_1026667c`), +0x98 with the depth
+limit and +0x14..+0x1d from the flags. The walkability test is `|n·(0,1,0)| < +0xc4` → blocked, with n the terrain
+triangle's normal (`FUN_100a4200`, up vector `DAT_102689d8`), and water deeper than +0xb8 (when the depth limit is on).
+Flag values: 2 → +0x1d, 4 the other goal-radius rule (`FUN_100c4670`), 8 clears the depth limit, 0x10 the water
+penalty, 0x20 puts nodes on the water surface, 0x40 skips the slope test. Per class (type codes of the object factory `FUN_1005cdb0`):
+
+| Class (type) | MOVETO | slope limit | depth limit (+0x98) | flags |
+|---|---|---|---|---|
+| Biped gear (0x48), Infantry (0x50), ChickenWalker (0x52), Frame (0x53) | `FUN_100373c0` (vtable +0x2b0) | constant 0x3f5db22d = cos 30° | the unit's bounding-sphere radius (object +0x98, `FUN_10017fa0`) | 0, 1 with the order's 0x80 bit, \|8 when Amphibious (perk word +0xc30 bit 1) |
+| Jeep (0x4e) | `FUN_1006cad0` / `FUN_1006cf50` | unit +0x27c = cos 20° (`FUN_1006c700` → `FUN_10049db0(20)`) | bounding radius | 0 / 1 |
+| HoverTank (0x4f) | `FUN_10068c30` / `FUN_10069180` | cos 30° | bounding radius (unused) | 0x38, 0x39 with the 0x80 bit |
+| Mount (0x51) | `FUN_100730a0` / `FUN_10072cd0` | cos 30° | bounding radius | 0 / 1 |
+
+`FUN_10049db0(deg)` stores cos(deg) at +0x27c; the base vehicle default is cos 0.349 rad = 20° (`FUN_10048ad0`), gears,
+ChickenWalkers and Mounts set 30° (`FUN_10035460`, `FUN_10041220`, `FUN_1006f620`), but only the Jeep's MOVETO reads it.
+So gears and the other walkers avoid ground steeper than 30° and water deeper than their radius (unless Amphibious) and
+pay (depth + 1) × step for wading; only hovers path across water freely.
+
+Slope force on a grounded gear (`FUN_1003cc30`, gear vtable +0x268, summed in the physics step `FUN_1003af10`): with
+the ground normal n (+0xfc0, from `FUN_10095940`) turned into the gear's frame, the force on each horizontal axis is
+n·|n| × k × mass × 20 (g, `DAT_10163ae8`), k = min(3 / n_y², 6) or, on skates (+0x13e0, getter vtable +0x2d4),
+min(5 / n_y², 9). Where n_y > 0.8 (flatter than 36.9°) the sideways part is dropped, and the forward part too while
+the throttle (+0xf48) is zero. The drive and resistance forces are capped at the traction μ × mass × g with μ = 2
+(+0xff0, `FUN_1003c8f0`), the slope force is added after that cap: a walking gear can't climb faces much steeper than
+~39° (3 tan²θ × 20 = 40), a skating one ~32°, and a gear standing on ground steeper than 36.9° slides. Standing on an
+object needs a contact normal · up > 0.7 (`FUN_1003db20`). The port applies the same numbers to a slide velocity
+(only the part beyond the traction on an axis the gear is driving along), damped by its own drag.
 
 Life Support (perk 22, bit 26 of the perk word +0xc30): nothing in `hg2sim.dll` tests it; it only counts toward the
-gear's threat value in the shell. Backup Life Support (bit 4) is the crew-critical backup. The port plans its own: an A* over 6 m cells round steep steps, solid
+gear's threat value in the shell. Backup Life Support (bit 4) is the crew-critical backup. The port plans its own: an A* over 4 m cells round ground steeper than the unit's slope limit, deep water, solid
 objects and lava, string-pulled to a few waypoints, when a unit is stuck or the next 48 m of its line are blocked.
 
 
@@ -332,3 +358,14 @@ The port's sizes for the other effects (detection, scatter, damage percentages) 
 Tactic objects post command 0xc to the gear (`FUN_10036920`), which sets the pilot controller's stance word (+0x1d0):
 low nibble 0..2 and high nibble 3..6 with a float (the standard combat tactic passes the selected weapon's range,
 `FUN_100b7d00`). `FUN_100649d0` / `FUN_10064c50` turn the stance into ECY triggers (0x1d..0x25).
+
+## Static collision (port, 0.24.x)
+The .M models carry no collision hulls - only per-mesh render BSPs (`FUN_1000dd00`) - so the port derives volumes from
+the drawn triangles (`src/assets/collision.cpp`): opaque surface samples (alpha-tested texels removed) are binned into
+vertical columns, each column keeps its occupied height ranges (gaps a gear fits under stay open), small wall-enclosed
+hollow shells without floors are filled, and matching columns are merged into boxes, grouped in clusters for queries.
+Models wider than 200 m (Gomorrah's city, `epl10005.m`) get one grid per mesh. Object classes from the factories
+(`FUN_10085570` / `FUN_100883d0`): Object_NoColl (0x162) clears the object's collision flags (`[4] & ~0x10000`,
+`[5] & ~0x40000`) and Plane_NoColl (0x61) `[5] & ~0x40000`; Ghosts_Object (0x13d) only clears its targetable flag
+(`+0x1a`) and still collides. Tree_Object (0x47) instances collide with the part rising from the base (the trunk).
+`hg2extract <data> collaudit` compares the volumes with the old one-box-per-mesh scheme; `HG2_COLLVIEW=1` draws them.

@@ -244,9 +244,19 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
                 } else if (ai) {
                     ai->face(u, Vec3(a, b, cc));
                 }
+            } else if (c == "fullStop" && pl && u == player) {
+                pl->halt();
             } else if (ai) {
                 ai->command(u, c, a, b, cc, str);
             }
+        }
+        void destroyUnit(int u) override {  // Kill: the ordinary destruction (explosion, wreck, event 5)
+            if (combat && u >= 0) combat->destroy(u);
+        }
+        struct Strike { Vec3 p; float wait; int left; };
+        std::vector<Strike> strikes;
+        void artilleryStrike(const float p[3], float delay, int count) override {
+            if (count > 0) strikes.push_back({Vec3(p[0], p[1], p[2]), delay, count});
         }
         void teamDefcon(int team, int level, int mode) override { if (ai) ai->setDefcon(team, level, mode); }
         int getTeamDefcon(int team) override { return ai ? ai->defcon(team) : 6; }
@@ -415,6 +425,18 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
     player.particles = &particles;
     ai.setParticles(&particles);
     world.sceneRW = &scene;
+    // ArtilleryStrike shells (the "Artillery" object, FUN_100349d0 / FUN_10034a50): after the delay one every 0.5 s,
+    // dropped from 150 m within +-15 m of the point
+    auto updateStrikes = [&](float dt) {
+        for (auto& st : world.strikes) {
+            if ((st.wait -= dt) > 0 || st.left <= 0) continue;
+            float x = st.p.x + float(rand() % 30000) * 0.001f - 15.f, z = st.p.z + float(rand() % 30000) * 0.001f - 15.f;
+            combat.artilleryShell(Vec3(x, scene.groundHeight(x, z), z));
+            st.left--, st.wait = 0.5f;
+        }
+        world.strikes.erase(std::remove_if(world.strikes.begin(), world.strikes.end(), [](const World::Strike& st) { return st.left <= 0; }),
+                            world.strikes.end());
+    };
     ai.onEvent = [&](int obj, int ev) { scripts.unitSignal(obj, ev); };
     // engine events from combat: hits (11, 12 while the user shoots), damaged (2), destroyed (5)
     std::map<int, float> lastHitEvent;
@@ -503,7 +525,7 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
         } else {
             fp.view = Mat4::lookAt(cam.pos, cam.pos + cam.forward(), Vec3(0, 1, 0));
         }
-        fp.proj = Mat4::perspective((sniperZoom ? 20.f : 60.f) * kDeg, aspect, 0.5f, 6000.f);
+        fp.proj = Mat4::perspective((sniperZoom ? 20.f : 60.f) * kDeg, aspect, 6000.f, 0.5f);  // near/far swapped: reversed Z
         return fp;
     };
     Hud hud;
@@ -996,20 +1018,22 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             pin.throttle = T.startX >= 0 ? 0.f : 1.f;
             pin.run = f > T.driveFrames / 2;
             pin.turn = T.startX >= 0 ? 0.f : 0.3f;
-            if (T.startX >= 0 && f % 3 == 0) {  // test mode: hold position and fire forward
+            if (T.startX >= 0 && f % 3 == 0 && !getenv("HG2_DRIVETO")) {  // test mode: hold position and fire forward
                 Vec3 mz, aim;
                 aimPoint(mz, aim);
                 combat.fire(mz, aim);
             }
             float np[3];
-            if (T.navDrive && scripts.checkpointPosition(scripts.selectedCheckpoint, np)) {
+            const char* driveTo = getenv("HG2_DRIVETO");  // test: walk to x,z (collision checks) instead of the nav point
+            bool toPoint = driveTo && sscanf(driveTo, "%f,%f", &np[0], &np[2]) == 2;
+            if (toPoint || (T.navDrive && scripts.checkpointPosition(scripts.selectedCheckpoint, np))) {
                 Vec3 d = Vec3(np[0], 0, np[2]) - Vec3(player.position().x, 0, player.position().z);
                 float want = std::atan2(-d.x, -d.z), e = want - player.yaw();
                 while (e > kPi) e -= 2 * kPi;
                 while (e < -kPi) e += 2 * kPi;
                 pin.turn = std::max(-1.f, std::min(1.f, e * 2.f));
                 pin.throttle = std::fabs(e) < 0.6f && length(d) > 4.f ? 1.f : 0.f;
-                pin.run = length(d) > 40.f;
+                pin.run = length(d) > 40.f && !toPoint;
             } else if (T.navDrive) {
                 pin = PlayerInput{};
             }
@@ -1033,6 +1057,8 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             player.speedScale = combat.mobility(player.object()), player.turnScale = combat.manoeuvre(player.object());
             if (player.active() && !combat.alive(player.object())) player.die();
             player.update(1.f / 30.f, pin);
+            ai.setCombatHold(scripts.combatHold());
+            updateStrikes(1.f / 30.f);
             ai.update(1.f / 30.f);
             combat.update(1.f / 30.f);
             if (const char* w = getenv("HG2_WEATHER")) particles.setWeather(atoi(w), atoi(strchr(w, ':') ? strchr(w, ':') + 1 : "3"));  // test: "1:3"
@@ -1047,7 +1073,7 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             drainCombatEvents();
             scripts.update(1.f / 30.f);
             if (f % 600 == 0 && getenv("HG2_AIDBG")) ai.dump();
-            if (f % 300 == 0 && (T.navDrive || !T.inputScript.empty()))
+            if (f % (driveTo ? 30 : 300) == 0 && (T.navDrive || driveTo || !T.inputScript.empty()))
                 printf("t=%5.1f pos %.0f,%.0f v %.1f ctl %d posture %d nav %d %s | %s\n", scripts.time(), player.position().x,
                        player.position().z, player.speed(), int(world.control) + 10 * int(player.forwardLocked()), player.postureCode(),
                        scripts.selectedCheckpoint,
@@ -1242,6 +1268,8 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
         if (botClose && !dead) pin.throttle = 1;
         player.update(dt, pin);
         scene.setObjectDrawn(player.object(), external || !chase || scripts.cinematic.active);
+        ai.setCombatHold(scripts.combatHold());
+        updateStrikes(dt);
         ai.update(dt);
         if (audio) {
             if (chase) {

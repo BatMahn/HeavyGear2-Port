@@ -216,6 +216,36 @@ void Player::update(float dt, const PlayerInput& in) {
     // models face -Z; world = local * rotY(yaw). With the left-handed view, screen right is (-cos, 0, sin).
     Vec3 fwd(-std::sin(yaw_), 0, -std::cos(yaw_)), right(-std::cos(yaw_), 0, std::sin(yaw_));
     pos_ += fwd * (speed_ * dt) + right * (strafe_ * dt);
+    // Slope force (FUN_1003cc30, gear vtable +0x268, while grounded): with the ground normal n in the gear's frame,
+    // a = n_h·|n_h| · k · g (g = 20, k = min(3 / n_y², 6), on skates min(5 / n_y², 9)) along each horizontal axis;
+    // on ground flatter than n_y 0.8 (36.9°) the sideways part is dropped, and the forward part too while there is
+    // no throttle. The drive (traction-limited to μ·g = 2 × 20, FUN_1003c8f0) holds against it on an axis the gear
+    // is driving along, so only the excess moves it: walking gears can't climb much past ~39°, skating ones ~32°,
+    // and a gear standing on ground steeper than 36.9° slides down.
+    if (!air_ && ecy) {
+        Vec3 n = scene_->groundNormal(pos_.x, pos_.z);
+        float ny = n.y < 1e-5f ? 1.f : n.y;
+        float k = sms_ ? std::min(5.f / (ny * ny), 9.f) : std::min(3.f / (ny * ny), 6.f);
+        float nf = dot(n, fwd), nr = dot(n, right);
+        float aF = nf * std::fabs(nf) * k * 20.f, aR = nr * std::fabs(nr) * k * 20.f;
+        if (ny > 0.8f) {
+            aR = 0;
+            if (std::fabs(thr) < 0.05f) aF = 0;
+        }
+        auto excess = [](float a, bool driven) {
+            const float traction = 40.f;
+            return driven ? std::copysign(std::max(0.f, std::fabs(a) - traction), a) : a;
+        };
+        aF = excess(aF, std::fabs(thr) > 0.05f), aR = excess(aR, std::fabs(str) > 0.05f);
+        Vec3 a = fwd * aF + right * aR;
+        slide_ += a * dt;
+        slide_ = slide_ * std::exp(-(length(a) > 0.01f ? 1.5f : 8.f) * dt);  // ground drag / grip once it levels out
+        float sv = length(slide_);
+        if (sv > 20.f) slide_ = slide_ * (20.f / sv);
+        pos_ += slide_ * dt;
+    } else if (!air_) {
+        slide_ = Vec3();
+    }
     pos_.x = std::max(1.f, std::min(4095.f, pos_.x));
     pos_.z = std::max(1.f, std::min(4095.f, pos_.z));
     Vec3 before = pos_;
@@ -242,7 +272,7 @@ void Player::update(float dt, const PlayerInput& in) {
             pos_.y = ground, vy_ = 0, air_ = false;
             if (state_ == sAir_ && sAir_ >= 0) fire(kTrigJump);
             if (audio && !def_.soundSteps.empty()) audio->play(def_.soundSteps, 0.8f * soundVolume, &pos_, 250.f);
-            if (particles) particles->spawn("FOOT_LANDDUST0", pos_, 1.f);
+            if (particles) particles->spawn("FOOT_LANDDUST0", pos_, 0.6f);
         }
     } else if (ground < pos_.y - 1.5f) {
         air_ = true, vy_ = 0;  // walked off an edge
@@ -311,14 +341,19 @@ void Player::update(float dt, const PlayerInput& in) {
 }
 
 void Player::sounds(float prevPhase) {
-    int len = std::max(1, scene_->animLength(object_, set_));
+    int len = std::max(1, scene_->animCycle(object_, set_));
     float ph = frame_ / float(len);
     // two foot falls per cycle
     for (float mark : {0.25f, 0.75f}) {
         bool crossed = prevPhase <= ph ? (prevPhase < mark && ph >= mark) : (prevPhase < mark || ph >= mark);
         if (!crossed) continue;
         if (audio && !def_.soundSteps.empty()) audio->play(def_.soundSteps, 0.55f * soundVolume, &pos_, 250.f);
-        if (particles && std::fabs(speed_) > 4.f) particles->spawn("FOOT_DUST0", pos_, 0.6f);
+        if (particles && std::fabs(speed_) > 4.f) {  // a small puff where the foot lands, not round the whole gear
+            Vec3 foot = pos_;
+            if (!scene_->frameBottom(object_, mark < 0.5f ? "frm-lld" : "frm-rld", foot)) foot = pos_;
+            foot.y = scene_->groundHeight(foot.x, foot.z);
+            particles->spawn("FOOT_DUST0", foot, 0.3f);
+        }
     }
 }
 

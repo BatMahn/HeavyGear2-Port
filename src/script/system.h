@@ -63,6 +63,10 @@ public:
     virtual void activateFountain(const std::string& name, bool on) { (void)name, (void)on; }
     virtual void activateLight(const std::string& name, bool on) { (void)name, (void)on; }
     virtual void weather(int type, int preset) { (void)type, (void)preset; }  // type -1: keep; preset -1: keep
+    // Kill (FUN_100d3e20): destroyed the normal way (explosion, wreck, event 5), unlike InstantDeath's removal.
+    virtual void destroyUnit(int unit) { (void)unit; }
+    // ArtilleryStrike (FUN_100d8b20): after `delay` seconds, `count` shells half a second apart land within 15 m of p.
+    virtual void artilleryStrike(const float p[3], float delay, int count) { (void)p, (void)delay, (void)count; }
 
     std::vector<std::string> unitNames;  // index = unit id (mission object order)
     std::vector<int> unitTeams;
@@ -88,6 +92,7 @@ public:
     ScriptVM* current() { return current_; }
     int vmCount() const { return int(vms_.size()); }
     uint64_t instructions() const;
+    std::set<std::string> calledNatives(bool unboundOnly) const;  // builtins the loaded scripts call (optionally only unbound ones)
     std::set<std::string> missing;  // unimplemented builtins seen
     bool verbose = false;
     float time() const { return time_; }
@@ -116,6 +121,12 @@ public:
     bool cinematicCamera(float eye[3], float at[3]);
     void skipCinematic();
     bool cinematicMode = false;
+    // AllowCinematicCombat (FUN_100d67e0, DAT_10268824): brains keep fighting while cinematicMode is on.
+    bool allowCinematicCombat = false;
+    // Brains stand down during cinematic mode unless combat is allowed (FUN_100b9ae0 checks +0x521). Held only while a
+    // scripted camera runs: some missions (S1J) never clear the mode themselves, and the port doesn't know yet what in
+    // the original ends it when a camera path runs out.
+    bool combatHold() const { return cinematicMode && cinematic.active && !allowCinematicCombat; }
     // BeginFade: screen fades in from black (in = true) or out to black over `time`, then raises `signal`.
     struct Fade { bool active = false, in = false; float time = 1, t = 0; int signal = -1; ScriptVM* vm = nullptr; } fade;
     float fadeAlpha() const;  // 0 clear .. 1 black
@@ -136,7 +147,7 @@ private:
     ScriptWorld& world_;
     StringTable strings_;
     std::vector<std::shared_ptr<ScriptProgram>> programs_;
-    struct Instance { std::unique_ptr<ScriptVM> vm; int unit; };  // unit -1 = mission script
+    struct Instance { std::unique_ptr<ScriptVM> vm; int unit; int deadTicks = 0; };  // unit -1 = mission script
     std::vector<Instance> vms_;
     struct Focus { int target = -1; float range = 0; bool inside = false; };  // SetUnitFocus / range: event 23
     std::map<ScriptVM*, Focus> focus_;

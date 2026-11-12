@@ -98,6 +98,18 @@ public:
     void markBreak(int id) {  // AutoBreak: slot fires when the unit's autopilot is interrupted (flag 8)
         if (id >= 0 && id < 64 && events_[id].present) events_[id].flags |= 8;
     }
+    // AutoIgnore (FUN_100d7310) clears the break and abort flags (8, 0x10); AutoAbort (FUN_100d7370) sets 0x10.
+    // A slot with either flag fires even while its state is disabled.
+    void eventFlags(int id, uint8_t set, uint8_t clear) {
+        if (id >= 0 && id < 64 && events_[id].present) events_[id].flags = uint8_t((events_[id].flags & ~clear) | set);
+    }
+    bool pending() const {  // a handler is running or signalled
+        if (pc_ >= 0) return true;
+        for (auto& e : events_)
+            if (e.present && (e.flags & 2)) return true;
+        return false;
+    }
+    bool persistent = false;  // Persistent(TRUE): the script outlives its unit (brain +0x194 bit 0)
     // Runs pending handlers (FUN_100c6ac0). Each run is limited to 20000 instructions per tick.
     void tick();
 
@@ -113,6 +125,7 @@ public:
 
     // Native bindings (name, overload) -> function. Unbound natives call ScriptHost::unimplemented.
     static void bind(const std::string& name, int overload, NativeFn fn);
+    static bool isBound(const std::string& name, int overload);
     // Shared exported globals (all loaded scripts of the mission).
     static std::unordered_map<int, std::pair<uint8_t*, uint32_t>>& exportedGlobals();
     static void resetGlobals();

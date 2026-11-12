@@ -689,6 +689,35 @@ std::string Combat::status() const {
     return buf;
 }
 
+
+void Combat::destroy(int object) {
+    if (object < 0 || size_t(object) >= damage.size() || scene_->objectHidden(object)) return;
+    auto u = units_.find(object);
+    if (u != units_.end()) {
+        if (u->second.hp <= 0) return;
+        u->second.hp = 0;
+    }
+    damage[size_t(object)] = 1e6f;
+    Vec3 p;
+    if (!scene_->objectPosition(object, p)) return kill(object);
+    if (object == playerObject_) {
+        destroyed.push_back(object);
+        if (!particles || !particles->spawn("EXP_HG", p, 1.5f)) flashes_.push_back({p, 0.f, 6.f});
+    } else {
+        destroyObject(object, p);
+    }
+}
+
+void Combat::artilleryShell(const Vec3& p) {
+    // the shell's weapon comes from a run-time table; a heavy field mortar's blast stands in (Damages 25, radius 20)
+    static WeaponDef shell = [] {
+        WeaponDef w;
+        w.name = "Artillery", w.damage = 25.f, w.collateralRadius = 20.f, w.mortarAngle = -25.f;
+        return w;
+    }();
+    if (audio) audio->play("explrg01.wav", 1.f, &p, 800.f);
+    impact(p, shell, -1, -1, 1.f);
+}
 }  // namespace hg2
 
 namespace hg2 {

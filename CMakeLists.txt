@@ -3,7 +3,7 @@
 # SDL3 and zlib are taken from the system when found, otherwise downloaded and built
 # (HG2_FETCH_DEPS=ON forces the download, which is what the release workflow does).
 cmake_minimum_required(VERSION 3.21)
-project(hg2port VERSION 0.24.2 LANGUAGES C CXX)
+project(hg2port VERSION 0.25.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -36,7 +36,7 @@ endif()
 
 set(CORE_SRC
   src/core/fs.cpp src/core/zfs.cpp src/assets/assets.cpp src/assets/mission.cpp src/script/vm.cpp src/script/system.cpp
-  src/assets/gear.cpp src/assets/weapon.cpp)
+  src/assets/gear.cpp src/assets/weapon.cpp src/assets/collision.cpp)
 set(GAME_SRC
   src/render/renderer.cpp src/game/scene.cpp src/game/player.cpp src/game/combat.cpp src/game/ai.cpp
   src/audio/audio.cpp src/game/hud.cpp src/game/particles.cpp src/game/fountains.cpp src/game/session.cpp

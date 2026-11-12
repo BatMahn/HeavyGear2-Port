@@ -40,6 +40,8 @@ public:
     // Pilot difficulty (the campaign pilot's setting, 0 easy .. 1 hard): how far hostiles see and how well they shoot.
     void setGravity(float g) { for (auto& u : units_) u.body.gravityScale = g; }
     void setDifficulty(float d) { difficulty_ = d < 0 ? 0.f : d > 1 ? 1.f : d; }
+    // Cinematic mode without AllowCinematicCombat: brains don't pick or engage targets (FUN_100b9ae0, +0x521).
+    void setCombatHold(bool on) { combatHold_ = on; }
     void setParticles(Particles* p) {
         particlesHook_ = p;
         for (auto& u : units_) u.body.particles = p;
@@ -143,6 +145,10 @@ private:
         Vec3 stuckFrom;
         Vec3 slot;
         std::string combatTactic, nonCombatTactic;
+        bool cinematic = false;     // SetCinematicControl(unit): script-driven, no targets of its own (brain +0x198)
+        bool autoAim = true;        // AutoAim (brain +0xe8): the gunner tracks and shoots its target
+        bool arc = false;           // SetWeaponConstraints on a turret (FUN_100ec400): yaw limits about its placement
+        float arcMin = 0, arcMax = 0, arcHome = 0;
     };
     Unit* find(int object);
     const Unit* find(int object) const;
@@ -160,8 +166,16 @@ private:
     // grid A* round steep ground, solid objects and lava; false when no route within the search budget
     bool planRoute(const Vec3& from, const Vec3& to, int self, std::vector<Vec3>& out) const;
     bool lineBlocked(const Vec3& from, const Vec3& to, int self) const;
+    // the MOVETO request a unit's class makes (slope cosine, water-depth limit, water penalty, nodes on the surface)
+    struct MoveRules {
+        float slopeCos = 0.866f, depthLimit = 1e9f;
+        bool waterCost = true, onSurface = false;
+    };
+    MoveRules moveRules(int self) const;
+    bool walkable(float x, float z, const MoveRules& r) const;
     float routeBudget_ = 0;
     bool forcedTac_ = false;
+    bool combatHold_ = false;
     const FileSystem* fs_ = nullptr;
     Audio* audioHook_ = nullptr;
     Particles* particlesHook_ = nullptr;

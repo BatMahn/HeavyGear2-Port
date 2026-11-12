@@ -8,7 +8,7 @@ A native port of **Heavy Gear II** (Activision, 1999) for modern macOS, Linux an
 No game data is included. You need your own copy of Heavy Gear II (see "Setting up the game folder": no
 installation needed).
 
-## Status (v0.24.2) — the whole single-player game
+## Status (v0.25.0) — the whole single-player game
 
 The game now starts in the original shell, drawn from the game's own layouts and artwork:
 
@@ -83,6 +83,14 @@ The game now starts in the original shell, drawn from the game's own layouts and
 - **AI, 0.22**: route planning now follows the original pathfinder: a 4 m grid, squared step costs with height and
   water penalties, a 2048-node budget with partial paths to the nearest reachable point, 2 m straight-line checks.
   The build workflow has a "Run workflow" button.
+- **0.25**: every builtin the mission scripts call is bound (Kill, FullStop, GetUnitDistance, Position, Teleport onto
+  a unit, ArtilleryStrike, Persistent, cinematic control, AutoIgnore / AutoAbort, AutoAim, SetWeaponConstraints);
+  collision built from the drawn geometry (column boxes that follow overhangs, arches and dropships, trunk-only trees,
+  no walls for no-collision objects and editor markers); the decoded slope rules (pathfinder 30°, Jeeps 20°, water
+  depth = the unit's radius; gears slide off faces past ~37°); terrain tile edges no longer bleed.
+- **0.24.3**: the system pointer is hidden (the game draws its own); reversed-Z depth and ground under the water
+  lowered a little, so shorelines no longer shimmer; trees collide with their trunk and crown instead of one 19 m wide
+  box (the invisible walls); foot dust is a small puff at the foot and fades near the camera.
 - **0.24.2**: walk / run cycles loop over their real length (the sets end with a padding key that held the pose for
   ten frames, a stop in every stride); cracks between fine (5x5) and coarse (3x3) terrain tiles closed.
 - **0.24.1**: the walk / run cycles' root motion (the body travels ~7 m through each cycle and snapped back) is now

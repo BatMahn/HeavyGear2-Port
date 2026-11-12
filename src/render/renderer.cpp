@@ -106,7 +106,7 @@ SDL_GPUGraphicsPipeline* Renderer::makePipeline(bool blend, bool background, boo
     pi.rasterizer_state.front_face = SDL_GPU_FRONTFACE_CLOCKWISE;
     pi.depth_stencil_state.enable_depth_test = !background;
     pi.depth_stencil_state.enable_depth_write = !blend && !background;
-    pi.depth_stencil_state.compare_op = SDL_GPU_COMPAREOP_LESS_OR_EQUAL;
+    pi.depth_stencil_state.compare_op = SDL_GPU_COMPAREOP_GREATER_OR_EQUAL;  // reversed Z (see beginFrame)
     pi.target_info.color_target_descriptions = &ct;
     pi.target_info.num_color_targets = 1;
     pi.target_info.depth_stencil_format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
@@ -165,6 +165,8 @@ bool Renderer::init(SDL_Window* window, bool offscreen, int w, int h, std::strin
     si.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
     si.max_lod = 16;
     sampler_ = SDL_CreateGPUSampler(dev_, &si);
+    si.address_mode_u = si.address_mode_v = si.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    clampSampler_ = SDL_CreateGPUSampler(dev_, &si);
     Image wimg;
     wimg.w = wimg.h = 4;
     wimg.rgba.assign(64, 255);
@@ -204,6 +206,7 @@ void Renderer::shutdown() {
     if (msaaColor_) SDL_ReleaseGPUTexture(dev_, msaaColor_);
     if (offscreen_) SDL_ReleaseGPUTexture(dev_, offscreen_);
     if (sampler_) SDL_ReleaseGPUSampler(dev_, sampler_);
+    if (clampSampler_) SDL_ReleaseGPUSampler(dev_, clampSampler_);
     if (opaque_) SDL_ReleaseGPUGraphicsPipeline(dev_, opaque_);
     if (blended_) SDL_ReleaseGPUGraphicsPipeline(dev_, blended_);
     if (background_) SDL_ReleaseGPUGraphicsPipeline(dev_, background_);
@@ -425,7 +428,7 @@ bool Renderer::beginFrame(const FrameParams& fp) {
     }
     SDL_GPUDepthStencilTargetInfo dt{};
     dt.texture = depth_;
-    dt.clear_depth = 1;
+    dt.clear_depth = 0;  // reversed Z: near is 1, far 0 - with a float depth buffer it keeps precision to the horizon
     dt.load_op = SDL_GPU_LOADOP_CLEAR;
     dt.store_op = SDL_GPU_STOREOP_DONT_CARE;
     dt.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
@@ -463,7 +466,7 @@ void Renderer::draw(const GpuMesh* mesh, const Mat4& model, bool lit, float alph
             SDL_PushGPUFragmentUniformData(cmd_, 0, &fu, sizeof(fu));
             int t = textureOverride >= 0 ? textureOverride : (b.texture >= 0 && b.texture < int(textures_.size())) ? b.texture : white_;
             if (t >= int(textures_.size())) t = white_;
-            SDL_GPUTextureSamplerBinding tsb{textures_[size_t(t)], sampler_};
+            SDL_GPUTextureSamplerBinding tsb{textures_[size_t(t)], b.clampUV && clampSampler_ ? clampSampler_ : sampler_};
             SDL_BindGPUFragmentSamplers(pass_, 0, &tsb, 1);
             SDL_DrawGPUPrimitives(pass_, b.count, 1, b.first, 0);
         }

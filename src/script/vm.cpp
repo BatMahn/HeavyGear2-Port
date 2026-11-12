@@ -172,6 +172,7 @@ bool ScriptProgram::load(const Bytes& data, const std::string& nm, StringTable& 
 
 // ------------------------------------------------------------------ VM
 void ScriptVM::bind(const std::string& name, int overload, NativeFn fn) { natives()[{name, overload}] = std::move(fn); }
+bool ScriptVM::isBound(const std::string& name, int overload) { return natives().count({name, overload}) != 0; }
 std::unordered_map<int, std::pair<uint8_t*, uint32_t>>& ScriptVM::exportedGlobals() { return g_exports; }
 void ScriptVM::resetGlobals() {
     g_exports.clear();

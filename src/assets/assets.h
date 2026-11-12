@@ -80,6 +80,8 @@ struct Terrain {
     std::vector<Vec3> table;         // trailing 256 vectors
     float height(int gx, int gz) const;  // 16-unit grid vertex (0..256)
     float sample(float x, float z) const;  // bilinear world height using each tile's own grid
+    // Unit normal of the drawn triangle under a point (the plane `sample` follows).
+    Vec3 normal(float x, float z) const;
     // Surface type (index into the mission's Surfaces table) at the nearest height sample: bits 8..10 of the
     // sample's attribute word (FUN_100974e0).
     int surfaceAt(float x, float z) const;

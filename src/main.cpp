@@ -174,6 +174,7 @@ int main(int argc, char** argv) {
     if (!app.offscreen) {
         SDL_WindowFlags fl = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | (app.settings.fullscreen ? SDL_WINDOW_FULLSCREEN : 0);
         app.win = SDL_CreateWindow("Heavy Gear II", app.width, app.height, fl);
+        SDL_HideCursor();  // the shell and the pause menu draw the game's own pointer
         if (!app.win) {
             fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
             return 1;

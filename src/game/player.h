@@ -24,7 +24,8 @@ public:
     bool initObject(const FileSystem& fs, Scene& scene, int object);  // any gear / vehicle object
     bool canWalk() const { return !ecy_.states.empty(); }
     void setYaw(float y) { yaw_ = y; }
-    void teleport(const Vec3& p) { pos_ = p, vy_ = 0, air_ = false; }
+    void teleport(const Vec3& p) { pos_ = p, vy_ = 0, air_ = false, slide_ = Vec3(); }
+    void halt() { speed_ = 0, strafe_ = 0, slide_ = Vec3(); }  // FullStop: motion zeroed on the spot
     void update(float dt, const PlayerInput& in);
     bool active() const { return object_ >= 0; }
     int object() const { return object_; }
@@ -78,6 +79,7 @@ private:
     float footprint_ = 1.4f;  // half the distance between the feet (ground probes)
     float yaw_ = 0, speed_ = 0, strafe_ = 0, vy_ = 0, frame_ = 0;
     bool air_ = false, sms_ = false, lockForward_ = false;
+    Vec3 slide_;  // downhill slide velocity on steep ground (the original's slope force, FUN_1003cc30)
     int wantPosture_ = -1;
     bool dead_ = false;
     int reactSet_ = -1;

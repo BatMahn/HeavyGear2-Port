@@ -140,7 +140,15 @@ void AiSystem::command(int o, const std::string& c, float a, float b, float cc, 
     else if (c == "nonCombatTactic") u->nonCombatTactic = lowerCopy(s), u->asleep = false;
     else if (c == "lookAt") u->lookAt = int(a);
     else if (c == "autoSleep") u->autoSleep = a != 0, u->dozing = u->dozing && a != 0;
-    else if (c == "autopilot") u->asleep = false, u->forced = -1, u->drive = 0, u->braked = false;  // back to the brain's own behaviour
+    else if (c == "autopilot") {  // back to the brain's own behaviour; FUN_100d7280 also resets auto aim and cinematic control
+        u->asleep = false, u->forced = -1, u->drive = 0, u->braked = false;
+        u->autoAim = true, u->cinematic = false;
+    } else if (c == "fullStop") u->body.halt();       // FUN_100d44f0: +0x158(0,0), orders kept
+    else if (c == "cinematicControl") u->cinematic = a != 0;  // FUN_100d66d0
+    else if (c == "autoAim") u->autoAim = a != 0;      // FUN_100d7390
+    else if (c == "weaponArc" && !u->mobile) {         // FUN_100d6b90 -> FUN_100ec400: yaw joint limits (-c, d) degrees
+        u->arc = true, u->arcMin = -a * 0.01745329f, u->arcMax = b * 0.01745329f, u->arcHome = u->body.yaw();
+    }
 }
 
 void AiSystem::hitBy(int o, int shooter) {
@@ -362,7 +370,7 @@ void AiSystem::update(float dt) {
             if (u.disengage > 0) u.disengage -= 0.25f;
             if (u.order == OrderAttack && (u.orderObj < 0 || !combat_->alive(u.orderObj))) u.order = OrderFollow, u.forced = -1;
             if (u.order == OrderDefend && (u.orderObj < 0 || !combat_->alive(u.orderObj))) u.order = OrderFollow;
-            if (!u.asleep && u.canTarget && u.disengage <= 0) {
+            if (!u.asleep && u.canTarget && u.disengage <= 0 && !combatHold_) {
                 if (u.forced >= 0 && combat_->alive(u.forced) && !dozing(u.forced)) u.target = u.forced;
                 float best = u.detect * sensorMul * kAlert[std::max(0, std::min(5, alert))] * (u.awake ? 1.5f : 1.f);
                 if (u.team != playerTeam) best *= 0.85f + 0.3f * difficulty_;  // harder pilots spot you sooner
@@ -377,7 +385,7 @@ void AiSystem::update(float dt) {
                     }
                     if (d < best * k && scene_->terrainRay(me + Vec3(0, 5, 0), p + Vec3(0, 4, 0)) > 1.f) best = d / k, u.target = obj;
                 };
-                if (u.target < 0) {
+                if (u.target < 0 && !u.cinematic) {
                     if (playerAlive) consider(player_->object(), playerTeam, player_->position());
                     // HuntUser units go for the user and whoever shoots at them, nobody else
                     bool hunter = u.nonCombatTactic.find("hunt") != std::string::npos;
@@ -385,7 +393,7 @@ void AiSystem::update(float dt) {
                         if (&o != &u && !hunter) consider(o.object, o.team, o.body.position());
                 }
                 // an attacker is engaged even beyond the sensor range
-                if (u.target < 0 && u.attacker >= 0 && combat_->alive(u.attacker) && teamOf(u.attacker) != u.team) {
+                if (u.target < 0 && !u.cinematic && u.attacker >= 0 && combat_->alive(u.attacker) && teamOf(u.attacker) != u.team) {
                     Vec3 ap;
                     if (positionOf(u.attacker, ap) && length(ap - me) < u.detect * 2.f) u.target = u.attacker;
                 }
@@ -431,6 +439,7 @@ void AiSystem::update(float dt) {
         float leashR = u.order == OrderFireAtWill ? 600.f : u.order == OrderHold || u.order == OrderGoto ? 1e9f : 220.f;
         if (u.leader >= 0 && positionOf(u.leader, leaderPos) && length(leaderPos - me) > leashR && u.forced < 0) leash = true;
         if (u.order == OrderFireAtWill) weaponsFree = true;
+        if (!u.autoAim) weaponsFree = false;  // AutoAim(FALSE): the gunner doesn't track (FUN_100801e0 skips +300)
         if (leash) u.target = -1;
         bool pathFirst = !u.path.empty() && u.pathIdx < u.path.size() && u.forced < 0 &&
                          (combat_->range(u.object) <= 0 || (u.team == playerTeam && u.type != 0x48));
@@ -477,6 +486,11 @@ void AiSystem::update(float dt) {
             float range = std::max(40.f, combat_->chooseWeapon(u.object, dist));
             u.visible = scene_->terrainRay(me + Vec3(0, 5, 0), tp + Vec3(0, 4, 0)) > 0.98f;
             bool canFire = u.visible && dist < range;
+            if (u.arc) {  // a constrained turret can't bring its gun round beyond the arc
+                Vec3 d = tp - me;
+                float rel = wrap(std::atan2(-d.x, -d.z) - u.arcHome);
+                if (rel < u.arcMin || rel > u.arcMax) canFire = false;
+            }
             std::uniform_real_distribution<float> R(0.f, 1.f);
             // ---- choose a combat tactic: the script's, else one of the unit class's from the tactic table
             std::string tac = u.combatTactic;
@@ -890,7 +904,9 @@ void AiSystem::update(float dt) {
         in.throttle *= std::min(1.f, u.speedFrac * 2.f);
         if (u.braked) in.throttle = 0, in.strafe = 0, in.run = false;
         if (!u.mobile) {  // turrets only rotate
-            u.body.setYaw(u.body.yaw() + in.turn * 1.2f * dt);
+            float y = u.body.yaw() + in.turn * 1.2f * dt;
+            if (u.arc) y = u.arcHome + std::clamp(wrap(y - u.arcHome), u.arcMin, u.arcMax);
+            u.body.setYaw(y);
             in = PlayerInput{};
         }
         if (getenv("HG2_UNITDBG") && u.object == atoi(getenv("HG2_UNITDBG")) && int(u.clock * 2) != int((u.clock - dt) * 2))
@@ -905,31 +921,50 @@ void AiSystem::update(float dt) {
 // ---- route planning: the original's MOVETO pathfinder (FUN_100bf020 → FUN_100c3190 search, FUN_100c26a0 expand,
 // FUN_100c2520 walkability, FUN_100c3530 straight-line test), as decoded:
 //  * a 4 m grid (DAT_102689d0) with 8 neighbours; a step costs its squared length (16, diagonals 32) plus the squared
-//    height change (under water, (depth + 1) × the step's cost is added for callers that ask for it);
+//    height change, and under water (depth + 1) × the step when the request asks for the water penalty;
 //  * f = g + the squared straight-line distance to the goal; nodes are expanded best-f first, at most 2048 of them
 //    (128 a frame in the original); a node within the goal radius (3 m) ends the search, otherwise the path runs
 //    to the best node found (a partial path, result 3);
-//  * a node is blocked by a solid object (the occupancy grid's flags) or by ground steeper than the slope limit.
-//    MOVETO asks with flags 0x38 (FUN_100373c0): no water-depth limit and no water penalty (those are for other
-//    callers), nodes raised to the water surface;
+//  * a node is blocked by a solid object (the occupancy grid's flags), by water deeper than the unit's bounding
+//    radius (object +0x98) unless the request lifts the depth limit, and by ground whose triangle normal has
+//    |n·up| < the unit's slope cosine (the follower's +0xa4, FUN_100bff80);
 //  * the path is then shortened by straight-line tests in 2 m steps.
-// The port's occupancy test is Scene::collide; the slope limit (the request's +0xa4) isn't traced, ~42° is used.
+// Per unit class (MOVETO of each class, see docs/FORMATS.md): the slope limit is 30° (cos 0.866, pushed as a constant)
+// for gears, infantry, mounts, chicken walkers, frames and hovers; Jeeps (0x4e) use their +0x27c, cos 20°. Flags:
+// gears 0 (8 = no depth limit when Amphibious), Jeeps and mounts 0, hovers 0x38 (no depth limit, no water penalty,
+// nodes on the water surface).
+// The port's occupancy test is Scene::collide.
 namespace {
 constexpr float kCell = 4.f;
-constexpr float kMaxRise = 0.9f;   // rise per metre (≈42°)
+}
+AiSystem::MoveRules AiSystem::moveRules(int self) const {
+    MoveRules r;
+    int type = self >= 0 && size_t(self) < scene_->mission().objects.size() ? scene_->mission().objects[size_t(self)].type : 0x48;
+    r.slopeCos = type == 0x4e ? 0.9397f : 0.866f;     // FUN_1006c700 → FUN_10049db0(20); 0x3f5db22d
+    bool hover = type == 0x4f;
+    bool amphibious = (type == 0x48 || type == 0x50 || type == 0x52 || type == 0x53) && combat_ && combat_->amphibious(self);
+    r.depthLimit = hover || amphibious ? 1e9f : std::max(1.f, scene_->objectRadius(self));
+    r.waterCost = !hover;
+    r.onSurface = hover;
+    return r;
+}
+bool AiSystem::walkable(float x, float z, const MoveRules& r) const {
+    if (scene_->mission().hasWater) {
+        float depth = scene_->waterLevel() - scene_->groundHeight(x, z);
+        if (depth > 1e-5f && depth > r.depthLimit) return false;
+    }
+    return std::fabs(scene_->groundNormal(x, z).y) >= r.slopeCos;
 }
 bool AiSystem::lineBlocked(const Vec3& from, const Vec3& to, int self) const {
     Vec3 d = flat(to) - flat(from);
     float len = length(d);
     if (len < 1.f) return false;
+    MoveRules rules = moveRules(self);
     int n = int(len / 2.f) + 1;   // FUN_100c3530: 2 m steps
-    float hPrev = scene_->groundHeight(from.x, from.z);
     for (int i = 1; i <= n; ++i) {
         Vec3 p = from + d * (float(i) / float(n));
-        float h = scene_->groundHeight(p.x, p.z);
-        if (std::fabs(h - hPrev) > kMaxRise * (len / float(n))) return true;
-        hPrev = h;
-        Vec3 q(p.x, h, p.z);
+        if (!walkable(p.x, p.z, rules)) return true;
+        Vec3 q(p.x, scene_->groundHeight(p.x, p.z), p.z);
         if (scene_->collide(q, 2.5f, 8.f, self)) return true;
         const Surface* s = scene_->surfaceAt(p.x, p.z);
         if (s && s->damage > 0) return true;
@@ -949,16 +984,19 @@ bool AiSystem::planRoute(const Vec3& from, const Vec3& to, int self, std::vector
     std::vector<signed char> kind(size_t(W) * H, -1);  // -1 unknown, 0 free, 1 blocked, 2 lava
     std::vector<float> hgt(size_t(W) * H, 0.f);
     float water = scene_->mission().hasWater ? scene_->waterLevel() : -1e9f;
+    MoveRules rules = moveRules(self);
+    std::vector<float> depth(size_t(W) * H, 0.f);
     auto centre = [&](int cx, int cz) { return Vec3(x0 + (cx + 0.5f) * kCell, 0, z0 + (cz + 0.5f) * kCell); };
     auto classify = [&](int cx, int cz) {
         size_t i = size_t(cz) * W + cx;
         if (kind[i] < 0) {
             Vec3 c = centre(cx, cz);
             float h = scene_->groundHeight(c.x, c.z);
-            hgt[i] = std::max(h, water);  // request flag 0x20 (+0x3b): nodes sit on the water surface
+            hgt[i] = rules.onSurface ? std::max(h, water) : h;  // request flag 0x20 (+0x3b): nodes on the water surface
+            depth[i] = std::max(0.f, water - h);
             Vec3 q(c.x, h, c.z);
             const Surface* s = scene_->surfaceAt(c.x, c.z);
-            kind[i] = scene_->collide(q, 2.5f, 8.f, self) ? 1 : (s && s->damage > 0) ? 2 : 0;
+            kind[i] = !walkable(c.x, c.z, rules) || scene_->collide(q, 2.5f, 8.f, self) ? 1 : (s && s->damage > 0) ? 2 : 0;
         }
         return kind[i];
     };
@@ -1001,8 +1039,8 @@ bool AiSystem::planRoute(const Vec3& from, const Vec3& to, int self, std::vector
                 if (k == 1) continue;
                 float step = (dx && dz) ? 2.f * kCell * kCell : kCell * kCell;
                 float dh = hgt[ni] - hgt[cur];
-                if (std::fabs(dh) > kMaxRise * std::sqrt(step)) continue;  // too steep
                 float c = g[cur] + step + dh * dh;
+                if (rules.waterCost && depth[ni] > 0) c += (depth[ni] + 1.f) * step;
                 if (k == 2) c += 12.f * step;  // lava: the port's addition (the original has no lava test here)
                 if (c < g[ni]) g[ni] = c, parent[ni] = cur, open.push({c + hcost(nx, nz, hgt[ni]), ni});
             }

@@ -115,27 +115,14 @@ GpuMesh* Scene::model(const std::string& name) {
         std::vector<DrawBatch> batches;
         appendModel(m, v, batches);
         mesh = r_.createMesh(v, std::move(batches));
-        // collision boxes: bounds of each frame's mesh in model space
-        auto& bx = boxes_[key];
-        std::function<void(int, const Mat4&)> walk = [&](int fi, const Mat4& parent) {
-            while (fi >= 0 && fi < int(m.frames.size())) {
-                const Frame& f = m.frames[size_t(fi)];
-                Mat4 w = frameMatrix(f) * parent;
-                if (f.mesh >= 0 && !m.meshes[size_t(f.mesh)].v.empty()) {
-                    Box b{Vec3(1e9f, 1e9f, 1e9f), Vec3(-1e9f, -1e9f, -1e9f)};
-                    for (auto& p : m.meshes[size_t(f.mesh)].v) {
-                        Vec3 q = w.transformPoint(p);
-                        b.lo = Vec3(std::min(b.lo.x, q.x), std::min(b.lo.y, q.y), std::min(b.lo.z, q.z));
-                        b.hi = Vec3(std::max(b.hi.x, q.x), std::max(b.hi.y, q.y), std::max(b.hi.z, q.z));
-                    }
-                    // skip decals / flat pieces the gears walk over
-                    if (b.hi.y - b.lo.y > 0.8f && (b.hi.x - b.lo.x) * (b.hi.z - b.lo.z) < 250000.f) bx.push_back(b);
-                }
-                if (f.child >= 0) walk(f.child, w);
-                fi = f.sibling;
-            }
-        };
-        walk(0, Mat4::identity());
+        // collision volumes from the drawn geometry (see collision.h)
+        CollModel& cs = boxes_[key];
+        if (getenv("HG2_COLLIDE_LEGACY")) legacyCollision(m, cs);  // A/B test: the old one-box-per-mesh volumes
+        else buildCollision(m, alpha_.forModel(m), cs);
+        if (getenv("HG2_COLLDBG"))
+            SDL_Log("collision %s: %zu boxes (%zu from the base), cell %.1f m, %d%% of the surface cut away by alpha", key.c_str(),
+                    cs.full.boxes.size(), cs.trunk.boxes.size(), cs.cell,
+                    cs.samples ? 100 * cs.transparentSamples / cs.samples : 0);
     } else {
         SDL_Log("model not found: %s", name.c_str());
     }
@@ -413,6 +400,9 @@ void Scene::buildTerrain() {
                     if (n.dim < t.dim) v.pos[1] = terrain_.sample(px, pz);
                 }
             }
+            // ground lying at the water's surface was coplanar with it and flickered through it; the drawn ground
+            // under the water (and level with it) is lowered a little
+            if (mission_.hasWater && v.pos[1] < mission_.waterLevel + 0.15f) v.pos[1] -= 0.3f;
             float e = 4.f;
             float hx = terrain_.sample(x + e, z) - terrain_.sample(x - e, z);
             float hz = terrain_.sample(x, z + e) - terrain_.sample(x, z - e);
@@ -437,7 +427,7 @@ void Scene::buildTerrain() {
     std::vector<Vertex> all;
     std::vector<DrawBatch> batches;
     for (auto& [tex, vs] : byTex) {
-        batches.push_back({tex, uint32_t(all.size()), uint32_t(vs.size()), false, false});
+        batches.push_back({tex, uint32_t(all.size()), uint32_t(vs.size()), false, false, false, true});
         all.insert(all.end(), vs.begin(), vs.end());
     }
     terrainMesh_ = r_.createMesh(all, std::move(batches));
@@ -465,7 +455,14 @@ void Scene::addInstance(size_t index) {
             std::string key = upper(mdl);
             while (!key.empty() && key[0] == '@') key.erase(0, 1);
             auto bi = boxes_.find(key);
-            if (bi != boxes_.end() && !bi->second.empty()) inst.boxes = &bi->second;
+            // No collision volume: Object_NoColl (0x162) and Plane_NoColl (0x61) - classes whose constructors clear the
+            // object's collision flag bits (object factories FUN_10085570 / FUN_100883d0) -, the spawn point markers (0x56-0x59)
+            // and light icons.
+            bool marker = (o.type == 0x162 || o.type == 0x61 || (o.type >= 0x56 && o.type <= 0x59) || o.type == 0x5c || o.isLight) &&
+                          !getenv("HG2_COLLIDE_LEGACY");
+            // Tree_Object: only the trunk stands in the way; gears brush through branches and crowns.
+            const CollShape* cs = bi == boxes_.end() || marker ? nullptr : o.type == 0x47 ? &bi->second.trunk : &bi->second.full;
+            if (cs && !cs->boxes.empty()) inst.boxes = cs;
             // rigid inverse: transpose the rotation, rotate the negated translation
             Mat4 inv = Mat4::identity();
             for (int r2 = 0; r2 < 3; r2++)
@@ -565,6 +562,37 @@ void Scene::render(const FrameParams& fp) {
         }
     }
     if (waterMesh_) r_.draw(waterMesh_, Mat4::translate(Vec3(0, waterOffset_, 0)), false);
+    if (getenv("HG2_COLLVIEW")) drawCollision();
+}
+
+// HG2_COLLVIEW: the static collision boxes as translucent red blocks (debug view; built once, in world space, from
+// the instances placed at the time - moving units with boxes are not followed).
+void Scene::drawCollision() {
+    if (!boxMesh_) {
+        std::vector<Vertex> v;
+        for (auto& i : instances_) {
+            if (!i.boxes || i.hidden) continue;
+            for (auto& b : i.boxes->boxes) {
+                Vec3 c[8];
+                const float e = 0.08f;  // a little proud of the surfaces they hug, so they don't z-fight
+                for (int k = 0; k < 8; k++)
+                    c[k] = i.world.transformPoint(Vec3(k & 1 ? b.hi.x + e : b.lo.x - e, k & 2 ? b.hi.y + e : b.lo.y - e, k & 4 ? b.hi.z + e : b.lo.z - e));
+                auto quad = [&](int a0, int b0, int c0, int d0, uint8_t shade) {
+                    for (int k : {a0, b0, c0, a0, c0, d0}) {
+                        Vertex o{};
+                        o.pos[0] = c[k].x, o.pos[1] = c[k].y, o.pos[2] = c[k].z;
+                        o.normal[1] = 1;
+                        o.color[0] = shade, o.color[1] = uint8_t(shade / 5), o.color[2] = uint8_t(shade / 5), o.color[3] = 255;
+                        v.push_back(o);
+                    }
+                };
+                quad(0, 1, 5, 4, 160), quad(2, 6, 7, 3, 255), quad(0, 2, 3, 1, 200), quad(4, 5, 7, 6, 200), quad(0, 4, 6, 2, 230), quad(1, 3, 7, 5, 230);
+            }
+        }
+        if (v.empty()) return;
+        boxMesh_ = r_.createMesh(v, {{r_.whiteTexture(), 0, uint32_t(v.size()), true, false}});
+    }
+    r_.draw(boxMesh_, Mat4::identity(), false, 0.45f);
 }
 
 void Scene::setObjectPose(int object, const Vec3& pos, float yaw, int animSet, float frame) {
@@ -592,12 +620,14 @@ bool Scene::collide(Vec3& pos, float radius, float height, int ignoreObject) con
     for (auto& i : instances_) {
         if (!i.boxes || i.object == ignoreObject || i.hidden) continue;
         Vec3 lp = i.inv.transformPoint(pos);
-        for (auto& b : *i.boxes) {
-            if (lp.x < b.lo.x - radius || lp.x > b.hi.x + radius || lp.z < b.lo.z - radius || lp.z > b.hi.z + radius) continue;
-            if (b.hi.y < lp.y + 1.2f || b.lo.y > lp.y + height) continue;  // step over low parts, pass under high ones
+        bool hitHere = false;
+        // boxes reaching above the knee (1.2 m step) and below the head; others are stepped over / walked under
+        i.boxes->query(Vec3(lp.x - radius, lp.y + 1.2f, lp.z - radius), Vec3(lp.x + radius, lp.y + height, lp.z + radius), [&](const CollBox& b) {
+            if (lp.x < b.lo.x - radius || lp.x > b.hi.x + radius || lp.z < b.lo.z - radius || lp.z > b.hi.z + radius) return;
+            if (b.hi.y < lp.y + 1.2f || b.lo.y > lp.y + height) return;
             float cx = std::max(b.lo.x, std::min(lp.x, b.hi.x)), cz = std::max(b.lo.z, std::min(lp.z, b.hi.z));
             float dx = lp.x - cx, dz = lp.z - cz, d2 = dx * dx + dz * dz;
-            if (d2 >= radius * radius) continue;
+            if (d2 >= radius * radius) return;
             if (d2 > 1e-6f) {
                 float d = std::sqrt(d2), push = radius - d;
                 lp.x += dx / d * push, lp.z += dz / d * push;
@@ -609,9 +639,13 @@ bool Scene::collide(Vec3& pos, float radius, float height, int ignoreObject) con
                 else if (k == 2) lp.z = b.lo.z - radius;
                 else lp.z = b.hi.z + radius;
             }
-            hit = true;
-        }
-        if (hit) pos = i.world.transformPoint(lp);
+            hit = hitHere = true;
+            if (getenv("HG2_COLLDBG") && ignoreObject == atoi(getenv("HG2_COLLDBG")))
+                SDL_Log("collide obj %d (%s) box (%.1f %.1f %.1f)-(%.1f %.1f %.1f) at %.0f,%.0f", i.object,
+                        i.object >= 0 && size_t(i.object) < mission_.objects.size() ? mission_.objects[size_t(i.object)].name.c_str() : "?",
+                        b.lo.x, b.lo.y, b.lo.z, b.hi.x, b.hi.y, b.hi.z, pos.x, pos.z);
+        });
+        if (hitHere) pos = i.world.transformPoint(lp);
     }
     return hit;
 }
@@ -636,23 +670,23 @@ int Scene::raycast(const Vec3& a, const Vec3& b, int ignoreObject, float& tOut) 
             continue;
         }
         Vec3 la = i.inv.transformPoint(a), lb = i.inv.transformPoint(b), d = lb - la;
-        for (auto& bx : *i.boxes) {  // slab test
+        Vec3 qlo(std::min(la.x, lb.x), std::min(la.y, lb.y), std::min(la.z, lb.z)), qhi(std::max(la.x, lb.x), std::max(la.y, lb.y), std::max(la.z, lb.z));
+        i.boxes->query(qlo, qhi, [&](const CollBox& bx) {  // slab test
             float t0 = 0, t1 = 1;
             const float lo[3] = {bx.lo.x, bx.lo.y, bx.lo.z}, hi[3] = {bx.hi.x, bx.hi.y, bx.hi.z};
             const float o[3] = {la.x, la.y, la.z}, dv[3] = {d.x, d.y, d.z};
-            bool miss = false;
-            for (int k = 0; k < 3 && !miss; k++) {
+            for (int k = 0; k < 3; k++) {
                 if (std::fabs(dv[k]) < 1e-6f) {
-                    if (o[k] < lo[k] || o[k] > hi[k]) miss = true;
+                    if (o[k] < lo[k] || o[k] > hi[k]) return;
                     continue;
                 }
                 float u0 = (lo[k] - o[k]) / dv[k], u1 = (hi[k] - o[k]) / dv[k];
                 if (u0 > u1) std::swap(u0, u1);
                 t0 = std::max(t0, u0), t1 = std::min(t1, u1);
-                if (t0 > t1) miss = true;
+                if (t0 > t1) return;
             }
-            if (!miss && t0 < tOut) tOut = t0, best = i.object;
-        }
+            if (t0 < tOut) tOut = t0, best = i.object;
+        });
     }
     return best;
 }
@@ -676,11 +710,11 @@ float Scene::supportHeight(const Vec3& pos, float step, int ignoreObject) const 
     for (auto& i : instances_) {
         if (!i.boxes || i.object == ignoreObject || i.hidden) continue;
         Vec3 lp = i.inv.transformPoint(pos);
-        for (auto& b : *i.boxes) {
-            if (lp.x < b.lo.x || lp.x > b.hi.x || lp.z < b.lo.z || lp.z > b.hi.z) continue;
+        i.boxes->query(Vec3(lp.x, -1e9f, lp.z), Vec3(lp.x, lp.y + step, lp.z), [&](const CollBox& b) {
+            if (lp.x < b.lo.x || lp.x > b.hi.x || lp.z < b.lo.z || lp.z > b.hi.z) return;
             float top = i.world.transformPoint(Vec3(lp.x, b.hi.y, lp.z)).y;
             if (top <= pos.y + step && top > best) best = top;
-        }
+        });
     }
     return best;
 }
@@ -724,6 +758,33 @@ const Surface* Scene::surfaceAt(float x, float z) const {
 
 float Scene::groundHeight(float x, float z) const {
     return hasTerrain_ ? terrain_.sample(x, z) : 0.f;
+}
+
+Vec3 Scene::groundNormal(float x, float z) const {
+    return hasTerrain_ ? terrain_.normal(x, z) : Vec3(0, 1, 0);
+}
+
+float Scene::objectRadius(int object) const {
+    for (auto& i : instances_) {
+        if (i.object != object) continue;
+        Vec3 lo(1e30f, 1e30f, 1e30f), hi(-1e30f, -1e30f, -1e30f);
+        auto grow = [&](const Vec3& a, const Vec3& b, const Mat4& w) {
+            for (int k = 0; k < 8; k++) {
+                Vec3 p = w.transformPoint(Vec3(k & 1 ? b.x : a.x, k & 2 ? b.y : a.y, k & 4 ? b.z : a.z));
+                lo = Vec3(std::min(lo.x, p.x), std::min(lo.y, p.y), std::min(lo.z, p.z));
+                hi = Vec3(std::max(hi.x, p.x), std::max(hi.y, p.y), std::max(hi.z, p.z));
+            }
+        };
+        if (i.rig) {
+            walkPose(i, [&](int fi, const Frame&, const Mat4& w, bool hidden) {
+                if (const GpuMesh* g = i.rig->parts[size_t(fi)]; g && !hidden) grow(g->bmin, g->bmax, w);
+            });
+        } else if (i.mesh) {
+            grow(i.mesh->bmin, i.mesh->bmax, i.world);
+        }
+        return hi.x < lo.x ? 0.f : 0.5f * length(hi - lo);
+    }
+    return 0.f;
 }
 
 Vec3 Scene::startPosition() const {

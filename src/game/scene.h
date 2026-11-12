@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "../assets/assets.h"
+#include "../assets/collision.h"
 #include "../assets/mission.h"
 #include "../core/fs.h"
 #include "../render/renderer.h"
@@ -15,7 +16,7 @@ namespace hg2 {
 
 class Scene {
 public:
-    Scene(const FileSystem& fs, Renderer& r) : fs_(fs), r_(r) {}
+    Scene(const FileSystem& fs, Renderer& r) : fs_(fs), r_(r), alpha_(fs) {}
     // `prepare` runs on the parsed mission before anything is built (gear swaps, squad mates).
     bool load(const std::string& missionName, std::string* err, const std::function<void(Mission&)>& prepare = nullptr);
     void render(const FrameParams& base);
@@ -23,6 +24,9 @@ public:
     const Mission& mission() const { return mission_; }
     Mission& missionRW() { return mission_; }  // definitions added at run time (instant-action waves)
     float groundHeight(float x, float z) const;
+    Vec3 groundNormal(float x, float z) const;  // the terrain triangle's normal (up when there's no terrain)
+    // Radius of the sphere round an object's model (rigged units at their current pose); 0 if it has none.
+    float objectRadius(int object) const;
     // The mission's surface entry under a point (lava etc.), or nullptr when the terrain has none there.
     const Surface* surfaceAt(float x, float z) const;
     Vec3 startPosition() const;
@@ -77,6 +81,7 @@ private:
     // Walks a rigged instance's frames at its current pose: f(frame index, frame, world matrix, hidden branch).
     void walkPose(const Instance& i, const std::function<void(int, const Frame&, const Mat4&, bool)>& f) const;
     void buildTerrain();
+    void drawCollision();
     void addInstance(size_t objectIndex);
     void appendModel(const Model& m, std::vector<Vertex>& out, std::vector<DrawBatch>& batches, int onlyFrame = -1);
     float time_ = 0;
@@ -92,8 +97,9 @@ private:
     GpuMesh* sky_ = nullptr;
     std::unordered_map<std::string, int> textures_;
     std::unordered_map<std::string, GpuMesh*> models_;
-    struct Box { Vec3 lo, hi; };  // model-space bounds of one frame mesh
-    std::unordered_map<std::string, std::vector<Box>> boxes_;
+    TextureAlpha alpha_;  // texture alpha masks for the collision builder
+    std::unordered_map<std::string, CollModel> boxes_;  // model-space collision volumes per model (collision.h)
+    GpuMesh* boxMesh_ = nullptr;  // unit cube for HG2_COLLVIEW
     std::unordered_map<std::string, std::unique_ptr<Rigged>> rigged_;
     std::unordered_map<std::string, std::unique_ptr<std::vector<AnimSet>>> anims_;
     struct Instance {
@@ -104,7 +110,7 @@ private:
         int set = 0;
         int object = -1;       // mission object index
         float frame = -1;      // animation key time override (< 0: loop on scene time)
-        const std::vector<Box>* boxes = nullptr;
+        const CollShape* boxes = nullptr;  // static collision volumes (nullptr: none - rigged units, markers)
         bool hidden = false;
         bool noDraw = false;   // still collides / takes hits (player in cockpit view)
         float twist = 0;

@@ -106,6 +106,8 @@ public:
     std::vector<Hit> hits;       // hits since last drain
     std::vector<int> damaged;    // units that dropped below half their hit points
     void kill(int object);       // InstantDeath
+    void destroy(int object);    // Kill: destroyed as if shot (explosion, wreck)
+    void artilleryShell(const Vec3& p);  // one ArtilleryStrike shell landing at p
     void grow(size_t objects) { if (damage.size() < objects) damage.resize(objects, 0.f); }
     // Per-part damage (gears with a Damage_Hierarchy): health 0..1 of a region (H head, T torso, A/a right/left
     // arm, L/l right/left leg; 1 if the unit has no such parts), movement left after leg damage, sensors working.

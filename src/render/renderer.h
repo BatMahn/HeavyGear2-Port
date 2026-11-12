@@ -26,6 +26,7 @@ struct DrawBatch {
     bool blend = false;
     bool alphaTest = false;
     bool additive = false;  // dynamic batches: additive blending (fire, sparks)
+    bool clampUV = false;   // sample clamped to the texture's edges (terrain tiles: no bleed from the opposite edge)
 };
 
 // A static mesh uploaded to the GPU (triangle list) with per-texture batches.
@@ -116,6 +117,7 @@ private:
     uint32_t overlayCount_ = 0;
     int font_ = -1;
     SDL_GPUSampler* sampler_ = nullptr;
+    SDL_GPUSampler* clampSampler_ = nullptr;
     SDL_GPUTexture* depth_ = nullptr;
     SDL_GPUTexture* msaaColor_ = nullptr;  // multisampled scene target, resolved into the swapchain
     int samples_ = 1, wantSamples_ = 1, msaaW_ = 0, msaaH_ = 0;

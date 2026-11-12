@@ -401,6 +401,20 @@ float Terrain::sample(float x, float z) const {
     return fx >= fz ? a + (b - a) * fx + (c - b) * fz : a + (d - a) * fz + (c - d) * fx;
 }
 
+Vec3 Terrain::normal(float x, float z) const {
+    if (tiles.size() < 128 * 128) return Vec3(0, 1, 0);
+    x = std::max(0.f, std::min(4095.99f, x));
+    z = std::max(0.f, std::min(4095.99f, z));
+    const TerrainTile& t = tiles[size_t(int(x) / 32) * 128 + size_t(int(z) / 32)];
+    float lx = (x - t.x0) / t.step, lz = (z - t.z0) / t.step;
+    int ix = std::min(t.dim - 2, int(lx)), iz = std::min(t.dim - 2, int(lz));
+    float fx = lx - ix, fz = lz - iz;
+    auto H = [&](int a, int b) { return t.h[size_t(a) * t.dim + b] * 0.01f; };
+    float a = H(ix, iz), b = H(ix + 1, iz), c = H(ix + 1, iz + 1), d = H(ix, iz + 1);
+    float dx = fx >= fz ? b - a : c - d, dz = fx >= fz ? c - b : d - a;  // rise per grid step
+    return normalize(Vec3(-dx / float(t.step), 1.f, -dz / float(t.step)));
+}
+
 int Terrain::surfaceAt(float x, float z) const {
     if (tiles.size() < 128 * 128) return 0;
     x = std::max(0.f, std::min(4095.99f, x));
