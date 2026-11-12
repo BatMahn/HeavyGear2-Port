@@ -257,7 +257,7 @@ void Player::update(float dt, const PlayerInput& in) {
         if (want != set_) set_ = want, frame_ = 0;
         loop_ = true;
     }
-    len = std::max(1, scene_->animLength(object_, set_));
+    len = std::max(1, loop_ ? scene_->animCycle(object_, set_) : scene_->animLength(object_, set_));
     float rate = 30.f;  // XB keys are 30 per second
     bool cycle = !ecy ? set_ != 0
                       : loop_ && !sms_ && !air_ && state_ != sIdle_ && state_ != sKneel_ && state_ != sProne_;
@@ -276,7 +276,7 @@ void Player::update(float dt, const PlayerInput& in) {
     int shown = set_;
     if (ecy && state_ == sIdle_ && loop_ && !sms_ && std::fabs(in.turn) > 0.1f && sWalk_ >= 0) {
         // turning on the spot: step with the walk cycle at a slow pace
-        shown = 1, rate = 18.f * std::fabs(in.turn), len = std::max(1, scene_->animLength(object_, shown));
+        shown = 1, rate = 18.f * std::fabs(in.turn), len = std::max(1, scene_->animCycle(object_, shown));
         cycle = true;
         if (idleSet_ != shown) frame_ = 0, idleSet_ = shown;
     } else if (idleSet_ != set_ && state_ == sIdle_) {

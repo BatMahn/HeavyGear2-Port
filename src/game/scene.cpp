@@ -1,6 +1,7 @@
 #include "scene.h"
 
 #include <algorithm>
+#include <cstring>
 #include <SDL3/SDL.h>
 
 #include <cmath>
@@ -264,6 +265,22 @@ bool Scene::frameWorld(int object, const std::string& frame, Vec3& out) const {
     return false;
 }
 
+namespace {
+// A looping set's real cycle: some sets end with a padding key that repeats the previous one (the Jaguar's walk has
+// its keys to 39 and again at 49), which held the pose for 10 frames each loop - a stop in every stride.
+int cycleEnd(const AnimSet& set) {
+    int end = 0;
+    auto chan = [&](const std::vector<AnimKey>& ks) {
+        if (ks.empty()) return;
+        size_t j = ks.size() - 1;
+        while (j > 0 && std::memcmp(ks[j - 1].v, ks.back().v, sizeof ks.back().v) == 0) --j;
+        end = std::max(end, int(ks[j].time));
+    };
+    for (auto& t : set.tracks) chan(t.rot), chan(t.pos), chan(t.scale);
+    return end > 0 ? end : set.length;
+}
+}  // namespace
+
 float Scene::animStride(int object, int animSet) const {
     for (auto& i : instances_) {
         if (i.object != object || !i.rig || !i.sets || animSet < 0 || size_t(animSet) >= i.sets->size()) continue;
@@ -279,7 +296,7 @@ float Scene::animStride(int object, int animSet) const {
             for (auto& trk : set.tracks)
                 if (lower(m.frames[size_t(fi)].name) == trk.frame && !trk.pos.empty()) {
                     Mat4 a = animLocal(&trk, frameMatrix(m.frames[size_t(fi)]), 0.f);
-                    Mat4 b = animLocal(&trk, frameMatrix(m.frames[size_t(fi)]), float(set.length));
+                    Mat4 b = animLocal(&trk, frameMatrix(m.frames[size_t(fi)]), float(cycleEnd(set)));
                     best = std::max(best, std::hypot(b.m[3][0] - a.m[3][0], b.m[3][2] - a.m[3][2]));
                 }
         if (getenv("HG2_STRIDEDBG"))
@@ -384,6 +401,18 @@ void Scene::buildTerrain() {
             float x = float(t.x0 + ix * t.step), z = float(t.z0 + iz * t.step);
             v.pos[0] = x, v.pos[2] = z;
             v.pos[1] = t.h[size_t(ix) * t.dim + iz] * 0.01f;
+            // T-junctions: a 5x5 tile next to a 3x3 one has an extra vertex mid-edge that the coarse tile doesn't; left
+            // at its own height it opens a crack (the "tear" where the water / fog shows through). Edge vertices take
+            // the coarser neighbour's height along the shared edge.
+            if (ix == 0 || iz == 0 || ix == t.dim - 1 || iz == t.dim - 1) {
+                float nx = ix == 0 ? -0.05f : ix == t.dim - 1 ? 0.05f : 0.f, nz = iz == 0 ? -0.05f : iz == t.dim - 1 ? 0.05f : 0.f;
+                for (int k = 0; k < 2; k++) {
+                    float px = x + (k == 0 ? nx : 0.f), pz = z + (k == 1 ? nz : 0.f);
+                    if ((k == 0 && nx == 0.f) || (k == 1 && nz == 0.f) || px < 0 || pz < 0 || px >= 4096 || pz >= 4096) continue;
+                    const TerrainTile& n = terrain_.tiles[size_t(int(px) / 32) * 128 + size_t(int(pz) / 32)];
+                    if (n.dim < t.dim) v.pos[1] = terrain_.sample(px, pz);
+                }
+            }
             float e = 4.f;
             float hx = terrain_.sample(x + e, z) - terrain_.sample(x - e, z);
             float hz = terrain_.sample(x, z + e) - terrain_.sample(x, z - e);
@@ -670,6 +699,13 @@ float Scene::terrainRay(const Vec3& a, const Vec3& b) const {
         if (p.y < groundHeight(p.x, p.z)) return t;
     }
     return 2.f;
+}
+
+
+int Scene::animCycle(int object, int animSet) const {
+    for (auto& i : instances_)
+        if (i.object == object && i.sets && animSet >= 0 && size_t(animSet) < i.sets->size()) return cycleEnd((*i.sets)[size_t(animSet)]);
+    return 0;
 }
 
 int Scene::animLength(int object, int animSet) const {

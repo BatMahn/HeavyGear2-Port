@@ -33,7 +33,8 @@ public:
     // body, "BDB"); set < 0 removes it.
     void setObjectOverlay(int object, int animSet, float frame, const std::string& rootFrame);
     int animLength(int object, int animSet) const;
-    float animStride(int object, int animSet) const;  // the top frame's horizontal travel over the set (root motion)
+    float animStride(int object, int animSet) const;
+    int animCycle(int object, int animSet) const;  // a looping set's length without its trailing padding keys  // the top frame's horizontal travel over the set (root motion)
     // Pushes a vertical cylinder (feet at pos.y, given radius/height) out of static object boxes.
     // Returns true if it hit something.
     bool collide(Vec3& pos, float radius, float height, int ignoreObject) const;
