@@ -20,11 +20,15 @@ if(NOT TARGET SDL3::SDL3)
   set(SDL_SHARED OFF CACHE BOOL "" FORCE)
   set(SDL_STATIC ON CACHE BOOL "" FORCE)
   set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+  set(SDL_INSTALL OFF CACHE BOOL "" FORCE)  # static, linked in: nothing of SDL goes in the package
   FetchContent_MakeAvailable(SDL3)
 endif()
 if(NOT ZLIB_FOUND)
   FetchContent_Declare(zlib URL https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz)
   set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  # zlib's install rules use absolute paths (/usr/local/lib) that ignore `cmake --install --prefix`; it is linked
+  # statically, so skip them
+  set(SKIP_INSTALL_ALL ON CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(zlib)
   add_library(ZLIB::ZLIB ALIAS zlibstatic)
   target_include_directories(zlibstatic INTERFACE ${zlib_SOURCE_DIR} ${zlib_BINARY_DIR})
