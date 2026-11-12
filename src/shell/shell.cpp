@@ -1798,6 +1798,7 @@ void Shell::gear() {
 void Shell::launch() {
     MissionSetup setup;
     setup.mission = msn_.id;
+    setup.title = msn_.title.empty() || msn_.title == "TEMP TITLE" ? missionName(msn_) : msn_.title;
     if (mode_ == Mode::Instant) {
         setup.mission = data_.iaMaps.empty() ? "D01" : data_.iaMaps[size_t(std::clamp(iaMap_, 0, int(data_.iaMaps.size()) - 1))];
         setup.player.chassis = iaSquad_[0].chassis;

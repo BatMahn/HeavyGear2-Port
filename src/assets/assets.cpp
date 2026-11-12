@@ -395,7 +395,10 @@ float Terrain::sample(float x, float z) const {
     int ix = std::min(t.dim - 2, int(lx)), iz = std::min(t.dim - 2, int(lz));
     float fx = lx - ix, fz = lz - iz;
     auto H = [&](int a, int b) { return t.h[size_t(a) * t.dim + b] * 0.01f; };
-    return (H(ix, iz) * (1 - fx) + H(ix + 1, iz) * fx) * (1 - fz) + (H(ix, iz + 1) * (1 - fx) + H(ix + 1, iz + 1) * fx) * fz;
+    // the drawn mesh splits each cell along (ix, iz)-(ix+1, iz+1) (Scene::buildTerrain): follow its triangles, so what
+    // stands on the ground meets the surface that's drawn
+    float a = H(ix, iz), b = H(ix + 1, iz), c = H(ix + 1, iz + 1), d = H(ix, iz + 1);
+    return fx >= fz ? a + (b - a) * fx + (c - b) * fz : a + (d - a) * fz + (c - d) * fx;
 }
 
 int Terrain::surfaceAt(float x, float z) const {

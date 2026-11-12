@@ -200,7 +200,11 @@ void Scene::walkPose(const Instance& i, const std::function<void(int, const Fram
     float t = i.frame >= 0 ? i.frame : time_ * 30.f;
     if (i.frame < 0 && set && set->length > 0) t = std::fmod(t, float(set->length));
     const AnimSet* over = i.overlaySet >= 0 && i.sets && size_t(i.overlaySet) < i.sets->size() ? &(*i.sets)[size_t(i.overlaySet)] : nullptr;
-    std::function<void(int, const Mat4&, bool, bool)> walk = [&](int fi, const Mat4& parent, bool hiddenBranch, bool inOverlay) {
+    // Locomotion sets carry root motion: the top frame walks forward through the cycle (7.5 m over a Jaguar's walk) and
+    // jumps back when it loops. The body's own movement already carries the gear, so the top frames' horizontal
+    // travel is taken out (its height - the step's bob - stays); Player sets the playback rate from that stride.
+    std::function<void(int, const Mat4&, bool, bool, int)> walk = [&](int fi, const Mat4& parent, bool hiddenBranch, bool inOverlay, int depth) {
+        bool top = depth <= 1;  // the model's root and its children (the body, frm-bda, carries the travel)
         while (fi >= 0 && fi < int(m.frames.size())) {
             const Frame& f = m.frames[size_t(fi)];
             const AnimTrack* tr = nullptr;
@@ -223,16 +227,20 @@ void Scene::walkPose(const Instance& i, const std::function<void(int, const Fram
                     }
             }
             Mat4 local = animLocal(tr, frameMatrix(f), ft);
+            if (top && tr && !tr->pos.empty()) {
+                Mat4 l0 = animLocal(tr, frameMatrix(f), 0.f);
+                local.m[3][0] = l0.m[3][0], local.m[3][2] = l0.m[3][2];
+            }
             if (i.twist != 0 && frameIs(f.name, "tst")) local = Mat4::rotY(i.twist) * local;
             Mat4 w = local * parent;
             bool hid = hiddenBranch;
             for (auto& h : i.hiddenFrames) hid = hid || frameIs(f.name, h);
             fn(fi, f, w, hid);
-            if (f.child >= 0) walk(f.child, w, hid, ov);
+            if (f.child >= 0) walk(f.child, w, hid, ov, depth + 1);
             fi = f.sibling;
         }
     };
-    walk(0, i.world, false, false);
+    walk(0, i.world, false, false, 0);
 }
 
 bool Scene::objectPosition(int object, Vec3& out) const {
@@ -250,6 +258,53 @@ bool Scene::frameWorld(int object, const std::string& frame, Vec3& out) const {
         bool found = false;
         walkPose(i, [&](int, const Frame& f, const Mat4& w, bool) {
             if (!found && frameIs(f.name, frame)) out = Vec3(w.m[3][0], w.m[3][1], w.m[3][2]), found = true;
+        });
+        return found;
+    }
+    return false;
+}
+
+float Scene::animStride(int object, int animSet) const {
+    for (auto& i : instances_) {
+        if (i.object != object || !i.rig || !i.sets || animSet < 0 || size_t(animSet) >= i.sets->size()) continue;
+        const AnimSet& set = (*i.sets)[size_t(animSet)];
+        const Model& m = i.rig->model;
+        float best = 0;
+        std::vector<int> topFrames;  // the root level and its children
+        for (int fi = 0; fi >= 0 && fi < int(m.frames.size()); fi = m.frames[size_t(fi)].sibling) {
+            topFrames.push_back(fi);
+            for (int c = m.frames[size_t(fi)].child; c >= 0 && c < int(m.frames.size()); c = m.frames[size_t(c)].sibling) topFrames.push_back(c);
+        }
+        for (int fi : topFrames)
+            for (auto& trk : set.tracks)
+                if (lower(m.frames[size_t(fi)].name) == trk.frame && !trk.pos.empty()) {
+                    Mat4 a = animLocal(&trk, frameMatrix(m.frames[size_t(fi)]), 0.f);
+                    Mat4 b = animLocal(&trk, frameMatrix(m.frames[size_t(fi)]), float(set.length));
+                    best = std::max(best, std::hypot(b.m[3][0] - a.m[3][0], b.m[3][2] - a.m[3][2]));
+                }
+        if (getenv("HG2_STRIDEDBG"))
+            for (size_t fi = 0; fi < m.frames.size(); fi++)
+                for (auto& trk : set.tracks)
+                    if (lower(m.frames[fi].name) == trk.frame && !trk.pos.empty()) {
+                        Mat4 a = animLocal(&trk, frameMatrix(m.frames[fi]), 0.f), b = animLocal(&trk, frameMatrix(m.frames[fi]), float(set.length));
+                        SDL_Log("stride set %d frame %zu %s top %d d=(%.2f %.2f %.2f) len %d", animSet, fi, m.frames[fi].name.c_str(), 0,
+                                b.m[3][0] - a.m[3][0], b.m[3][1] - a.m[3][1], b.m[3][2] - a.m[3][2], set.length);
+                    }
+        return best;
+    }
+    return 0;
+}
+
+bool Scene::frameBottom(int object, const std::string& frame, Vec3& out) const {
+    for (auto& i : instances_) {
+        if (i.object != object || !i.rig) continue;
+        bool found = false;
+        walkPose(i, [&](int fi, const Frame& f, const Mat4& w, bool) {
+            if (found || !frameIs(f.name, frame)) return;
+            const GpuMesh* g = i.rig->parts[size_t(fi)];
+            out = g ? w.transformPoint(Vec3((g->bmin.x + g->bmax.x) * 0.5f, g->bmin.y, (g->bmin.z + g->bmax.z) * 0.5f))
+                    : Vec3(w.m[3][0], w.m[3][1], w.m[3][2]);
+            found = true;
         });
         return found;
     }

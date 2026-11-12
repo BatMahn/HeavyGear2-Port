@@ -33,6 +33,7 @@ public:
     // body, "BDB"); set < 0 removes it.
     void setObjectOverlay(int object, int animSet, float frame, const std::string& rootFrame);
     int animLength(int object, int animSet) const;
+    float animStride(int object, int animSet) const;  // the top frame's horizontal travel over the set (root motion)
     // Pushes a vertical cylinder (feet at pos.y, given radius/height) out of static object boxes.
     // Returns true if it hit something.
     bool collide(Vec3& pos, float radius, float height, int ignoreObject) const;
@@ -44,6 +45,7 @@ public:
     // Rigged units: world position of a frame (e.g. "frm-hp1", "frm-POV"), the nearest of several frames to a
     // point, whether a frame hangs under another, and hiding a frame with everything attached to it.
     bool frameWorld(int object, const std::string& frame, Vec3& out) const;
+    bool frameBottom(int object, const std::string& frame, Vec3& out) const;  // bottom centre of a part's mesh, posed
     bool objectPosition(int object, Vec3& out) const;  // current placement of any instance
     std::string nearestFrame(int object, const Vec3& p, const std::vector<std::string>& frames) const;
     bool frameUnder(int object, const std::string& frame, const std::string& ancestor) const;

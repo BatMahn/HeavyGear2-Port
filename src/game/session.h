@@ -26,6 +26,7 @@ struct SquadMate {
 
 struct MissionSetup {
     std::string mission;           // "S01"
+    std::string title;             // shown at the start (the shell's mission title); empty: the mission file's
     GearChoice player;
     std::vector<SquadMate> squad;  // AI squad mates following the user
     // instant action: waves of `enemies` hunting the user; success when every wave is destroyed

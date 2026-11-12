@@ -3,7 +3,7 @@
 # SDL3 and zlib are taken from the system when found, otherwise downloaded and built
 # (HG2_FETCH_DEPS=ON forces the download, which is what the release workflow does).
 cmake_minimum_required(VERSION 3.21)
-project(hg2port VERSION 0.24.0 LANGUAGES C CXX)
+project(hg2port VERSION 0.24.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

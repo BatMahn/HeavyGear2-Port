@@ -290,6 +290,7 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
     }
     Combat combat;
     if (player.active()) combat.init(fs, scene, player.def(), player.object());
+    if (player.active() && getenv("HG2_FOOTDBG")) SDL_Log("player object %d", player.object());
     if (player.active() && !setup.player.weapons.empty()) combat.setLoadout(player.object(), setup.player.weapons);
     if (player.active() && setup.player.armor > 0) combat.setStats(player.object(), setup.player.armor, setup.player.fireControl);
     if (player.active() && setup.player.hasSystems)
@@ -763,8 +764,10 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
         if (float fa = scripts.fadeAlpha(); fa > 0.f)  // BeginFade
             hud.rect(0, 0, float(W), float(H), uint32_t(std::min(255.f, fa * 255.f)));
         if (missionClock < 8.f) {
-            std::string t = scene.mission().title;
-            hud.text(W * 0.5f - hud.textWidth(t, 1.5f * s) * 0.5f, 40 * s, t, amber, 1.5f * s);
+            std::string t = !setup.title.empty() ? setup.title : scene.mission().title;
+            std::string tl = lower(t);
+            if (tl == "none" || tl == "temp title") t.clear();  // placeholder titles in some mission files
+            if (!t.empty()) hud.text(W * 0.5f - hud.textWidth(t, 1.5f * s) * 0.5f, 40 * s, t, amber, 1.5f * s);
         }
         if (paused) {
             hud.rect(0, 0, float(W), float(H), 0x00000098u);

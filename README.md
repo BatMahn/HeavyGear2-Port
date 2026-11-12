@@ -8,7 +8,7 @@ A native port of **Heavy Gear II** (Activision, 1999) for modern macOS, Linux an
 No game data is included. You need your own copy of Heavy Gear II (see "Setting up the game folder": no
 installation needed).
 
-## Status (v0.24.0) — the whole single-player game
+## Status (v0.24.1) — the whole single-player game
 
 The game now starts in the original shell, drawn from the game's own layouts and artwork:
 
@@ -83,6 +83,10 @@ The game now starts in the original shell, drawn from the game's own layouts and
 - **AI, 0.22**: route planning now follows the original pathfinder: a 4 m grid, squared step costs with height and
   water penalties, a 2048-node budget with partial paths to the nearest reachable point, 2 m straight-line checks.
   The build workflow has a "Run workflow" button.
+- **0.24.1**: the walk / run cycles' root motion (the body travels ~7 m through each cycle and snapped back) is now
+  taken out of the pose, and the cycles play at the speed their stride gives, so feet plant instead of sliding; gears
+  stand on the highest ground under their feet (and the ground follows the drawn terrain triangles), so they no
+  longer sink into hillsides; the start-of-mission title uses the briefing's title (no more "none").
 - **0.24**: rain drawn as thin motion-blurred streaks (denser, fainter, fading at the tail); video options in
   Options → Graphics: anti-aliasing (off / 2x / 4x / 8x MSAA), a movie filter (CRT scanlines and tube edges, or
   interlaced fields) and the movie screen (the original 4:3 frame, or filling the window); the game folder is picked

@@ -75,6 +75,7 @@ private:
     GearDef def_;
     EcyScript ecy_;
     Vec3 pos_;
+    float footprint_ = 1.4f;  // half the distance between the feet (ground probes)
     float yaw_ = 0, speed_ = 0, strafe_ = 0, vy_ = 0, frame_ = 0;
     bool air_ = false, sms_ = false, lockForward_ = false;
     int wantPosture_ = -1;

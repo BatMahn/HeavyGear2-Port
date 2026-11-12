@@ -225,7 +225,16 @@ void Player::update(float dt, const PlayerInput& in) {
         if (length(moved) > 0.01f && dot(normalize(moved), fwd) < -0.5f) speed_ *= 0.5f;
     }
     // vertical: terrain or object tops (platforms, blocks), gravity while airborne
+    // stand on the highest ground under the footprint (the feet), not just the centre: on a slope the uphill foot
+    // would otherwise sink into the hill
     float ground = scene_->supportHeight(pos_, air_ ? 0.3f : 1.2f, object_);
+    {
+        const float fr = footprint_;
+        for (const Vec3& o : {fwd * fr, fwd * -fr, right * fr, right * -fr}) {
+            float h = scene_->groundHeight(pos_.x + o.x, pos_.z + o.z);
+            ground = std::max(ground, std::min(h, pos_.y + 2.5f));  // not up a cliff face
+        }
+    }
     if (air_) {
         vy_ -= kGravity * gravityScale * dt;
         pos_.y += vy_ * dt;
@@ -257,7 +266,10 @@ void Player::update(float dt, const PlayerInput& in) {
     } else if (cycle) {
         float ref = (ecy ? state_ == sRun_ : set_ == 2) ? run : state_ == sKneelWalk_ ? walk * 0.35f : state_ == sCrawl_ ? walk * 0.2f : walk;
         float v = std::max(std::fabs(speed_), std::fabs(strafe_));
-        rate *= std::max(0.3f, v / std::max(0.5f, ref));
+        // the cycle's own pace: its root travel (stride) over its length; play it so the feet keep up with the ground
+        float stride = scene_->animStride(object_, set_);
+        if (stride > 0.5f) ref = stride / (float(len) / 30.f);
+        rate *= std::clamp(v / std::max(0.5f, ref), 0.3f, 3.f);
         if (speed_ < -0.1f) rate = -rate;
     }
     prevPhase = frame_ / float(len);
@@ -273,6 +285,13 @@ void Player::update(float dt, const PlayerInput& in) {
     if (loop_) frame_ = std::fmod(frame_ + rate * dt + float(len), float(len));
     else frame_ = std::min(frame_ + rate * dt, float(len - 1));
     scene_->setObjectPose(object_, pos_, yaw_, shown, frame_);
+    if (getenv("HG2_FOOTDBG") && object_ == atoi(getenv("HG2_FOOTDBG"))) {
+        Vec3 l, r;
+        const char* fl = getenv("HG2_FOOTL") ? getenv("HG2_FOOTL") : "frm-lld"; const char* frr = getenv("HG2_FOOTR") ? getenv("HG2_FOOTR") : "frm-rld";
+        if (scene_->frameBottom(object_, fl, l) && scene_->frameBottom(object_, frr, r))
+            SDL_Log("foot %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f speed %.2f set %d frame %.1f", pos_.x, pos_.y, pos_.z, l.x, l.y, l.z,
+                    r.x, r.y, r.z, speed_, shown, frame_);
+    }
     if (reactSet_ >= 0) {
         reactFrame_ += 30.f * dt;
         if (reactFrame_ >= float(scene_->animLength(object_, reactSet_))) {
