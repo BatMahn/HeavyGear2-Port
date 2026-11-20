@@ -8,6 +8,8 @@ A native port of **Heavy Gear II** (Activision, 1999) for modern macOS, Linux an
 No game data is included. You need your own copy of Heavy Gear II (see "Setting up the game folder": no
 installation needed).
 
+See [CHANGELOG.md](CHANGELOG.md) for what each release changed.
+
 ## Status (v0.27.0) — the whole single-player game
 
 The game now starts in the original shell, drawn from the game's own layouts and artwork:
