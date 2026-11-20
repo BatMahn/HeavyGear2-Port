@@ -55,7 +55,11 @@ struct Fountain {
 };
 
 // Surfaces (0xd2): terrain surface types — colour key, friction, damage per second (lava), footstep sound.
-struct Surface { int index = 0; uint8_t color[3] = {0, 0, 0}; float friction = 1; int damage = 0; std::string footstep; };
+struct Surface {
+    int index = 0; uint8_t color[3] = {0, 0, 0}; float friction = 1; int damage = 0; std::string footstep;
+    uint32_t dustColor = 0;  // 0x156 DustColor as 0x00RRGGBB (tints SPARK0 / SPARK1 / SPARKU)
+    int dustIndex = 0;       // 0x165 DustIndex: bullet ground hits use SPARK0 (0), SPARK1 (1), else SPARKO
+};
 
 struct Mission {
     Bytes raw;

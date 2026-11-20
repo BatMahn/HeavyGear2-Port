@@ -26,6 +26,9 @@ struct ParticleType {          // .ptl, 0x1ab4 bytes
     // (+0x2a4 frames > 1, smokmuzc.tga) step through 0.25 x 0.1875 cells in reading order over their life.
     float u0 = 0, v0 = 0, cellW = 1, cellH = 1;
     int frames = 1;
+    // +0x2a8 draw mode: modes 1 and 9 take their RGB from the emitting stream's colour (FUN_101260c0's last argument,
+    // 0xffffffff = white) and only their alpha from the curve (FUN_10128fd0 callers)
+    int mode = 0;
 };
 struct Emitter {               // .emt, 0x928 bytes
     std::string name;
@@ -47,7 +50,15 @@ public:
     void init(const FileSystem& fs, Renderer& r, const std::string& detail = "hi");
     // Start an effect by name (.ped, or an .emt/.ptl pair, or a lone .ptl). `up` orients the emission cone.
     // `density` scales the particle counts (weapon hits use a fraction so sustained fire stays readable).
-    bool spawn(const std::string& name, const Vec3& pos, float scale = 1.f, const Vec3& up = Vec3(0, 1, 0), float density = 1.f);
+    // `tint` (0x00RRGGBB, 0xffffffff none) colours particle types of draw mode 1 / 9.
+    bool spawn(const std::string& name, const Vec3& pos, float scale = 1.f, const Vec3& up = Vec3(0, 1, 0), float density = 1.f,
+               uint32_t tint = 0xffffffffu);
+    // An effect attached to a moving object (projectile trails, FUN_101260c0 with a parent): its emitters keep
+    // running, looping their emission time, at the position last given by move(), until detach(). Returns 0 if the
+    // effect is missing.
+    int attach(const std::string& name, const Vec3& pos, float scale = 1.f, uint32_t tint = 0xffffffffu);
+    void move(int handle, const Vec3& pos, const Vec3& dir);
+    void detach(int handle);
     void update(float dt);
     // Builds the billboards for this camera and hands them to the renderer (before beginFrame).
     void submit(const Mat4& view);
@@ -68,12 +79,13 @@ private:
     const Emitter* emitter(const std::string& name);
     bool read(const std::string& file, Bytes& out) const;
 
-    struct Particle { Vec3 pos, vel; float age, life, scale, spin; const ParticleType* type; int stream = 0; };
+    struct Particle { Vec3 pos, vel; float age, life, scale, spin; const ParticleType* type; int stream = 0; uint32_t tint = 0xffffffffu; };
     // One emitter running: it emits at its rate curve for its emission time, keeping at most `total` of its
     // particles alive.
-    struct Stream { Effect::Part part; Vec3 pos, up; float scale, t, acc; int total, id, alive; };
-    void emit(const Effect::Part& p, const Vec3& pos, const Vec3& up, float scale, int n, float speedMul = 1.f, int stream = 0);
-    int nextStream_ = 1;
+    struct Stream { Effect::Part part; Vec3 pos, up; float scale, t, acc; int total, id, alive; uint32_t tint = 0xffffffffu; int handle = 0; };
+    void emit(const Effect::Part& p, const Vec3& pos, const Vec3& up, float scale, int n, float speedMul = 1.f, int stream = 0,
+              uint32_t tint = 0xffffffffu);
+    int nextStream_ = 1, nextHandle_ = 1;
 
     const FileSystem* fs_ = nullptr;
     Renderer* r_ = nullptr;

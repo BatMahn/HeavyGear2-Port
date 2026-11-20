@@ -11,6 +11,19 @@
 namespace hg2 {
 
 namespace {
+// Geometry name as a file: '@' prefixes (shared geometry) dropped; names whose base is longer than the 8.3 file names
+// ("pAbpg20005.m", "pAmrd30005.m" in S25 / S27 / S37 / H07 / H09) fall back to the last 8 characters of the base
+// (BPG20005.M, MRD30005.M), which is the file the game ships.
+std::string modelKey(const FileSystem& fs, const std::string& name) {
+    std::string key = upper(name);
+    while (!key.empty() && key[0] == '@') key.erase(0, 1);
+    size_t dot = key.rfind('.');
+    if (dot != std::string::npos && dot > 8 && !fs.exists(key)) {
+        std::string alt = key.substr(dot - 8);
+        if (fs.exists(alt)) return alt;
+    }
+    return key;
+}
 constexpr float kDeg = 3.14159265358979f / 180.f;
 
 Mat4 frameMatrix(const Frame& f) {
@@ -103,8 +116,7 @@ void Scene::appendModel(const Model& m, std::vector<Vertex>& out, std::vector<Dr
 }
 
 GpuMesh* Scene::model(const std::string& name) {
-    std::string key = upper(name);
-    while (!key.empty() && key[0] == '@') key.erase(0, 1);  // '@' marks a shared/instanced geometry reference
+    std::string key = modelKey(fs_, name);  // '@' marks a shared/instanced geometry reference
     auto it = models_.find(key);
     if (it != models_.end()) return it->second;
     GpuMesh* mesh = nullptr;
@@ -131,8 +143,7 @@ GpuMesh* Scene::model(const std::string& name) {
 }
 
 Scene::Rigged* Scene::rigged(const std::string& name) {
-    std::string key = upper(name);
-    while (!key.empty() && key[0] == '@') key.erase(0, 1);
+    std::string key = modelKey(fs_, name);
     auto it = rigged_.find(key);
     if (it != rigged_.end()) return it->second.get();
     auto rg = std::make_unique<Rigged>();
@@ -320,8 +331,15 @@ bool Scene::frameBottom(int object, const std::string& frame, Vec3& out) const {
         walkPose(i, [&](int fi, const Frame& f, const Mat4& w, bool) {
             if (found || !frameIs(f.name, frame)) return;
             const GpuMesh* g = i.rig->parts[size_t(fi)];
-            out = g ? w.transformPoint(Vec3((g->bmin.x + g->bmax.x) * 0.5f, g->bmin.y, (g->bmin.z + g->bmax.z) * 0.5f))
-                    : Vec3(w.m[3][0], w.m[3][1], w.m[3][2]);
+            if (!g) {
+                out = Vec3(w.m[3][0], w.m[3][1], w.m[3][2]);
+            } else {
+                // the sole: whichever of the box's two Y faces is lower as posed (the gears' foot parts have local +Y
+                // pointing down, so bmin.y is the top of the foot)
+                float cx = (g->bmin.x + g->bmax.x) * 0.5f, cz = (g->bmin.z + g->bmax.z) * 0.5f;
+                Vec3 a = w.transformPoint(Vec3(cx, g->bmin.y, cz)), b = w.transformPoint(Vec3(cx, g->bmax.y, cz));
+                out = a.y <= b.y ? a : b;
+            }
             found = true;
         });
         return found;
@@ -473,8 +491,7 @@ void Scene::addInstance(size_t index) {
         // releases the object itself (lampicon.m is the editor's icon).
         if ((o.type >= 0x56 && o.type <= 0x59) || o.isLight) inst.noDraw = true;
         if (inst.mesh) {
-            std::string key = upper(mdl);
-            while (!key.empty() && key[0] == '@') key.erase(0, 1);
+            std::string key = modelKey(fs_, mdl);
             auto bi = boxes_.find(key);
             // No collision volume: Object_NoColl (0x162) and Plane_NoColl (0x61) - classes whose constructors clear the
             // object's collision flag bits (object factories FUN_10085570 / FUN_100883d0) -, the spawn point markers (0x56-0x59)

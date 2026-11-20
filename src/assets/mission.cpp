@@ -222,7 +222,8 @@ done:
 }
 
 // Surfaces block: crc, size, '{', 0xd3 count, then entries 0xd6 {0xd4 index, 0xd5 r g b, 0xd7 f32 friction,
-// 0xd8 u32 damage, 0x154 u32, 0x153 u32, 0x155 STR footstep, 0x156 r g b} each closed by '}'.
+// 0xd8 u32 damage, 0x154 f32 MovementCost, 0x153 u32 Flags, 0x155 STR footstep, 0x156 r g b DustColor, 0x165 u32
+// DustIndex} each closed by '}' (FUN_10079960).
 bool parseSurfaces(Reader b, Mission& m) {
     b.u32();  // '{'
     for (uint32_t t = b.u32(); t != 1 && b.ok(); t = b.u32()) {
@@ -238,7 +239,12 @@ bool parseSurfaces(Reader b, Mission& m) {
                     case 0xd8: s.damage = b.i32(); break;
                     case 0x153: case 0x154: b.u32(); break;
                     case 0x155: s.footstep = b.str(); break;
-                    case 0x156: b.u32(), b.u32(), b.u32(); break;
+                    case 0x156: {
+                        uint32_t r = b.u32() & 255, g = b.u32() & 255, bl = b.u32() & 255;
+                        s.dustColor = r << 16 | g << 8 | bl;
+                        break;
+                    }
+                    case 0x165: s.dustIndex = int(b.u32() & 255); break;
                     default: return false;
                 }
             }

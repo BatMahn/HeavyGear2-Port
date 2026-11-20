@@ -8,7 +8,7 @@ A native port of **Heavy Gear II** (Activision, 1999) for modern macOS, Linux an
 No game data is included. You need your own copy of Heavy Gear II (see "Setting up the game folder": no
 installation needed).
 
-## Status (v0.26.0) — the whole single-player game
+## Status (v0.27.0) — the whole single-player game
 
 The game now starts in the original shell, drawn from the game's own layouts and artwork:
 
@@ -83,6 +83,11 @@ The game now starts in the original shell, drawn from the game's own layouts and
 - **AI, 0.22**: route planning now follows the original pathfinder: a 4 m grid, squared step costs with height and
   water penalties, a 2048-node budget with partial paths to the nearest reachable point, 2 m straight-line checks.
   The build workflow has a "Run workflow" button.
+- **0.27**: weapon trails, explosions, sparks and muzzle flashes from the original's effect tables (by ammo class and
+  surface); lava and other surfaces parsed fully again (D01's lava burns); the user's gear walks its scripted path in
+  intros (S1J); dropships, VTOLs, maglev trains and elevators follow their routes; a sweep of all 84 missions with
+  missing names fixed; the CRT movie filter has screen curvature, beam-width scanlines, glow, an aperture grille and a
+  bezel, and the interlaced filter shows fields at twice the movie rate.
 - **0.26**: scripted cameras send the right end signal, so cut-scene mode (letterbox, hidden reticle) ends as in the
   original (S1J); the AI stands down for the whole cut-scene mode; turret weapon arcs with the original's sign and gun
   pitch limits; gear locomotion from the original (moved by the cycle's root motion at speed / stride, walk / run by

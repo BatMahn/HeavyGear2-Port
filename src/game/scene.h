@@ -55,7 +55,7 @@ public:
     // Rigged units: world position of a frame (e.g. "frm-hp1", "frm-POV"), the nearest of several frames to a
     // point, whether a frame hangs under another, and hiding a frame with everything attached to it.
     bool frameWorld(int object, const std::string& frame, Vec3& out) const;
-    bool frameBottom(int object, const std::string& frame, Vec3& out) const;  // bottom centre of a part's mesh, posed
+    bool frameBottom(int object, const std::string& frame, Vec3& out) const;  // bottom centre (the lower Y face) of a part's mesh, posed
     bool objectPosition(int object, Vec3& out) const;  // current placement of any instance
     std::string nearestFrame(int object, const Vec3& p, const std::vector<std::string>& frames) const;
     bool frameUnder(int object, const std::string& frame, const std::string& ancestor) const;

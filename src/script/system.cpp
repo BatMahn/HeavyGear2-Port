@@ -455,11 +455,25 @@ void ScriptSystem::bindBuiltins() {
         float p[3] = {argF(t, 16), argF(t, 12), argF(t, 8)};
         g_sys->world().unitGoto(vm.owner(), p);
     });
-    for (int ov : {1, 2, 3, 4, 5})  // path-name forms; the name is the first string argument found
-        V::bind("FollowPath", ov, [](V& vm, const uint8_t* t, ScriptValue&) {
-            for (int off : {4, 8, 12})
-                if (g_sys->world().unitFollowPath(vm.owner(), vm.strings().get(argI(t, off)))) return;
-        });
+    // FollowPath overloads (FUN_100d5340..FUN_100d5730): ov1 / ov2 a unit (reference / name at -0x14) to a point
+    // (-0x10..-8), ov3 the owner along a path (-8), ov4 / ov5 a unit (reference / name at -0xc) along a path (-8)
+    V::bind("FollowPath", 1, [](V& vm, const uint8_t* t, ScriptValue&) {
+        float p[3] = {argF(t, 16), argF(t, 12), argF(t, 8)};
+        g_sys->world().unitGoto(unitRef(vm, argI(t, 20)), p);
+    });
+    V::bind("FollowPath", 2, [](V& vm, const uint8_t* t, ScriptValue&) {
+        float p[3] = {argF(t, 16), argF(t, 12), argF(t, 8)};
+        g_sys->world().unitGoto(unitName(vm, t, 20), p);
+    });
+    V::bind("FollowPath", 3, [](V& vm, const uint8_t* t, ScriptValue&) {
+        g_sys->world().unitFollowPath(vm.owner(), vm.strings().get(argI(t, 8)));
+    });
+    V::bind("FollowPath", 4, [](V& vm, const uint8_t* t, ScriptValue&) {
+        g_sys->world().unitFollowPath(unitRef(vm, argI(t, 12)), vm.strings().get(argI(t, 8)));
+    });
+    V::bind("FollowPath", 5, [](V& vm, const uint8_t* t, ScriptValue&) {
+        g_sys->world().unitFollowPath(unitName(vm, t, 12), vm.strings().get(argI(t, 8)));
+    });
     V::bind("AssignPath", 0, [](V& vm, const uint8_t* t, ScriptValue&) { g_sys->world().unitAssignPath(vm.owner(), vm.strings().get(argI(t, 4))); });
     V::bind("FullBrake", 0, [](V& vm, const uint8_t* t, ScriptValue&) { g_sys->world().unitStop(unitRef(vm, argI(t, 4))); });
     V::bind("FullBrake", 1, [](V& vm, const uint8_t* t, ScriptValue&) { g_sys->world().unitStop(unitName(vm, t, 4)); });

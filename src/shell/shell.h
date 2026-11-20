@@ -153,13 +153,19 @@ private:
     bool humOn_ = false;
     struct Playback {
         std::unique_ptr<Movie> m;
-        Image img, prev, woven;     // prev / woven: the interlaced filter's fields
+        Image img;
+        Image fields, woven;        // the interlaced filter: the two fields as last written, and as shown
+        Image crt;                  // the CRT filter: the frame drawn as scanlines (crtRows rows per source line)
         int tex = -1, shown = -1;
+        int field = -1, newest = 0; // interlaced: the last field written (at twice the frame rate) and its parity
+        int crtShown = -1, crtRows = 0, crtTex = -1;
         Uint64 t0 = 0;
-        bool fullscreen = false, interlaced = false;
+        bool fullscreen = false, interlaced = false, crtMode = false;
     };
-    int scanTex_ = -1, fieldTex_ = -1, vignetteTex_ = -1;  // movie filter overlays
-    void movieFilterTextures();
+    int movieTexture(int w, int h);
+    void bakeCrt(int rows, float pitch);
+    void crtMask(int w, int h);
+    int grilleTex_ = -1, maskTex_ = -1, maskW_ = 0, maskH_ = 0;  // CRT filter: aperture grille, tube mask
     Playback movie_;
     std::vector<std::string> movieQueue_;
     std::map<std::pair<int, int>, int> movieTex_;  // renderer texture per frame size

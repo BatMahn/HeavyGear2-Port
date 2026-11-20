@@ -46,7 +46,9 @@ public:
         particlesHook_ = p;
         for (auto& u : units_) u.body.particles = p;
     }
-    bool addUnit(int objectIndex);  // a mission object (or one spawned later) becomes a simulated unit
+    // a mission object (or one spawned later) becomes a simulated unit; teams below 100 (neutral props, the user's
+    // side in single player) only when `neutral` is set (a script gave it a movement order)
+    bool addUnit(int objectIndex, bool neutral = false);
     int aliveIn(const std::vector<int>& objects) const;
     int alive() const;
     void dump() const;  // debug: one line per unit

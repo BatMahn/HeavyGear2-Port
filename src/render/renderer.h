@@ -25,7 +25,8 @@ struct DrawBatch {
     uint32_t count = 0;
     bool blend = false;
     bool alphaTest = false;
-    bool additive = false;  // dynamic batches: additive blending (fire, sparks)
+    bool additive = false;  // dynamic batches / overlay: additive blending (fire, sparks)
+    bool multiply = false;  // overlay: multiplies what is under it (movie filters)
     bool clampUV = false;   // sample clamped to the texture's edges (terrain tiles: no bleed from the opposite edge)
 };
 
@@ -93,7 +94,7 @@ public:
 
 private:
     SDL_GPUShader* makeShader(bool vertex);
-    SDL_GPUGraphicsPipeline* makePipeline(bool blend, bool background = false, bool additive = false);
+    SDL_GPUGraphicsPipeline* makePipeline(bool blend, bool background = false, bool additive = false, bool multiply = false);
     void buildPipelines();
     void releasePipelines();
     void ensureDepth(int w, int h);
@@ -105,6 +106,8 @@ private:
     SDL_GPUGraphicsPipeline* background_ = nullptr;
     SDL_GPUGraphicsPipeline* overlayPipe_ = nullptr;
     SDL_GPUGraphicsPipeline* additive_ = nullptr;
+    SDL_GPUGraphicsPipeline* overlayAdd_ = nullptr;
+    SDL_GPUGraphicsPipeline* overlayMul_ = nullptr;
     SDL_GPUBuffer* dynamicVB_ = nullptr;
     SDL_GPUTransferBuffer* dynamicTB_ = nullptr;
     std::vector<Vertex> dynamic_;

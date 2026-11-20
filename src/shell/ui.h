@@ -78,6 +78,17 @@ public:
     }
     void textureQuad(int tex, float x, float y, float w, float h) { quad(tex, ox_ + x * s_, oy_ + y * s_, ox_ + (x + w) * s_, oy_ + (y + h) * s_, 0, 0, 1, 1, 0xffffffff); }
     Renderer* renderer() const { return r_; }
+    // Blending of what is drawn next (movie filters): alpha (the default), additive or multiplying.
+    enum class Blend { Alpha, Add, Multiply };
+    void setBlend(Blend b) { blend_ = b; }
+    // Window pixels of a point in UI units.
+    float pxX(float x) const { return ox_ + x * s_; }
+    float pxY(float y) const { return oy_ + y * s_; }
+    // A quad with arbitrary corners in window pixels: xy / uv are TL, TR, BR, BL (x, y pairs).
+    void quadPx(int tex, const float* xy, const float* uv, uint32_t rgba);
+    void quadPx(int tex, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, uint32_t rgba) {
+        quad(tex, x0, y0, x1, y1, u0, v0, u1, v1, rgba);
+    }
     void frame(float x, float y, float w, float h, uint32_t rgba);
     // Text in a box; returns the height used. firstLine skips wrapped lines (scrolling text boxes).
     float textBox(const std::string& s, const UiRect& r, const TextStyle& st, uint32_t color, int firstLine = 0, int* totalLines = nullptr);
@@ -130,6 +141,7 @@ private:
     std::vector<Vertex> verts_;
     std::vector<DrawBatch> batches_;
     float s_ = 1, ox_ = 0, oy_ = 0;
+    Blend blend_ = Blend::Alpha;
     int W_ = 640, H_ = 480;
     float mx_ = -1, my_ = -1, wheel_ = 0;
     bool down_ = false, pressed_ = false, released_ = false;

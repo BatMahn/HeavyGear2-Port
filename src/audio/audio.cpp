@@ -163,6 +163,9 @@ std::shared_ptr<Audio::Clip> Audio::clip(const std::string& name) {
             SDL_free(buf);
         }
     }
+    // redbkNNN.wav are CD-audio cues (Sounds.lst: "#CD audio track N"); no such files ship, the music comes from the
+    // ripped tracks (startMusic), so they are not reported
+    if (!c && upper(name).rfind("REDBK", 0) != 0) SDL_Log("sound not found: %s", name.c_str());
     cache_[key] = c;
     return c;
 }
@@ -181,7 +184,8 @@ void Audio::gains(float volume, const Vec3* at, float range, float& l, float& r)
 }
 
 bool Audio::play(const std::string& wav, float volume, const Vec3* at, float range) {
-    if (!stream_ || wav.empty()) return false;
+    if (wav.empty()) return false;
+    if (!stream_) return fs_ && clip(wav), false;  // no device: still resolve the name (reports missing files)
     auto c = clip(wav);
     if (!c) return false;
     if (const SoundInfo* si = info(wav)) {

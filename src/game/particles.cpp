@@ -54,6 +54,7 @@ const ParticleType* Particles::type(const std::string& name) {
         t->gravity = f32(b, 0x110);
         t->texture = cstr(b, 0x118, 256);
         t->frames = std::max(1, std::min(16, int(u32(b, 0x2a4))));
+        t->mode = int(u32(b, 0x2a8));
         t->u0 = std::max(0.f, std::min(0.75f, f32(b, 0x21c)));
         t->v0 = std::max(0.f, std::min(0.75f, f32(b, 0x220)));
         if (t->frames > 1) t->u0 = t->v0 = 0, t->cellW = 0.25f, t->cellH = 0.1875f;
@@ -138,13 +139,16 @@ const Effect* Particles::effect(const std::string& name) {
     } else if (const ParticleType* t = type(name)) {  // emitter + particle of the same name, or a lone particle
         fx->parts.push_back({emitter(name), t, 1.f, 0.f, 0.f, 0.f});
     }
-    if (fx->parts.empty()) fx.reset();
+    if (fx->parts.empty()) {
+        fx.reset();
+        SDL_Log("effect not found: %s", name.c_str());
+    }
     auto* raw = fx.get();
     effects_[k] = std::move(fx);
     return raw;
 }
 
-void Particles::emit(const Effect::Part& p, const Vec3& pos, const Vec3& up, float scale, int n, float speedMul, int stream) {
+void Particles::emit(const Effect::Part& p, const Vec3& pos, const Vec3& up, float scale, int n, float speedMul, int stream, uint32_t tint) {
     std::uniform_real_distribution<float> U(0.f, 1.f);
     // basis around `up`
     Vec3 a = std::fabs(up.y) < 0.9f ? Vec3(0, 1, 0) : Vec3(1, 0, 0);
@@ -165,11 +169,12 @@ void Particles::emit(const Effect::Part& p, const Vec3& pos, const Vec3& up, flo
         q.spin = U(rng_) * 6.2831853f;
         q.type = p.type;
         q.stream = stream;
+        q.tint = tint;
         parts_.push_back(q);
     }
 }
 
-bool Particles::spawn(const std::string& name, const Vec3& pos, float scale, const Vec3& up, float density) {
+bool Particles::spawn(const std::string& name, const Vec3& pos, float scale, const Vec3& up, float density, uint32_t tint) {
     const Effect* fx = effect(name);
     if (!fx) return false;
     for (auto& p : fx->parts) {
@@ -177,13 +182,39 @@ bool Particles::spawn(const std::string& name, const Vec3& pos, float scale, con
         if (!p.emitter || !p.emitter->hasCurves) {  // no emitter curves: a burst, or spread over the emission time
             float dur = p.emitter ? p.emitter->duration : 0.f;
             if (dur <= 1.f && p.delay <= 0) {
-                emit(p, pos, up, scale, std::min(total, 40));
+                emit(p, pos, up, scale, std::min(total, 40), 1.f, 0, tint);
                 continue;
             }
         }
-        streams_.push_back({p, pos, up, scale, -p.delay, 0.f, total, nextStream_++, 0});
+        Stream s{p, pos, up, scale, -p.delay, 0.f, total, nextStream_++, 0};
+        s.tint = tint;
+        streams_.push_back(s);
     }
     return true;
+}
+
+int Particles::attach(const std::string& name, const Vec3& pos, float scale, uint32_t tint) {
+    const Effect* fx = effect(name);
+    if (!fx) return 0;
+    int h = nextHandle_++;
+    for (auto& p : fx->parts) {
+        int total = p.emitter ? std::max(1, std::min(p.emitter->count, 80)) : 1;
+        Stream s{p, pos, Vec3(0, 1, 0), scale, -p.delay, 0.f, total, nextStream_++, 0};
+        s.tint = tint, s.handle = h;
+        streams_.push_back(s);
+    }
+    return h;
+}
+
+void Particles::move(int handle, const Vec3& pos, const Vec3& dir) {
+    if (!handle) return;
+    for (auto& s : streams_)
+        if (s.handle == handle) s.pos = pos, s.up = length(dir) > 1e-4f ? normalize(dir) * -1.f : Vec3(0, 1, 0);
+}
+
+void Particles::detach(int handle) {
+    if (!handle) return;
+    streams_.erase(std::remove_if(streams_.begin(), streams_.end(), [&](const Stream& s) { return s.handle == handle; }), streams_.end());
 }
 
 int Particles::dotTexture() {
@@ -248,21 +279,22 @@ void Particles::update(float dt) {
         if (s.t < 0) continue;
         const Emitter* e = s.part.emitter;
         float dur = std::max(0.05f, e ? e->duration : 1.f);
+        if (s.handle && s.t > dur) s.t = std::fmod(s.t, dur), s.acc = 0;  // attached: keeps emitting until detached
         if (s.t > dur) continue;
         if (e && e->hasCurves) {
             int k = std::min(255, int(s.t / dur * 255.f));
             s.acc += e->rate[k] * dt;
             int n = std::min(int(s.acc), s.total - s.alive);
-            if (n > 0) emit(s.part, s.pos, s.up, s.scale, n, std::max(0.f, e->speedCurve[k]), s.id), s.alive += n;
+            if (n > 0) emit(s.part, s.pos, s.up, s.scale, n, std::max(0.f, e->speedCurve[k]) * (s.handle && (e->flags & 2) ? 0.f : 1.f), s.id, s.tint), s.alive += n;
             s.acc -= std::floor(s.acc);  // what can't be emitted (at the cap) is dropped, not saved up
         } else {  // evenly over the emission time
             float want = float(s.total) * std::min(1.f, s.t / dur);
             int n = int(want - s.acc);
-            if (n > 0) emit(s.part, s.pos, s.up, s.scale, n, 1.f, s.id), s.acc += float(n);
+            if (n > 0) emit(s.part, s.pos, s.up, s.scale, n, s.handle && e && (e->flags & 2) ? 0.f : 1.f, s.id, s.tint), s.acc += float(n);
         }
     }
     streams_.erase(std::remove_if(streams_.begin(), streams_.end(),
-                                  [](const Stream& s) { return s.t > std::max(0.05f, s.part.emitter ? s.part.emitter->duration : 1.f); }),
+                                  [](const Stream& s) { return !s.handle && s.t > std::max(0.05f, s.part.emitter ? s.part.emitter->duration : 1.f); }),
                    streams_.end());
     float windSpeed = length(wind_);
     windPhase_ = std::fmod(windPhase_ + windSpeed * windSpeed * dt, 256.f);
@@ -291,6 +323,9 @@ void Particles::submit(const Mat4& view) {
         int i = std::min(255, int(p.age / p.life * 255.f));
         const float* c = p.type->rgba[i];
         float sz = std::min(6.f, p.type->size[i] * kSizeScale * p.scale * 0.5f);
+        // draw mode 3 (sparks, MT_SPACE): the size is on-screen, scaled by the view depth over the projection
+        // factor (FUN_10128ac0 case 3), so these stay a few pixels across at any distance
+        if (p.type->mode == 3) sz = std::min(6.f, length(p.pos - eye_) * p.type->size[i] * p.scale / 640.f);
         if (sz <= 0.001f || c[3] <= 0.004f) continue;
         // sprites right in front of the viewer fade out instead of filling the screen
         float dEye = length(p.pos - eye_), near = dEye / std::max(1.f, sz * 3.f);
@@ -321,6 +356,8 @@ void Particles::submit(const Mat4& view) {
         v.normal[1] = 1;
         v.color[0] = uint8_t(c[0] * 255), v.color[1] = uint8_t(c[1] * 255), v.color[2] = uint8_t(c[2] * 255),
         v.color[3] = uint8_t(c[3] * 255 * fade);
+        if ((p.type->mode == 1 || p.type->mode == 9) && p.tint != 0xffffffffu)  // stream colour replaces the RGB
+            v.color[0] = uint8_t(p.tint >> 16), v.color[1] = uint8_t(p.tint >> 8), v.color[2] = uint8_t(p.tint);
         auto mk = [&](const Vec3& q, float u, float w) {
             Vertex o = v;
             o.pos[0] = q.x, o.pos[1] = q.y, o.pos[2] = q.z, o.uv[0] = u, o.uv[1] = w;

@@ -155,8 +155,10 @@ Fixed-size records read whole (`fread`) by the loaders in hg2sim.dll; the detail
 
 ## Mission blocks decoded in 0.9
 - `0xd2` Surfaces (`crc, size, '{'`): `0xd3 count`, then `0xd6` entries `{0xd4 index, 0xd5 r g b, 0xd7 f32 friction,
-  0xd8 u32 damage, 0x154 u32, 0x153 u32, 0x155 STR footstep wav, 0x156 r g b (dust), '}'}`. D01's surface 1 (yellow)
-  does 50 damage (lava).
+  0xd8 u32 damage, 0x154 f32 MovementCost, 0x153 u32 Flags, 0x155 STR footstep wav, 0x156 r g b DustColor,
+  0x165 u32 DustIndex, '}'}` (binary reader `FUN_10079960`, 0x48-byte entries). D01's surface 1 (yellow) does 50 damage
+  (lava). `FUN_10078570` returns entry + 0x28, so a bullet's ground hit reads DustColor (+0x18, packed 0x00RRGGBB) and
+  DustIndex (+0x1c byte) from it. (Before 0.26.1 the port stopped at 0x165 and lost the surfaces after it.)
 - `0x12a` FountainSystem (`'{'`, no size): system scalars `0x132` (3 = active), `0x12b`, `0x12c`; templates `0x12d
   {0x3c defIndex, 0x3f object type, [0xa1 script]}`; generators `0x12e {0x3e name, 0xa1 script, 0x6c team, 0x132
   active, 0x133, 0x12f mode 0..2, 0x130 total, 0x131 max alive 1..8, 0x12b wave 1..16, 0x134 flags, 0x40 x y z,
@@ -468,3 +470,74 @@ Models wider than 200 m (Gomorrah's city, `epl10005.m`) get one grid per mesh. O
   `FUN_100503c0`, set again on dropping it or AutoPilot): the idle sweep `FUN_10037e30` turns the torso at π/2 rad/s
   (+0x13b8) to yaw goals of `rand × π/2 / 32767` on alternate sides and pitch goals of `rand × 0.3 / 32767`, resting
   `0.5 + 3 × rand / 32767` s at each.
+
+## Weapon effects (`FUN_100e4ca0`, 0.26.1)
+- **Effect tables**, built once by `FUN_100e4ca0` (called from `FUN_100e4fd0`, which also loads `expdyna2.wav` and
+  `envfirea.wav`). An *ammo class* byte `c` (projectile +0x1d8, set through vtable +0xf4 = `FUN_100e5300`) is read as
+  row `c / 10`, size `c % 10` (0 S, 1 M, 2 L); row ≥ 8 or size ≥ 3 falls back to row 0.
+  - Rows `0x10269358` (8 × 8 bytes: u32 trail colour 0x00RRGGBB, byte trail row, byte explosion row):
+
+    | row | colour | trail row | explosion | weapons (Trail_Effect codes in MstrWpns) |
+    |---|---|---|---|---|
+    | 0 | 0x000000 | 0 (none) | MI | launchers with no code (LRP128, -1 → 0 in `FUN_100e8570`), thrown grenades |
+    | 1 | 0xffffff | 1 MTMI | MI | rocket pods LRP/VLRP 10, MRP 11, HRP 12 |
+    | 2 | 0x969696 | 3 MTBA | MI | bazookas LBZK/RFB 20, MBZK 21, HBZK 22 |
+    | 3 | 0x000000 | 4 MTMO | MO | mortars LFM/LGM/APM 30, MFM 31, HFM/HGM 32; artillery shell 0x1f |
+    | 4 | 0x323232 | 4 MTMO | GR | grenade launchers APGL 40, LGL 41, HGL 42 |
+    | 5 | 0xffffff | 5 MTPA | MI | panzerfausts LPZ 50, MPZ 51, HPZ 52 |
+    | 6 | 0x323232 | 1 MTMI | IN | incendiary rocket pods IRP 60, HIRP 62 |
+    | 7 | 0x000000 | 2 MTMI(M,L,L) | MI | guided missiles ABM/AGM 70, ATM 71, AAM/HATM 72 |
+  - Trails `0x10269470` (6 rows × {S, M, L}): none; MTMIS/MTMIM/MTMIL; MTMIM/MTMIL/MTMIL; MTBAS/MTBAM/MTBAL;
+    MTMOS/MTMOM/MTMOL; MTPAS/MTPAM/MTPAL.
+  - Explosions `0x10269330` (5 rows × {ground, object}, `FUN_100e4c20` pairs): MEMIG/MEMIO, MEMIG/MEMIO,
+    MEMOG/MEMOO, MEGRG/MEGRO, MEING/MEINO.
+- **Trail** (`FUN_100ef740`, weapon vtable +0xdc, only when the weapon's Trail_Effect (+0x2c0, keyword 0x15c) ≠ -1):
+  the effect is attached to the projectile (`FUN_101260c0` with it as parent) with the row colour; in space every
+  trail is MT_SPACE, a projectile starting under the water level gets MT_WATER. The colour replaces the RGB of particle
+  types with draw mode (+0x2a8) 1 or 9 (`FUN_10128ac0`), keeping the curve's alpha: MTMI / MTBA (mode 9) are tinted,
+  MTMO / MTPA (modes 0 / 2) are not. So guided missiles trail black smoke, IRPs dark grey, bazookas grey.
+- **Explosive projectiles** (vtable 0x101498f0 family: 0x101499e8, 0x10149ae0, 0x10149bd8, the shell 0x10140a08):
+  +0xe4 object hit (`FUN_100e53e0`) → the row's object explosion, +0xe8 ground hit (`FUN_100e5530`) → ground
+  explosion, +0xec end of flight (`FUN_100e5880`) → object explosion where it is. Each makes the explosion object
+  `FUN_100f3140` (scale 1.0, radius = Collateral_Radius +0x1cc) and plays its copy of `expdyna2.wav` there.
+- **Bullets** (cannons, machine guns, lasers, rail guns: `FUN_100dece0`, vtable 0x101487a8; laser beams 0x10149048
+  share its handlers): object hit `FUN_100df390` → SPARKO; ground hit `FUN_100df4e0`: above the water level the
+  surface's DustIndex picks SPARK0 (0) / SPARK1 (1) tinted with its DustColor, any other index SPARKO; under the
+  water SPARKU with the dust colour. (Names resolved by `FUN_101258e0` into `0x10269048..54` in `FUN_100deb40`.)
+- **Muzzle flash** (`FUN_100ef610`, weapon vtable +0xd8, only when Flash_Effect +0x2c4 ≠ -1; 0x15d values > 9 become
+  -1): table `0x10163488` = MUZZLE_FLASH for 0-3 and 6-9, FLARE_SMA for 4 (lasers), FLARE_LAR for 5 (HLC / HPLC);
+  flash 1 adds four more MUZZLE_FLASH at fixed offsets. FLARE_LAR has no file in any shipped particle folder (the
+  original finds nothing either; the port shows FLARE_SMA larger). Rocket and missile launchers have no flash.
+- Draw mode 3 particles (SPARKO, MT_SPACE) are sized on screen: size × depth / projection factor (`FUN_10128ac0`).
+- Weapon class by hardpoint keyword (`FUN_10049f40` factory): 0xb3/0xb5/0xb6/0xc0 base `FUN_100ecbf0` (bullets),
+  0xb4/0xba/0xbb/0xbc/0xbd launchers (`FUN_100e8570` / `FUN_100e8a30`, projectile from vtable +0x130 carrying the
+  ammo class), 0xb7/0xb8/0xb9/0xbe lasers (`FUN_100e2b10` family, a beam object), 0xbf rail gun (`FUN_100eada0`).
+
+## FollowPath (`FUN_100d5340` .. `FUN_100d5730`)
+- ov0 (x, y, z): the script's own unit to a point; ov1 (unit ref -0x14, point) / ov2 (unit name -0x14, point); ov3
+  (path -8): the own unit along a path; ov4 (unit ref -0xc, path -8) / ov5 (unit name -0xc, path -8). Points go to
+  `FUN_100d5380` (brain order 2, flags | 0x241), paths to `FUN_100d5590` (order 5, flags | 0x240) on the unit's brain
+  (+0xd8c). The user's gear has a brain too: S1J's s1j_user script sends it along "user1" while cinematic mode runs
+  under the camera1 fly-by; the port walks the player's gear along the path while the user has no control (cinematic
+  mode or SetUserControl(0)) and drops the order when control comes back. Dropships (class 0x55, "Plane",
+  `FUN_1002a730`) fly their path's points (S1J "dship"); the port moves them at the def's run speed (else 40 m/s).
+- **Maglev trains** (class 0x13e, `FUN_10073a00`, vtable 0x101452b8; M10 / M20): AssignPath (+0x22c,
+  `FUN_10073bd0`) stores the path's points as offsets from the train's own position (relative to the path); Forward(n)
+  / Backward(n) (+0x224 `FUN_10073b10` / +0x228 `FUN_10073b70`) set the direction (+0xdb8 = ±1), the point count
+  (+0xdbc) and the next point; the update (`FUN_10073d10`) moves speed × dt toward it, stepping on until the count runs
+  out or the path ends. The port does the same, with SetSpeed in km/h (default 20 m/s). Elevators (class 0x60,
+  `FUN_10073ef0`, vtable 0x10145508; S21 / S22) derive from it with the same +0x224..+0x22c slots; their update
+  (`FUN_100740a0`) clamps the time step to 0.06 s before `FUN_10073d10`.
+- Class 0x5d craft (`FUN_1002df40`; S30's drones / maintenance craft) take FollowPath like dropships in the port.
+
+## Mission sweep notes (0.26.1: every mission 30 s windowed, `--verbose-scripts`)
+- Geometry names longer than 8.3 (`pAbpg20005.m` S25 / S27, `pAmrd30005.m` H07 / H09 / S27, `pAmbo10005.m` S37,
+  `pAbwr10005.m` S27) have no file of that name; the shipped files are the last 8 characters of the base (BPG20005.M,
+  MRD30005.M, MBO10005.M, BWR10005.M). The port falls back to that (a heuristic: the original's lookup for these was not
+  traced).
+- T05_PATROL1..4 call FollowPath("patrol1".."patrol4"), but T05 only has the paths cam1, user1 and failcam: the original
+  data has no such paths either (`FUN_1008c960` finds nothing and the order is skipped).
+- `redbkNNN.wav` cues (TriggerSound in many scripts; Sounds.lst marks them "#CD audio track N") have no files: CD audio.
+- FLARE_LAR (Flash_Effect 5) is missing from every particle folder.
+- S27_GATE1 assigns "gatepth1", which S27 doesn't have (data). Still unsimulated: S22's bldg1frm on a class 0x53 frame
+  object and the fountain-spawned VTOL (vtol1path), which AssignPath but aren't units the port moves.

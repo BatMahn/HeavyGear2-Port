@@ -198,18 +198,85 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
         int playerUnit() override { return player; }
         void unitSleep(int u, bool on) override { if (ai) ai->sleep(u, on); }
         void unitActivate(int u, bool on) override { if (ai) ai->sleep(u, !on); }
-        void unitGoto(int u, const float p[3]) override { if (ai) ai->gotoPoint(u, Vec3(p[0], p[1], p[2])); }
+        // FollowPath on the user's own gear (FUN_100d5590 / FUN_100d5380 give the order to the unit's brain, +0xd8c,
+        // which the user's gear has too): the brain walks the gear along the path while the user isn't driving it
+        // (cinematic mode or SetUserControl(0)), e.g. S1J's intro walk along "user1" under the camera fly-by
+        std::vector<Vec3> userPath;
+        size_t userPathIdx = 0;
+        struct Flyer { std::vector<Vec3> pts; size_t idx = 0; float speed = 40.f; Vec3 pos; float yaw = 0; };
+        std::map<int, Flyer> flyers;
+        // maglev trains (class 0x13e, FUN_10073a00) and elevators (0x60, FUN_10073ef0, same path slots): AssignPath stores the path's points offset by the train's own
+        // position (FUN_10073bd0); Forward(n) / Backward(n) (vtable +0x224 / +0x228) run it n points along it;
+        // the update (FUN_10073d10) moves at speed x dt toward the next point
+        struct Rail { std::vector<Vec3> pts; int cur = 0, target = 0, dir = 0, count = 0; float speed = 20.f; Vec3 pos; float yaw = 0; };
+        std::map<int, Rail> rails;
+        void unitGoto(int u, const float p[3]) override {
+            if (u == player && player >= 0) userPath = {Vec3(p[0], p[1], p[2])}, userPathIdx = 0;
+            else if (ai) ai->gotoPoint(u, Vec3(p[0], p[1], p[2]));
+        }
         bool unitFollowPath(int u, const std::string& n) override {
+            if (u == player && player >= 0) {
+                const MissionPath* pa = m->path(n);
+                if (pa) {
+                    userPath.clear(), userPathIdx = 0;
+                    for (auto& q : pa->points) userPath.push_back(Vec3(q[0], q[1], q[2]));
+                } else if (verbose) {
+                    SDL_Log("[script] FollowPath %s for the user: no such path", n.c_str());
+                }
+                return pa != nullptr;
+            }
             bool ok = ai && ai->followPath(u, n);
+            // a unit on team 99 (neutral to the AI's targeting) that a script sends along a path, e.g. H07's escort
+            // gear: it becomes a simulated unit now so it can walk
+            if (!ok && ai && m->path(n) && u >= 0 && size_t(u) < m->objects.size() && m->objects[size_t(u)].team < 100 && u != player &&
+                ai->addUnit(u, true))
+                ok = ai->followPath(u, n);
+            // dropships / planes / ships (class 0x55, "Plane", FUN_1002a730) and class 0x5d craft (FUN_1002df40: S30's
+            // drones and maintenance subs) aren't ground units: the port flies them through the path's points as given
+            if (!ok && u >= 0 && size_t(u) < m->objects.size() && (m->objects[size_t(u)].type == 0x55 || m->objects[size_t(u)].type == 0x5d))
+                if (const MissionPath* pa = m->path(n)) {
+                    Flyer f;
+                    for (auto& q : pa->points) f.pts.push_back(Vec3(q[0], q[1], q[2]));
+                    const MissionObject& o = m->objects[size_t(u)];
+                    f.pos = Vec3(float(o.pos[0]), float(o.pos[1]), float(o.pos[2]));
+                    if (scene) scene->objectPosition(u, f.pos);
+                    GearDef g;
+                    if (o.defIndex >= 0 && size_t(o.defIndex) < m->defs.size() &&
+                        parseGearDef(m->defs[size_t(o.defIndex)].data, m->defs[size_t(o.defIndex)].size, g) && g.maxRunSpeed > 1.f)
+                        f.speed = g.maxRunSpeed;
+                    flyers[u] = f;
+                    ok = true;
+                }
             if (!ok && verbose && !n.empty() && n.size() < 40)
-                SDL_Log("[script] FollowPath %s for unit %d (%s) failed", n.c_str(), u,
-                        u >= 0 && size_t(u) < m->objects.size() ? m->objects[size_t(u)].name.c_str() : "-");
+                SDL_Log("[script] FollowPath %s for unit %d (%s) failed%s", n.c_str(), u,
+                        u >= 0 && size_t(u) < m->objects.size() ? m->objects[size_t(u)].name.c_str() : "-", m->path(n) ? "" : ": no such path");
             return ok;
         }
-        bool unitAssignPath(int u, const std::string& n) override { return ai && ai->assignPath(u, n); }
+        bool unitAssignPath(int u, const std::string& n) override {
+            bool ok = ai && ai->assignPath(u, n);
+            if (!ok && u >= 0 && size_t(u) < m->objects.size() && (m->objects[size_t(u)].type == 0x13e || m->objects[size_t(u)].type == 0x60))
+                if (const MissionPath* pa = m->path(n)) {
+                    Rail& r = rails[u];
+                    const MissionObject& o = m->objects[size_t(u)];
+                    Vec3 at(float(o.pos[0]), float(o.pos[1]), float(o.pos[2]));
+                    if (scene) scene->objectPosition(u, at);
+                    r.pts.clear();
+                    for (auto& q : pa->points) r.pts.push_back(at + Vec3(q[0], q[1], q[2]) - Vec3(pa->anchor[0], pa->anchor[1], pa->anchor[2]));  // relative to the path
+                    r.pos = at, r.cur = r.target = 0, r.dir = r.count = 0;
+                    if (getenv("HG2_AUTODBG")) SDL_Log("rail %d on path %s (%zu points)", u, n.c_str(), r.pts.size());
+                    ok = true;
+                }
+            if (!ok && verbose)
+                SDL_Log("[script] AssignPath %s for unit %d (%s) failed%s", n.c_str(), u,
+                        u >= 0 && size_t(u) < m->objects.size() ? m->objects[size_t(u)].name.c_str() : "-", m->path(n) ? "" : ": no such path");
+            return ok;
+        }
         bool verbose = false;
         void unitStop(int u) override { if (ai) ai->stop(u); }
-        void unitSpeed(int u, float k) override { if (ai) ai->speed(u, k); }
+        void unitSpeed(int u, float k) override {
+            if (rails.count(u)) rails[u].speed = std::max(0.f, k / 3.6f);
+            else if (ai) ai->speed(u, k);
+        }
         void unitAttack(int u, int t) override { if (ai) ai->attack(u, t); }
         void unitNotifyRange(int u, float rr) override { if (ai) ai->notifyRange(u, rr); }
         void unitAutoPilot(int u) override { if (ai) ai->command(u, "autopilot", 0, 0, 0, std::string()); }
@@ -246,6 +313,11 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
                 }
             } else if (c == "fullStop" && pl && u == player) {
                 pl->halt();
+            } else if ((c == "forward" || c == "backward") && rails.count(u)) {
+                Rail& r = rails[u];
+                if (r.pts.empty()) return;
+                r.count = int(a), r.dir = c == "forward" ? 1 : -1;
+                r.target = std::max(0, std::min(int(r.pts.size()) - 1, r.cur + r.dir));
             } else if (ai) {
                 ai->command(u, c, a, b, cc, str, d);
             }
@@ -608,6 +680,70 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             banner = order == AiSystem::OrderGoto ? "NO NAV POINT SELECTED" : "NO TARGET", bannerUntil = scripts.time() + 1.5f;
         }
         if (getenv("HG2_TACDBG")) SDL_Log("squad order %d: %s (%.0f,%.0f)", order, banner.c_str(), pos.x, pos.z);
+    };
+    auto updateFlyers = [&](float dt) {
+        for (auto it = world.flyers.begin(); it != world.flyers.end();) {
+            auto& f = it->second;
+            float step = f.speed * dt;
+            while (f.idx < f.pts.size() && step > 0) {
+                Vec3 d = f.pts[f.idx] - f.pos;
+                float len = length(d);
+                if (len > 0.01f) f.yaw = std::atan2(-d.x, -d.z);
+                if (len <= step) f.pos = f.pts[f.idx++], step -= len;
+                else f.pos += d * (step / len), step = 0;
+            }
+            scene.setObjectPose(it->first, f.pos, f.yaw, -1, 0.f);
+            if (f.idx >= f.pts.size()) it = world.flyers.erase(it);
+            else ++it;
+        }
+        for (auto& [obj, r] : world.rails) {
+            if (r.dir == 0) continue;
+            float step = r.speed * std::min(dt, 0.06f);  // elevators clamp the step to 0.06 s (FUN_100740a0)
+            Vec3 d = r.pts[size_t(r.target)] - r.pos;
+            float len = length(d);
+            if (len <= step) {
+                r.pos = r.pts[size_t(r.target)], r.cur = r.target;
+                int next = r.target + r.dir;
+                if (--r.count < 1 || next < 0 || next >= int(r.pts.size())) r.dir = 0;
+                else r.target = next;
+            } else {
+                r.pos += d * (step / len);
+                if (d.x * d.x + d.z * d.z > 0.01f) r.yaw = std::atan2(-d.x, -d.z);
+            }
+            scene.setObjectPose(obj, r.pos, r.yaw, -1, 0.f);
+            if (getenv("HG2_AUTODBG")) SDL_Log("rail %d: point %d -> %d (%d left) at %.0f,%.0f,%.0f", obj, r.cur, r.target, r.count, r.pos.x, r.pos.y, r.pos.z);
+        }
+    };
+    // the user's gear on a scripted path (see World::unitFollowPath): steer at the next point, walk, and drop the
+    // order once the user has the controls back
+    bool userAutoWas = false;
+    auto userAutopilot = [&](PlayerInput& pin, bool dead) {
+        bool scripted = scripts.cinematic.active || scripts.cinematicMode || !world.control;
+        if (world.userPath.empty() || dead || !player.active()) return userAutoWas = false, void();
+        if (!scripted) {
+            if (userAutoWas) world.userPath.clear();
+            userAutoWas = false;
+            return;
+        }
+        userAutoWas = true;
+        Vec3 pos = player.position();
+        while (world.userPathIdx < world.userPath.size()) {
+            Vec3 d = world.userPath[world.userPathIdx] - pos;
+            if (d.x * d.x + d.z * d.z > 16.f) break;
+            world.userPathIdx++;
+        }
+        if (world.userPathIdx >= world.userPath.size()) {
+            world.userPath.clear();
+            return;
+        }
+        Vec3 d = world.userPath[world.userPathIdx] - pos;
+        float want = std::atan2(-d.x, -d.z), err = want - player.yaw();
+        while (err > 3.14159265f) err -= 6.2831853f;
+        while (err < -3.14159265f) err += 6.2831853f;
+        pin = PlayerInput{};
+        pin.turn = std::max(-1.f, std::min(1.f, err * 2.f));
+        pin.throttle = std::fabs(err) < 1.2f ? 1.f : 0.f;
+        if (getenv("HG2_AUTODBG")) SDL_Log("user autopilot: point %zu/%zu, %.0f m, turn %.2f", world.userPathIdx, world.userPath.size(), std::sqrt(d.x * d.x + d.z * d.z), pin.turn);
     };
     auto buildHud = [&](const FrameParams& fp) {
         int W = r.width() > 0 ? r.width() : width, H = r.height() > 0 ? r.height() : height;
@@ -1062,6 +1198,7 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
                 else if (act.rfind("order", 0) == 0) pickTarget(), issueOrder(atoi(act.c_str() + 5));
             }
             if (!world.control) pin = PlayerInput{};
+            userAutopilot(pin, false);
             if (const char* fxn = getenv("HG2_FX"))  // test: an effect 25 m ahead, a few frames before the shot
                 if (f == std::max(0, T.driveFrames - atoi(getenv("HG2_FX_AGE") ? getenv("HG2_FX_AGE") : "10"))) {
                     Vec3 eye = frameParams().eye, at = player.position() + (eye - player.position()) * 0.5f;  // between camera and gear
@@ -1074,6 +1211,7 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             ai.setCombatHold(scripts.combatHold());
             updateStrikes(1.f / 30.f);
             ai.update(1.f / 30.f);
+            updateFlyers(1.f / 30.f);
             combat.update(1.f / 30.f);
             if (const char* w = getenv("HG2_WEATHER")) particles.setWeather(atoi(w), atoi(strchr(w, ':') ? strchr(w, ':') + 1 : "3"));  // test: "1:3"
             else particles.setWeather(world.weatherType, world.weatherPreset % 5);
@@ -1121,14 +1259,17 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
         scene.setObjectDrawn(player.object(), external || !chase || scripts.cinematic.active);
         if (T.driveFrames) printf("after %d frames: %s, hostiles alive %d/%d, squad %zu, wave %d, end %d\n", T.driveFrames, combat.status().c_str(),
                                   ai.alive(), ai.count(), mates.size(), wave, world.endCode);
+        if (const char* wn = getenv("HG2_WEAPON"); wn && T.fireFrames && !combat.testWeapon(wn)) fprintf(stderr, "no weapon %s\n", wn);
         for (int f = 0; f < T.fireFrames; f++) {
             Vec3 mz, aim;
             aimPoint(mz, aim);
             combat.fire(mz, aim);
             combat.update(1.f / 30.f);
+            particles.update(1.f / 30.f);
         }
         buildHud(frameParams());
         glowLights();
+        particles.setViewer(frameParams().eye);
         particles.submit(frameParams().view);
         if (r.beginFrame(frameParams())) {
             scene.render(frameParams());
@@ -1278,6 +1419,7 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
         bool dead = player.active() && !combat.alive(player.object());
         if (dead) player.die();
         if (dead || !world.control) pin = PlayerInput{};
+        userAutopilot(pin, dead);
         player.twist = chase ? std::max(-1.2f, std::min(1.2f, camOrbit)) : 0.f;  // torso follows the aim
         edge = PlayerInput{};
         player.speedScale = combat.mobility(player.object()), player.turnScale = combat.manoeuvre(player.object());
@@ -1289,6 +1431,7 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
         ai.setCombatHold(scripts.combatHold());
         updateStrikes(dt);
         ai.update(dt);
+        updateFlyers(dt);
         if (audio) {
             if (chase) {
                 Vec3 eye, at;

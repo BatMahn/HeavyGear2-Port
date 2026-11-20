@@ -38,9 +38,10 @@ void AiSystem::init(const FileSystem& fs, Scene& scene, Combat& combat, const Pl
     SDL_Log("AI: %zu units, %zu paths", units_.size(), scene.mission().paths.size());
 }
 
-bool AiSystem::addUnit(int index) {
+bool AiSystem::addUnit(int index, bool neutral) {
     const MissionObject& o = scene_->mission().objects[size_t(index)];
-    if (o.team < 100) return false;
+    if (o.team < 100 && !neutral) return false;
+    if (find(index)) return false;
     bool turret = o.type == 0x4b;
     // gears, vehicles, turrets, and the walkers / infantry / mounts spawned by fountains
     bool unit = o.type == 0x48 || turret || o.type == 0x4e || o.type == 0x4f || o.type == 0x50 || o.type == 0x51 || o.type == 0x52;

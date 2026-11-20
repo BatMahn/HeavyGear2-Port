@@ -67,6 +67,8 @@ public:
     // Debrief statistics per shooter: rounds fired, hits on units, units destroyed.
     std::map<int, int> shotsBy, hitsBy, killsBy;
     void selectWeapon(int index);
+    // test hook (HG2_WEAPON): arm the player's selected slot with the named MstrWpns weapon, unlimited ammo
+    bool testWeapon(const std::string& name);
     void nextWeapon();
     // Fire the shooter's selected weapon from `muzzle` toward `aim` (world point). False if not ready / empty.
     bool fire(const Vec3& muzzle, const Vec3& aim) { return fire(playerObject_, muzzle, aim); }
@@ -136,6 +138,7 @@ private:
         int shooter;
         int target = -1;     // guided missiles home on it while the lock holds
         bool jammed = false;
+        int trail = 0;       // attached trail effect (Particles handle), 0 if none
     };
     std::map<int, int> aimTarget_;
     int designated_ = -1, designatorTeam_ = -1;
@@ -181,7 +184,7 @@ private:
         if (w & m) w = (w & ~m) | ((((w & m) >> shift) - 1) << shift);
     }
     struct Flash { Vec3 pos; float age, size; };
-    struct Shell { Vec3 pos, vel; float trail = 0; };       // ArtilleryStrike shells in flight
+    struct Shell { Vec3 pos, vel; int trail = 0; };         // ArtilleryStrike shells in flight
     struct Blast { int object; float wait, damage; Vec3 at; };  // explosion damage on its way (dist / 60 s)
     std::vector<Shell> shells_;
     std::map<int, int> smoking_;          // script-set smoke levels (override the damage smoke)
@@ -191,7 +194,13 @@ private:
     // takes the full `damage`, delayed by its distance / 60
     void blast(const Vec3& p, float radius, float damage, int object);
     void updateShells(float dt);
-    void impact(const Vec3& p, const WeaponDef& w, int object, int shooter, float scale = 1.f);
+    void impact(const Vec3& p, const WeaponDef& w, int object, int shooter, float scale = 1.f, bool expired = false);
+    // effect tables (FUN_100e4ca0): a projectile's ammo class byte (the weapon's Trail_Effect) picks its trail,
+    // trail colour and ground / object explosions; bullets and beams make sparks by the ground's dust class
+    static bool explosive(const WeaponDef& w);
+    int startTrail(int ammoClass, const Vec3& pos);
+    void explosionEffect(int ammoClass, const Vec3& p, bool onObject);
+    void bulletEffect(const Vec3& p, bool onObject);
     void applyDamage(int object, int shooter, float d, const Vec3& p);
     void destroyObject(int object, const Vec3& p);
     std::map<int, float> structure_;  // destructible objects without an armour stat: structure points left

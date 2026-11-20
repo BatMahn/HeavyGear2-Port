@@ -30,9 +30,11 @@ void Renderer::buildPipelines() {
     background_ = makePipeline(false, true);
     overlayPipe_ = makePipeline(true, true);
     additive_ = makePipeline(true, false, true);
+    overlayAdd_ = makePipeline(true, true, true);
+    overlayMul_ = makePipeline(true, true, false, true);
 }
 void Renderer::releasePipelines() {
-    for (auto** p : {&opaque_, &blended_, &background_, &overlayPipe_, &additive_})
+    for (auto** p : {&opaque_, &blended_, &background_, &overlayPipe_, &additive_, &overlayAdd_, &overlayMul_})
         if (*p) SDL_ReleaseGPUGraphicsPipeline(dev_, *p), *p = nullptr;
 }
 
@@ -68,7 +70,7 @@ SDL_GPUShader* Renderer::makeShader(bool vertex) {
     return SDL_CreateGPUShader(dev_, &ci);
 }
 
-SDL_GPUGraphicsPipeline* Renderer::makePipeline(bool blend, bool background, bool additive) {
+SDL_GPUGraphicsPipeline* Renderer::makePipeline(bool blend, bool background, bool additive, bool multiply) {
     SDL_GPUShader* vs = makeShader(true);
     SDL_GPUShader* fs = makeShader(false);
     if (!vs || !fs) return nullptr;
@@ -92,6 +94,12 @@ SDL_GPUGraphicsPipeline* Renderer::makePipeline(bool blend, bool background, boo
         ct.blend_state.src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
         ct.blend_state.dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
         ct.blend_state.alpha_blend_op = SDL_GPU_BLENDOP_ADD;
+        if (multiply) {
+            ct.blend_state.src_color_blendfactor = SDL_GPU_BLENDFACTOR_DST_COLOR;
+            ct.blend_state.dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ZERO;
+            ct.blend_state.src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ZERO;
+            ct.blend_state.dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
+        }
     }
     SDL_GPUGraphicsPipelineCreateInfo pi{};
     pi.vertex_shader = vs;
@@ -508,6 +516,7 @@ void Renderer::endFrame() {
         FSUniforms fu{{0, 0, 0, 0}, {0, 1, 0.f, 1.f}};
         SDL_PushGPUFragmentUniformData(cmd_, 0, &fu, sizeof(fu));
         SDL_BindGPUGraphicsPipeline(pass_, overlayPipe_);
+        SDL_GPUGraphicsPipeline* bound = overlayPipe_;
         SDL_GPUBufferBinding vb{overlayVB_, 0};
         SDL_BindGPUVertexBuffers(pass_, 0, &vb, 1);
         if (overlayBatches_.empty()) {
@@ -519,6 +528,8 @@ void Renderer::endFrame() {
             if (!b.count || b.first + b.count > overlayCount_) continue;
             int t = b.texture < 0 ? font_ : b.texture;
             if (t >= int(textures_.size()) || !textures_[size_t(t)]) t = white_;
+            SDL_GPUGraphicsPipeline* pipe = b.multiply && overlayMul_ ? overlayMul_ : b.additive && overlayAdd_ ? overlayAdd_ : overlayPipe_;
+            if (pipe != bound) SDL_BindGPUGraphicsPipeline(pass_, pipe), bound = pipe;
             SDL_GPUTextureSamplerBinding tsb{textures_[size_t(t)], sampler_};
             SDL_BindGPUFragmentSamplers(pass_, 0, &tsb, 1);
             SDL_DrawGPUPrimitives(pass_, b.count, 1, b.first, 0);

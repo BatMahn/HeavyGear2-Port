@@ -1172,19 +1172,13 @@ bool Shell::startMovie(const std::string& name, bool shellMovie, bool fullscreen
     movie_.m = std::move(m);
     movie_.shown = -1;
     movie_.fullscreen = fullscreen;
-    // the interlaced filter weaves two fields: twice the frame's lines, the odd ones from the previous frame
+    // the filters (full-screen movies only): interlaced shows the frame as two fields, the woven picture twice the
+    // frame's lines; CRT draws its own scanline image
     movie_.interlaced = fullscreen && app_.settings.movieFilter == 2;
-    movie_.prev = Image{};
-    std::pair<int, int> size{movie_.m->width(), movie_.m->height() * (movie_.interlaced ? 2 : 1)};
-    auto it = movieTex_.find(size);
-    if (it == movieTex_.end()) {
-        Image black;
-        black.w = size.first, black.h = size.second;
-        black.rgba.assign(size_t(black.w) * black.h * 4, 0);
-        for (size_t i = 3; i < black.rgba.size(); i += 4) black.rgba[i] = 255;
-        it = movieTex_.emplace(size, app_.r.createTexture(black, false)).first;
-    }
-    movie_.tex = it->second;
+    movie_.crtMode = fullscreen && app_.settings.movieFilter == 1;
+    movie_.fields = Image{};
+    movie_.field = -1, movie_.crtShown = -1, movie_.crtRows = 0;
+    movie_.tex = movieTexture(movie_.m->width(), movie_.m->height() * (movie_.interlaced ? 2 : 1));
     if (app_.audioOk && movie_.m->hasAudio()) {
         if (fullscreen) app_.audio.stopAll(), humOn_ = false;
         app_.audio.playPcm(movie_.m->audioSpec(), movie_.m->audio().data(), movie_.m->audio().size(), 1.f);
@@ -1199,6 +1193,18 @@ void Shell::stopMovie() {
     movie_.m.reset();
 }
 
+int Shell::movieTexture(int w, int h) {
+    auto it = movieTex_.find({w, h});
+    if (it == movieTex_.end()) {
+        Image black;
+        black.w = w, black.h = h;
+        black.rgba.assign(size_t(w) * h * 4, 0);
+        for (size_t i = 3; i < black.rgba.size(); i += 4) black.rgba[i] = 255;
+        it = movieTex_.emplace(std::make_pair(w, h), app_.r.createTexture(black, false)).first;
+    }
+    return it->second;
+}
+
 bool Shell::updateMovie() {
     if (!movie_.m) return false;
     double t = double(SDL_GetTicksNS() - movie_.t0) * 1e-9;
@@ -1208,25 +1214,196 @@ bool Shell::updateMovie() {
         return false;
     }
     if (idx != movie_.shown && movie_.m->frame(idx, movie_.img)) {
-        if (movie_.interlaced) {
+        movie_.shown = idx;
+        if (!movie_.interlaced && !movie_.crtMode) app_.r.updateTexture(movie_.tex, movie_.img);
+    }
+    if (movie_.interlaced && movie_.shown >= 0) {
+        // Interlaced video on a progressive display: fields at twice the frame rate, each one rewriting every other
+        // line with the newest frame while the other lines keep the last field's (the frame before), so motion
+        // combs on one field of two. The older field is a little dimmer, its phosphor fading.
+        int f = int(t * movie_.m->fps() * 2.0);
+        if (f != movie_.field) {
             const Image& c = movie_.img;
-            const Image& p = movie_.prev.w == c.w && movie_.prev.h == c.h ? movie_.prev : c;
-            Image& o = movie_.woven;
-            o.w = c.w, o.h = c.h * 2, o.hasAlpha = false;
-            o.rgba.resize(size_t(o.w) * o.h * 4);
+            Image& raw = movie_.fields;
             size_t row = size_t(c.w) * 4;
-            for (int y = 0; y < c.h; y++) {
-                memcpy(&o.rgba[size_t(2 * y) * row], &c.rgba[size_t(y) * row], row);       // this frame's field
-                memcpy(&o.rgba[size_t(2 * y + 1) * row], &p.rgba[size_t(y) * row], row);   // the last frame's field
+            bool fresh = raw.w != c.w || raw.h != c.h * 2;
+            if (fresh) raw.w = c.w, raw.h = c.h * 2, raw.hasAlpha = false, raw.rgba.assign(row * size_t(raw.h), 255);
+            int par = f & 1;
+            for (int y = 0; y < c.h; y++)
+                for (int p = 0; p < 2; p++)
+                    if (fresh || p == par) memcpy(&raw.rgba[size_t(2 * y + p) * row], &c.rgba[size_t(y) * row], row);
+            movie_.field = f, movie_.newest = par;
+            Image& o = movie_.woven;
+            o = raw;
+            for (int y = 1 - par; y < o.h; y += 2) {
+                uint8_t* q = &o.rgba[size_t(y) * row];
+                for (size_t i = 0; i < row; i += 4)
+                    q[i] = uint8_t(q[i] * 225 >> 8), q[i + 1] = uint8_t(q[i + 1] * 225 >> 8), q[i + 2] = uint8_t(q[i + 2] * 225 >> 8);
             }
             app_.r.updateTexture(movie_.tex, o);
-            movie_.prev = c;
-        } else {
-            app_.r.updateTexture(movie_.tex, movie_.img);
         }
-        movie_.shown = idx;
     }
     return true;
+}
+
+namespace {
+// The CRT filter's tube: the raster curved (each edge bowing out, the corners pulled in, more along the longer
+// edges as on a spherical face), inside a rounded glass opening with a thin bezel. Coordinates: x, y in -1..1 over
+// the raster; X, Y in window pixels from the tube's middle.
+struct CrtGeom {
+    float hw, hh, mx, my, kx, ky, bez, rg, rr;
+    CrtGeom(float w, float h) {
+        hw = w * 0.5f, hh = h * 0.5f;
+        bez = std::round(std::max(3.f, h * 0.011f));
+        float gap = std::max(2.f, h * 0.006f);
+        mx = 1.f - (bez + gap) / hw, my = 1.f - (bez + gap) / hh;
+        float diag = std::sqrt(w * w + h * h), c = 0.042f;
+        kx = c * h * h / (w * diag), ky = c * w * w / (h * diag);
+        rg = std::min(w, h) * 0.045f, rr = std::min(w, h) * 0.02f;
+    }
+    void map(float x, float y, float& X, float& Y) const {
+        X = hw * mx * x * (1.f - kx * y * y), Y = hh * my * y * (1.f - ky * x * x);
+    }
+    void unmap(float X, float Y, float& x, float& y) const {
+        float a = X / (hw * mx), b = Y / (hh * my);
+        x = a, y = b;
+        for (int i = 0; i < 8; i++) x = a / (1.f - kx * y * y), y = b / (1.f - ky * x * x);
+    }
+};
+// signed distance to a rounded rectangle (half sizes ax, ay, corner radius r)
+float roundRectDist(float x, float y, float ax, float ay, float r) {
+    float qx = std::fabs(x) - ax + r, qy = std::fabs(y) - ay + r;
+    float ox = std::max(qx, 0.f), oy = std::max(qy, 0.f);
+    return std::sqrt(ox * ox + oy * oy) + std::min(std::max(qx, qy), 0.f) - r;
+}
+float smooth01(float a, float b, float v) {
+    float t = std::clamp((v - a) / (b - a), 0.f, 1.f);
+    return t * t * (3.f - 2.f * t);
+}
+}  // namespace
+
+// The CRT filter's picture: each of the frame's lines drawn as a beam `rows` texels tall, wider when bright, the
+// gaps between lines dark; softened along the line (the beam's spot) with a glow around bright areas.
+void Shell::bakeCrt(int rows, float pitch) {
+    const Image& c = movie_.img;
+    int W = c.w, H = c.h;
+    if (W <= 0 || H <= 0) return;
+    std::vector<float> a(size_t(W) * H * 3), g(size_t(W) * H * 3), t(size_t(W) * H * 3);
+    for (size_t i = 0, n = size_t(W) * H; i < n; i++)
+        for (int k = 0; k < 3; k++) a[i * 3 + k] = float(c.rgba[i * 4 + k]) * (1.f / 255.f);
+    // bright pass for the glow
+    for (size_t i = 0, n = size_t(W) * H; i < n; i++) {
+        float l = 0.3f * a[i * 3] + 0.59f * a[i * 3 + 1] + 0.11f * a[i * 3 + 2];
+        float b = std::max(0.f, l - 0.45f) / 0.55f;
+        for (int k = 0; k < 3; k++) g[i * 3 + k] = a[i * 3 + k] * b;
+    }
+    auto boxH = [&](std::vector<float>& src, std::vector<float>& dst, int r) {
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++)
+                for (int k = 0; k < 3; k++) {
+                    float s = 0;
+                    for (int d = -r; d <= r; d++) s += src[(size_t(y) * W + size_t(std::clamp(x + d, 0, W - 1))) * 3 + k];
+                    dst[(size_t(y) * W + x) * 3 + k] = s / float(2 * r + 1);
+                }
+    };
+    auto boxV = [&](std::vector<float>& src, std::vector<float>& dst, int r) {
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++)
+                for (int k = 0; k < 3; k++) {
+                    float s = 0;
+                    for (int d = -r; d <= r; d++) s += src[(size_t(std::clamp(y + d, 0, H - 1)) * W + x) * 3 + k];
+                    dst[(size_t(y) * W + x) * 3 + k] = s / float(2 * r + 1);
+                }
+    };
+    boxH(g, t, 3), boxH(t, g, 3), boxV(g, t, 1), boxV(t, g, 1);
+    // the beam's spot along the line, and the glow added
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+            for (int k = 0; k < 3; k++) {
+                size_t i = (size_t(y) * W + x) * 3 + k;
+                float l = a[(size_t(y) * W + size_t(std::max(x - 1, 0))) * 3 + k], r = a[(size_t(y) * W + size_t(std::min(x + 1, W - 1))) * 3 + k];
+                t[i] = std::min(1.f, 0.62f * a[i] + 0.19f * (l + r) + 0.22f * g[i]);
+            }
+    // beam profile per value and sub-row: the line's own and its two neighbours' gaussians
+    static std::vector<float> lut;
+    static int lutRows = 0;
+    static float lutSoft = 0;
+    // on a small window (a few pixels per line) the gaps are softened: sharp ones there only alias
+    float soft = std::clamp(4.5f / std::max(pitch, 1.f), 1.f, 1.45f);
+    if (lutRows != rows || lutSoft != soft) {
+        lut.assign(size_t(rows) * 3 * 256, 0.f);
+        for (int r = 0; r < rows; r++)
+            for (int j = 0; j < 3; j++)
+                for (int v = 0; v < 256; v++) {
+                    float d = (float(r) + 0.5f) / float(rows) - 0.5f - float(j - 1);  // distance to line (y + j - 1)
+                    float val = float(v) / 255.f, sg = (0.21f + 0.15f * val) * soft;
+                    lut[(size_t(r) * 3 + j) * 256 + v] = 1.7f / soft * val * std::exp(-d * d / (2.f * sg * sg));
+                }
+        lutRows = rows, lutSoft = soft;
+    }
+    Image& o = movie_.crt;
+    o.w = W, o.h = H * rows, o.hasAlpha = false;
+    o.rgba.resize(size_t(o.w) * o.h * 4);
+    std::vector<uint8_t> q(t.size());
+    for (size_t i = 0; i < t.size(); i++) q[i] = uint8_t(t[i] * 255.f + 0.5f);
+    for (int y = 0; y < H; y++)
+        for (int r = 0; r < rows; r++) {
+            uint8_t* out = &o.rgba[(size_t(y) * rows + r) * size_t(W) * 4];
+            const float* w0 = &lut[(size_t(r) * 3 + 0) * 256];
+            const float* w1 = &lut[(size_t(r) * 3 + 1) * 256];
+            const float* w2 = &lut[(size_t(r) * 3 + 2) * 256];
+            const uint8_t* l0 = &q[size_t(std::max(y - 1, 0)) * W * 3];
+            const uint8_t* l1 = &q[size_t(y) * W * 3];
+            const uint8_t* l2 = &q[size_t(std::min(y + 1, H - 1)) * W * 3];
+            for (int x = 0; x < W * 3; x++) {
+                float v = w0[l0[x]] + w1[l1[x]] + w2[l2[x]];
+                out[(x / 3) * 4 + x % 3] = uint8_t(std::min(255.f, v * 255.f + 0.5f));
+            }
+            for (int x = 0; x < W; x++) out[x * 4 + 3] = 255;
+        }
+}
+
+// The CRT filter's tube for a w x h pixel screen: the vignette over the raster, the dark glass around it, the
+// rounded opening and the bezel.
+void Shell::crtMask(int w, int h) {
+    if (maskTex_ >= 0 && maskW_ == w && maskH_ == h) return;
+    CrtGeom G{float(w), float(h)};
+    Image m;
+    m.w = w, m.h = h, m.hasAlpha = true;
+    m.rgba.assign(size_t(w) * h * 4, 0);
+    for (int j = 0; j < h; j++)
+        for (int i = 0; i < w; i++) {
+            float X = float(i) + 0.5f - G.hw, Y = float(j) + 0.5f - G.hh;
+            float x, y;
+            G.unmap(X, Y, x, y);
+            // the raster: darker toward its edges and corners
+            float dr = roundRectDist(x * G.hw * G.mx, y * G.hh * G.my, G.hw * G.mx, G.hh * G.my, G.rr);
+            float cr = std::clamp(0.5f - dr, 0.f, 1.f);
+            float e = std::pow(std::pow(std::fabs(x), 8.f) + std::pow(std::fabs(y), 8.f), 1.f / 8.f);
+            float vig = std::min(1.f, 0.6f * smooth01(0.8f, 1.02f, e) + 0.12f * (x * x + y * y) * 0.5f);
+            // the glass: nearly black, a faint sheen toward the top
+            float sheen = 1.f - std::clamp((Y + G.hh) / (2.f * G.hh), 0.f, 1.f);
+            float gl = 7.f + 7.f * sheen * sheen;
+            float ia = cr * vig + (1.f - cr), ir = (1.f - cr) * gl;  // premultiplied
+            float ig = (1.f - cr) * (gl + 1.f), ib = (1.f - cr) * gl;
+            // the bezel outside the glass's rounded opening: a lit lip at the opening, darker plastic outward,
+            // the top lit a little more than the bottom
+            float dg = roundRectDist(X, Y, G.hw - G.bez, G.hh - G.bez, G.rg);
+            float cg = std::clamp(0.5f - dg, 0.f, 1.f);
+            float lip = std::exp(-std::max(dg, 0.f) / 1.6f);
+            float top = 1.f - 0.18f * Y / G.hh;
+            float bz = (20.f + 32.f * lip) * top;
+            float oa = cg * ia + (1.f - cg);
+            float orr = cg * ir + (1.f - cg) * bz, og = cg * ig + (1.f - cg) * bz, ob = cg * ib + (1.f - cg) * (bz + 2.f);
+            uint8_t* p = &m.rgba[(size_t(j) * w + i) * 4];
+            if (oa > 0.f) {
+                p[0] = uint8_t(std::min(255.f, orr / oa)), p[1] = uint8_t(std::min(255.f, og / oa)), p[2] = uint8_t(std::min(255.f, ob / oa));
+            }
+            p[3] = uint8_t(std::min(255.f, oa * 255.f + 0.5f));
+        }
+    if (maskTex_ >= 0 && maskW_ == w && maskH_ == h) app_.r.updateTexture(maskTex_, m);
+    else maskTex_ = app_.r.createTexture(m, false);
+    maskW_ = w, maskH_ = h;
 }
 
 bool Shell::fullscreenMovie() {
@@ -1257,53 +1434,56 @@ bool Shell::fullscreenMovie() {
     float mw = float(movie_.m->width()), mh = float(movie_.m->height());
     float k = std::min(sw / mw, sh / mh);
     float w = mw * k, h = mh * k, mx = sx + (sw - w) * 0.5f, my = sy + (sh - h) * 0.5f;
-    if (movie_.shown >= 0) ui_.textureQuad(movie_.tex, mx, my, w, h);
-    int filter = app_.settings.movieFilter;
-    if (filter && movie_.shown >= 0) {
-        movieFilterTextures();
-        if (filter == 1) {
-            // CRT: a dark gap between the picture's source lines (one scanline per line of the 180), the screen's
-            // edges and corners falling off
-            float period = h / mh, v0 = -(my - sy) / period;
-            ui_.textureQuadUV(scanTex_, sx, sy, sw, sh, 0, v0, 1, v0 + sh / period, 0xffffffffu);
-            ui_.textureQuadUV(vignetteTex_, sx, sy, sw, sh, 0, 0, 1, 1, 0xffffffffu);
-        } else {
-            // interlaced: the two fields woven (above), the second field's lines a little darker
-            float period = h / (mh * 2.f);
-            ui_.textureQuadUV(fieldTex_, mx, my, w, h, 0, 0, 1, h / period, 0xffffffffu);
-        }
+    if (movie_.shown < 0) return true;
+    if (!movie_.crtMode) {
+        ui_.textureQuad(movie_.tex, mx, my, w, h);  // as is, or the interlaced fields woven (updateMovie)
+        return true;
     }
+    // CRT: the scanline picture on a curved grid, an aperture grille over the tube at the window's pixel scale,
+    // and the tube's mask (vignette, glass, rounded opening, bezel)
+    float TX = std::round(ui_.pxX(sx)), TY = std::round(ui_.pxY(sy));
+    float TW = std::round(ui_.pxX(sx + sw)) - TX, TH = std::round(ui_.pxY(sy + sh)) - TY;
+    if (TW < 16 || TH < 16) return true;
+    CrtGeom G(TW, TH);
+    float cx = TX + TW * 0.5f, cy = TY + TH * 0.5f;
+    float x0 = (mx - sx) / sw * 2.f - 1.f, x1 = (mx + w - sx) / sw * 2.f - 1.f;
+    float y0 = (my - sy) / sh * 2.f - 1.f, y1 = (my + h - sy) / sh * 2.f - 1.f;
+    float pitch = h * s * G.my / mh;  // window pixels per line
+    int rows = std::clamp(int(std::lround(pitch)), 3, 8);
+    if (movie_.crtShown != movie_.shown || movie_.crtRows != rows) {
+        bakeCrt(rows, pitch);
+        movie_.crtTex = movieTexture(movie_.crt.w, movie_.crt.h);
+        app_.r.updateTexture(movie_.crtTex, movie_.crt);
+        movie_.crtShown = movie_.shown, movie_.crtRows = rows;
+    }
+    const int NX = 40, NY = 30;
+    std::vector<float> px(size_t(NX + 1) * (NY + 1) * 2);
+    for (int j = 0; j <= NY; j++)
+        for (int i = 0; i <= NX; i++) {
+            float x = x0 + (x1 - x0) * float(i) / NX, y = y0 + (y1 - y0) * float(j) / NY, X, Y;
+            G.map(x, y, X, Y);
+            px[(size_t(j) * (NX + 1) + i) * 2] = cx + X, px[(size_t(j) * (NX + 1) + i) * 2 + 1] = cy + Y;
+        }
+    for (int j = 0; j < NY; j++)
+        for (int i = 0; i < NX; i++) {
+            auto P = [&](int a, int b, int c) { return px[(size_t(j + b) * (NX + 1) + size_t(i + a)) * 2 + size_t(c)]; };
+            float xy[8] = {P(0, 0, 0), P(0, 0, 1), P(1, 0, 0), P(1, 0, 1), P(1, 1, 0), P(1, 1, 1), P(0, 1, 0), P(0, 1, 1)};
+            float u0 = float(i) / NX, u1 = float(i + 1) / NX, v0 = float(j) / NY, v1 = float(j + 1) / NY;
+            float uv[8] = {u0, v0, u1, v0, u1, v1, u0, v1};
+            ui_.quadPx(movie_.crtTex, xy, uv, 0xffffffffu);
+        }
+    if (grilleTex_ < 0) {
+        Image g;  // aperture grille: red, green and blue phosphor stripes a window pixel wide
+        g.w = 3, g.h = 1;
+        g.rgba = {255, 212, 212, 255, 212, 255, 212, 255, 212, 212, 255, 255};
+        grilleTex_ = app_.r.createTexture(g, false);
+    }
+    ui_.setBlend(Ui::Blend::Multiply);
+    ui_.quadPx(grilleTex_, TX, TY, TX + TW, TY + TH, 0, 0, TW / 3.f, 1, 0xffffffffu);
+    ui_.setBlend(Ui::Blend::Alpha);
+    crtMask(int(TW), int(TH));
+    ui_.quadPx(maskTex_, TX, TY, TX + TW, TY + TH, 0, 0, 1, 1, 0xffffffffu);
     return true;
-}
-
-void Shell::movieFilterTextures() {
-    if (scanTex_ >= 0) return;
-    Image sc;  // one scanline: 8 rows, bright in the middle, dark between lines (alpha = darkness)
-    sc.w = 4, sc.h = 8, sc.hasAlpha = true;
-    sc.rgba.assign(size_t(sc.w) * sc.h * 4, 0);
-    for (int y = 0; y < sc.h; y++) {
-        float t = std::sin(3.14159f * (float(y) + 0.5f) / float(sc.h));
-        uint8_t a = uint8_t(255.f * 0.7f * std::pow(1.f - t, 1.4f));
-        for (int x = 0; x < sc.w; x++) sc.rgba[(size_t(y) * sc.w + x) * 4 + 3] = a;
-    }
-    scanTex_ = app_.r.createTexture(sc, false);
-    Image f;  // two field lines: the first clear, the second dimmed
-    f.w = 4, f.h = 2, f.hasAlpha = true;
-    f.rgba.assign(size_t(f.w) * f.h * 4, 0);
-    for (int x = 0; x < f.w; x++) f.rgba[(size_t(1) * f.w + x) * 4 + 3] = 70;
-    fieldTex_ = app_.r.createTexture(f, false);
-    Image v;  // the tube's edges: darkening toward the sides and more into the corners
-    v.w = 128, v.h = 96, v.hasAlpha = true;
-    v.rgba.assign(size_t(v.w) * v.h * 4, 0);
-    for (int y = 0; y < v.h; y++)
-        for (int x = 0; x < v.w; x++) {
-            float dx = (float(x) + 0.5f) / float(v.w) * 2.f - 1.f, dy = (float(y) + 0.5f) / float(v.h) * 2.f - 1.f;
-            float e = std::pow(std::pow(std::fabs(dx), 6.f) + std::pow(std::fabs(dy), 6.f), 1.f / 6.f);  // rounded rect
-            float a = std::clamp((e - 0.78f) / 0.22f, 0.f, 1.f);
-            a = a * a * (3.f - 2.f * a) * 0.85f + 0.12f * (dx * dx + dy * dy) * 0.5f;
-            v.rgba[(size_t(y) * v.w + x) * 4 + 3] = uint8_t(255.f * std::min(1.f, a));
-        }
-    vignetteTex_ = app_.r.createTexture(v, false);
 }
 
 // ---------------------------------------------------------------- briefing

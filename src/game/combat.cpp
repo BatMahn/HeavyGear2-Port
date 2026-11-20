@@ -14,6 +14,34 @@
 namespace hg2 {
 
 namespace {
+// Weapon effect tables, filled once by FUN_100e4ca0. An ammo class byte c (a projectile's +0x1d8, from the weapon's
+// Trail_Effect; the artillery shell sets 0x1f) is read as row c / 10 and size c % 10 (S, M, L); anything past
+// row 7 or size 2 falls back to row 0. Each row (0x1026935c, 8 bytes) holds the trail colour, the trail row and the
+// explosion row.
+struct FxRow { uint32_t color; int trail, explosion; };
+constexpr FxRow kFxRows[8] = {
+    {0x000000, 0, 0},  // 0x: no trail; MEMI (bullet launchers without a trail code, LRP128)
+    {0xffffff, 1, 1},  // 1x: rocket pods (LRP / MRP / HRP): MTMI, MEMI
+    {0x969696, 3, 1},  // 2x: bazookas, RFB: MTBA grey, MEMI
+    {0x000000, 4, 2},  // 3x: mortars (LGM / HGM / LFM / APM), artillery shells: MTMO, MEMO
+    {0x323232, 4, 3},  // 4x: grenade launchers (LGL / HGL / APGL): MTMO, MEGR
+    {0xffffff, 5, 1},  // 5x: panzerfausts (LPZ / MPZ / HPZ): MTPA, MEMI
+    {0x323232, 1, 4},  // 6x: incendiary rocket pods (IRP / HIRP): MTMI dark, MEIN
+    {0x000000, 2, 1},  // 7x: guided missiles (AGM / ABM / ATM / AAM / HATM): MTMIM / MTMIL black, MEMI
+};
+// trails (0x10269470), 6 rows x {S, M, L}
+const char* const kTrails[6][3] = {{nullptr, nullptr, nullptr}, {"MTMIS", "MTMIM", "MTMIL"}, {"MTMIM", "MTMIL", "MTMIL"},
+                                   {"MTBAS", "MTBAM", "MTBAL"}, {"MTMOS", "MTMOM", "MTMOL"}, {"MTPAS", "MTPAM", "MTPAL"}};
+// explosions (0x10269330), 5 rows x {ground, object}
+const char* const kExplosions[5][2] = {{"MEMIG", "MEMIO"}, {"MEMIG", "MEMIO"}, {"MEMOG", "MEMOO"}, {"MEGRG", "MEGRO"}, {"MEING", "MEINO"}};
+// muzzle flashes by Flash_Effect (0x10163488); FLARE_LAR has no file in the shipped particle folders
+const char* const kFlashes[10] = {"MUZZLE_FLASH", "MUZZLE_FLASH", "MUZZLE_FLASH", "MUZZLE_FLASH", "FLARE_SMA",
+                                  "FLARE_LAR",    "MUZZLE_FLASH", "MUZZLE_FLASH", "MUZZLE_FLASH", "MUZZLE_FLASH"};
+const FxRow& fxRow(int c, int& size) {
+    if (c < 0 || c / 10 >= 8 || c % 10 >= 3) return size = 0, kFxRows[0];
+    size = c % 10;
+    return kFxRows[c / 10];
+}
 // Unit box from z = 0..1 (x, y = -0.5..0.5), flat-coloured, unlit.
 std::vector<Vertex> box(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
     const float p[8][3] = {{-.5f, -.5f, 0}, {.5f, -.5f, 0}, {.5f, .5f, 0}, {-.5f, .5f, 0},
@@ -304,7 +332,7 @@ bool Combat::muzzle(int shooter, Vec3& out) const {
 void Combat::partDestroyed(int object, Unit& u, Part& part, const Vec3& at) {
     part.gone = true, part.hp = 0;
     if (particles) particles->spawn("DAMAGE_SPARK", at, 1.f);
-    if (audio) audio->play("explsm01.wav", 0.8f, &at, 500.f);
+    if (audio) audio->play("expmed01.wav", 0.8f, &at, 500.f);  // (explsm01.wav, used before, does not exist)
     const char* what = part.region == 'H' ? "SENSORS DESTROYED" : part.region == 'A' ? "RIGHT ARM DESTROYED"
                      : part.region == 'a' ? "LEFT ARM DESTROYED" : part.region == 'L' ? "RIGHT LEG DAMAGED"
                      : part.region == 'l' ? "LEFT LEG DAMAGED" : "TORSO BREACHED";
@@ -380,6 +408,17 @@ void Combat::selectWeapon(int i) {
     auto& u = units_[playerObject_];
     if (i >= 0 && i < int(u.loadout.size())) u.selected = i;
 }
+bool Combat::testWeapon(const std::string& name) {
+    auto& u = units_[playerObject_];
+    if (u.loadout.empty()) return false;
+    for (auto& w : weapons_)
+        if (w.name == name) {
+            Loadout& l = u.loadout[size_t(u.selected)];
+            l.def = &w, l.ammo = -1, l.cooldown = 0;
+            return true;
+        }
+    return false;
+}
 void Combat::nextWeapon() {
     auto& u = units_[playerObject_];
     if (!u.loadout.empty()) u.selected = (u.selected + 1) % int(u.loadout.size());
@@ -397,7 +436,10 @@ bool Combat::fire(int shooter, const Vec3& muzzle, const Vec3& aim) {
     shotsBy[shooter]++;
     Vec3 dir = normalize(aim - muzzle);
     if (audio) audio->play(w.fireSound, shooter == playerObject_ ? 0.6f : 0.8f, &muzzle, 500.f);
-    if (particles && w.type != 2) particles->spawn(w.beam() ? "MUZZLE_FLASH2" : "MUZZLE_FLASH", muzzle, 0.3f, dir, 0.3f);
+    // muzzle flash by Flash_Effect (FUN_100ef610, only when it is set: launchers have none)
+    if (particles && w.type != 2 && w.flashEffect >= 0 && w.flashEffect < 10 &&
+        !particles->spawn(kFlashes[w.flashEffect], muzzle, 0.3f, dir, 0.3f) && w.flashEffect == 5)
+        particles->spawn("FLARE_SMA", muzzle, 0.45f, dir, 0.3f);
     float range = std::max(20.f, w.maxRange);
     if (w.type == 2) range = 6.f;  // melee
     if (w.beam()) {  // hitscan
@@ -428,22 +470,60 @@ bool Combat::fire(int shooter, const Vec3& muzzle, const Vec3& aim) {
             }
             break;
         }
+    if (explosive(w)) sh.trail = startTrail(std::max(0, w.trailEffect), muzzle);
     shots_.push_back(sh);
     return true;
 }
 
-void Combat::impact(const Vec3& p, const WeaponDef& w, int object, int shooter, float scale) {
-    if (getenv("HG2_DEBUG")) fprintf(stderr, "impact %s obj %d by %d at %.0f %.0f %.0f\n", w.name.c_str(), object, shooter, p.x, p.y, p.z);
-    // impact effect: metal hits on objects (beam / missile / mortar / ballistic, by weight), dirt on the ground
-    bool fx = false;
-    if (particles) {
-        char sz = w.damage >= 40.f ? 'L' : w.damage >= 12.f ? 'M' : 'S';
-        std::string kind = w.beam() ? "MTPA" : (w.type == 3 || w.type == 7 || w.mortarAngle > 0) ? "MTMO" : w.velocity < 300 ? "MTMI" : "MTBA";
-        float dens = w.damage >= 40.f ? 0.5f : 0.2f;
-        if (object >= 0) fx = particles->spawn(kind + sz, p, 0.6f, Vec3(0, 1, 0), dens);
-        else fx = particles->spawn(w.damage >= 30.f || w.collateralRadius > 3.f ? "DIRT BLAST" : "SPARKDUST", p, 0.8f, Vec3(0, 1, 0), dens);
+bool Combat::explosive(const WeaponDef& w) {
+    // launcher projectiles (vtable 0x101498f0 family: rocket pods, bazookas, mortars, grenade launchers, missiles)
+    // carry an ammo class and explode; cannon, machine-gun, laser and rail rounds are bullets (0x101487a8) that
+    // spark. Launchers whose weapon has no Trail_Effect get class 0 (FUN_100e8570); thrown grenades explode too.
+    return !w.beam() && (w.trailEffect >= 0 || w.collateralRadius > 0.f || w.type == 3 || w.type == 7 || w.type == 0x84);
+}
+
+int Combat::startTrail(int c, const Vec3& pos) {
+    // FUN_100ef740: in space every trail is MT_SPACE, under water MT_WATER, else the table's trail and colour
+    if (!particles) return 0;
+    int size;
+    const FxRow& row = fxRow(c, size);
+    if (space_) return particles->attach("MT_SPACE", pos);
+    if (scene_->mission().hasWater && pos.y < scene_->waterLevel()) return particles->attach("MT_WATER", pos);
+    const char* name = kTrails[row.trail][size];
+    return name ? particles->attach(name, pos, 1.f, row.color) : 0;
+}
+
+void Combat::explosionEffect(int c, const Vec3& p, bool onObject) {
+    // FUN_100e53e0 (object, vtable +0xe4), FUN_100e5530 (ground, +0xe8), FUN_100e5880 (end of flight, +0xec: the
+    // object one): explosion FUN_100f3140 at scale 1 with the projectile's blast radius, and expdyna2.wav
+    int size;
+    const FxRow& row = fxRow(c, size);
+    const char* name = kExplosions[row.explosion][onObject ? 1 : 0];
+    if (!particles || !particles->spawn(name, p, 1.f)) flashes_.push_back({p, 0.f, 6.f});
+    if (audio) audio->play("expdyna2.wav", 1.f, &p, 800.f);
+}
+
+void Combat::bulletEffect(const Vec3& p, bool onObject) {
+    // bullets (FUN_100df390 object, FUN_100df4e0 ground): SPARKO on objects; on the ground the surface's DustIndex
+    // picks SPARK0 / SPARK1 tinted with its DustColor (any other index: SPARKO), and under water SPARKU
+    if (!particles) return;
+    if (onObject) {
+        particles->spawn("SPARKO", p, 1.f);
+        return;
     }
-    if (!fx) flashes_.push_back({p, 0.f, 1.f + w.damage * 0.08f + w.collateralRadius * 0.2f});
+    const Surface* s = scene_->surfaceAt(p.x, p.z);
+    if (scene_->mission().hasWater && p.y < scene_->waterLevel()) {
+        particles->spawn("SPARKU", p, 1.f, Vec3(0, 1, 0), 1.f, s ? s->dustColor : 0u);
+        return;
+    }
+    if (s && (s->dustIndex == 0 || s->dustIndex == 1)) particles->spawn(s->dustIndex ? "SPARK1" : "SPARK0", p, 1.f, Vec3(0, 1, 0), 1.f, s->dustColor);
+    else particles->spawn("SPARKO", p, 1.f);
+}
+
+void Combat::impact(const Vec3& p, const WeaponDef& w, int object, int shooter, float scale, bool expired) {
+    if (getenv("HG2_DEBUG")) fprintf(stderr, "impact %s obj %d by %d at %.0f %.0f %.0f\n", w.name.c_str(), object, shooter, p.x, p.y, p.z);
+    if (explosive(w)) explosionEffect(std::max(0, w.trailEffect), p, object >= 0 || expired);
+    else if (!expired) bulletEffect(p, object >= 0);
     // damage value: weapon Damages x10 (FUN_100ee440) x the shooter's fire-control multiplier (table 0x10163474)
     static const float kFireControl[11] = {0.24f, 0.2f, 0.3f, 0.5f, 0.7f, 0.8f, 1.f, 1.5f, 2.f, 2.5f, 3.f};
     int fc = 0;
@@ -462,7 +542,7 @@ void Combat::impact(const Vec3& p, const WeaponDef& w, int object, int shooter, 
         }
     }
     if (object < 0 || size_t(object) >= damage.size()) return;
-    if (audio) audio->play("hitbull6.wav", 0.5f, &p, 200.f);
+    if (audio && !explosive(w)) audio->play("hitbull6.wav", 0.5f, &p, 200.f);
     if (w.type == 0x84 && field(object, 0, 17, 1)) d *= 0.25f;  // Haywire Resistant shrugs off the haywire effect (FUN_100594b0)
     applyDamage(object, shooter, d, p);
 }
@@ -655,6 +735,7 @@ void Combat::update(float dt) {
                 s.vel = nd * sp;
             }
         }
+        if (!s.beam && dead && explosive(*s.def)) impact(s.pos, *s.def, -1, s.shooter, 1.f, true);  // end of flight
         if (!s.beam && !dead) {
             Vec3 next = s.pos + s.vel * dt;
             float tg = scene_->terrainRay(s.pos, next), to;
@@ -665,8 +746,12 @@ void Combat::update(float dt) {
                 dead = true;
             }
             s.pos = next;
+            if (particles && s.trail) particles->move(s.trail, s.pos, s.vel);
         }
-        if (dead) shots_.erase(shots_.begin() + long(i));
+        if (dead) {
+            if (particles && s.trail) particles->detach(s.trail);
+            shots_.erase(shots_.begin() + long(i));
+        }
         else i++;
     }
     updateShells(dt);
@@ -726,13 +811,11 @@ void Combat::artilleryShell(const Vec3& p) {
     // the shell (vtable 0x10140a08) carries no MstrWpns weapon: ammo class 0x1f (mortar, medium) picks the
     // MTMOM trail and the MEMOG / MEMOO explosions from the effect tables FUN_100e4ca0 fills; blast radius 30,
     // damage word 0x190080 >> 14 = 100, doubled by the explosion = 200 (Damages 20)
-    shells_.push_back({p, Vec3(0, 0, 0)});
+    shells_.push_back({p, Vec3(0, 0, 0), startTrail(0x1f, p)});
 }
 
 void Combat::blast(const Vec3& p, float radius, float damage, int object) {
-    if (particles) particles->spawn(object >= 0 ? "MEMOO" : "MEMOG", p, 1.f);
-    else flashes_.push_back({p, 0.f, 6.f});
-    if (audio) audio->play("expdyna2.wav", 1.f, &p, 800.f);
+    explosionEffect(0x1f, p, object >= 0);
     const auto& objs = scene_->mission().objects;
     for (size_t i = 0; i < objs.size(); i++) {
         if (!units_.count(int(i)) && !structure_.count(int(i))) continue;
@@ -749,12 +832,13 @@ void Combat::updateShells(float dt) {
         Shell& s = shells_[i];
         s.vel.y -= 20.f * dt;  // FUN_100e7910: 20 m/s^2
         Vec3 next = s.pos + s.vel * dt;
-        if (particles && (s.trail -= dt) <= 0) s.trail = 0.05f, particles->spawn("MTMOM", s.pos, 1.f, Vec3(0, 1, 0), 0.3f);
+        if (particles && s.trail) particles->move(s.trail, s.pos, s.vel);
         float tg = scene_->terrainRay(s.pos, next), to;
         int obj = scene_->raycast(s.pos, next, -1, to);
         float t = std::min(tg, to);
         if (t <= 1.f || s.pos.y < -1000.f) {
             blast(s.pos + (next - s.pos) * std::min(t, 1.f), 30.f, 200.f, to <= tg ? obj : -1);
+            if (particles && s.trail) particles->detach(s.trail);
             shells_.erase(shells_.begin() + long(i));
             continue;
         }

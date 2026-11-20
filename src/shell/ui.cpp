@@ -39,6 +39,7 @@ void Ui::begin(int w, int h) {
     ox_ = std::floor((float(w) - 640.f * s_) * 0.5f);
     oy_ = std::floor((float(h) - 480.f * s_) * 0.5f);
     verts_.clear();
+    blend_ = Blend::Alpha;
     batches_.clear();
     clicked_.clear();
     hot_.clear();
@@ -76,25 +77,32 @@ void Ui::playSound(const std::string& wav, float vol) {
 }
 
 // ---------------------------------------------------------------- drawing primitives
-void Ui::quad(int tex, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, uint32_t c) {
+void Ui::quadPx(int tex, const float* xy, const float* uv, uint32_t c) {
     if (verts_.size() + 6 > 65536) return;
-    if (batches_.empty() || batches_.back().texture != tex) {
+    bool add = blend_ == Blend::Add, mul = blend_ == Blend::Multiply;
+    if (batches_.empty() || batches_.back().texture != tex || batches_.back().additive != add || batches_.back().multiply != mul) {
         DrawBatch b;
         b.texture = tex;
         b.first = uint32_t(verts_.size());
         b.blend = true;
+        b.additive = add, b.multiply = mul;
         batches_.push_back(b);
     }
-    auto v = [&](float x, float y, float u, float w) {
+    auto v = [&](int i) {
         Vertex o{};
-        o.pos[0] = x, o.pos[1] = y;
-        o.uv[0] = u, o.uv[1] = w;
+        o.pos[0] = xy[2 * i], o.pos[1] = xy[2 * i + 1];
+        o.uv[0] = uv[2 * i], o.uv[1] = uv[2 * i + 1];
         o.color[0] = uint8_t(c >> 24), o.color[1] = uint8_t(c >> 16), o.color[2] = uint8_t(c >> 8), o.color[3] = uint8_t(c);
         verts_.push_back(o);
     };
-    v(x0, y0, u0, v0), v(x1, y0, u1, v0), v(x1, y1, u1, v1);
-    v(x0, y0, u0, v0), v(x1, y1, u1, v1), v(x0, y1, u0, v1);
+    v(0), v(1), v(2);
+    v(0), v(2), v(3);
     batches_.back().count += 6;
+}
+
+void Ui::quad(int tex, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, uint32_t c) {
+    const float xy[8] = {x0, y0, x1, y0, x1, y1, x0, y1}, uv[8] = {u0, v0, u1, v0, u1, v1, u0, v1};
+    quadPx(tex, xy, uv, c);
 }
 
 int Ui::texture(const std::string& name, int* w, int* h) {
