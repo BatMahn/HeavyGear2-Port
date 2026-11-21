@@ -183,6 +183,7 @@ void Combat::setSystems(int object, int sensors, int maneuver, uint32_t perks, u
     auto it = units_.find(object);
     if (it == units_.end()) return;
     it->second.sensors = sensors, it->second.maneuverStat = maneuver, it->second.perks = perks, it->second.flaws = flaws;
+    it->second.maneuverNow = maneuver;
 }
 
 float Combat::aimSpread(int shooter, int target) const {
@@ -238,6 +239,12 @@ void Combat::addUnit(int object, const GearDef& def) {
     u.hp = u.maxHp = hp;
     u.fireControl = def.fireControl;
     u.sensors = def.sensors, u.maneuverStat = def.maneuverability, u.perks = def.perks, u.flaws = def.flaws;
+    u.maneuverNow = def.maneuverability;
+    u.movement = u.movementBase = std::max(1, def.movement1);
+    {
+        const auto& objs = scene_->mission().objects;
+        u.gear = object >= 0 && size_t(object) < objs.size() && objs[size_t(object)].type == 0x48;
+    }
     u.damageTexture = def.damageTexture;
     structure_.erase(object);
     for (auto& d : def.damageParts) {
@@ -270,34 +277,16 @@ float Combat::regionHealth(int object, char region) const {
 }
 
 float Combat::mobility(int object) const {
+    // criticals take the Movement stat down (FUN_10062430 0x80 / 0x100 / 0x40000 / 0x8000), and vmax is Movement x 6
+    // km/h, so the body's speed scales with what is left of it
     auto it = units_.find(object);
-    if (it == units_.end()) return 1.f;
-    float m = wading(object, scene_->mission().waterLevel);
-    if (space_ && !zeroG(object)) m *= 0.75f;  // footing in low gravity, unless built for Zero-G Movement
-    for (char leg : {'L', 'l'}) {
-        bool lost = false;
-        for (auto& p : it->second.parts)
-            if (p.region == leg && p.gone) lost = true;
-        if (lost) m -= 0.35f;
-    }
-    m *= 0.4f + 0.15f * float(std::max(0, it->second.mobility));  // critical hits on the drive system
-    return std::max(0.2f, std::min(1.f, m));
+    if (it == units_.end() || it->second.movementBase <= 0) return 1.f;
+    return float(it->second.movement) / float(it->second.movementBase);
 }
 
-float Combat::wading(int object, float waterLevel) const {
-    Vec3 p;
-    if (waterLevel <= 0 || !scene_->objectPosition(object, p)) return 1.f;
-    float depth = waterLevel - p.y;
-    if (depth <= 1.f) return 1.f;
-    return amphibious(object) ? 1.f : std::max(0.45f, 1.f - 0.08f * depth);
-}
-
-float Combat::manoeuvre(int object) const {
+int Combat::maneuverNow(int object) const {
     auto it = units_.find(object);
-    if (it == units_.end()) return 1.f;
-    // turn rate scales with the Maneuverability rating, 0.6 + 0.05 x rating (FUN_1003aaf0); 1 at rating 0
-    float rating = std::max(0.5f, (0.6f + 0.05f * float(it->second.maneuverStat)) / 0.6f);
-    return std::max(0.2f, float(it->second.manoeuvre + 5) / 5.f) * rating;
+    return it == units_.end() ? 0x7fff : it->second.maneuverNow;
 }
 
 bool Combat::weaponBroken(int object, int index) const {
@@ -308,6 +297,7 @@ bool Combat::weaponBroken(int object, int index) const {
 bool Combat::sensorsOkRaw(int object) const {
     auto it = units_.find(object);
     if (it == units_.end()) return true;
+    if (it->second.sensorsLost) return false;
     for (auto& p : it->second.parts)
         if (p.system == 3 && p.gone) return false;
     return true;
@@ -316,6 +306,7 @@ bool Combat::sensorsOkRaw(int object) const {
 bool Combat::sensorsOk(int object) const {
     auto it = units_.find(object);
     if (it == units_.end()) return true;
+    if (it->second.sensorsLost) return false;    // FUN_100622b0 took the sensors (and the backup)
     if (it->second.perks >> 5 & 1) return true;  // Backup Sensors
     for (auto& p : it->second.parts)
         if (p.system == 3 && p.gone) return false;
@@ -361,6 +352,39 @@ float Combat::range(int shooter) const {
     auto it = units_.find(shooter);
     if (it == units_.end() || it->second.loadout.empty()) return 0;
     return it->second.loadout[size_t(it->second.selected)].def->maxRange;
+}
+
+int Combat::autoBurst(int shooter) const {
+    auto it = units_.find(shooter);
+    if (it == units_.end() || it->second.loadout.empty()) return 1;
+    return std::max(1, it->second.loadout[size_t(it->second.selected)].def->autoBurst);
+}
+
+float Combat::firepower(int object) const {
+    auto it = units_.find(object);
+    if (it == units_.end()) return 0;
+    float sum = 0;
+    for (auto& l : it->second.loadout)
+        if (l.def && l.ammo != 0) sum += l.def->damage;
+    return sum;
+}
+
+float Combat::hitpoints(int object) const {
+    auto it = units_.find(object);
+    return it == units_.end() ? 0.f : std::max(0.f, it->second.hp);
+}
+
+float Combat::muzzleVelocity(int shooter) const {
+    auto it = units_.find(shooter);
+    if (it == units_.end() || it->second.loadout.empty()) return 0;
+    const Loadout& l = it->second.loadout[size_t(it->second.selected)];
+    return l.def && l.def->type != 2 ? l.def->velocity : 0.f;
+}
+
+int Combat::ammoLeft(int shooter) const {
+    auto it = units_.find(shooter);
+    if (it == units_.end() || it->second.loadout.empty()) return 0;
+    return it->second.loadout[size_t(it->second.selected)].ammo;
 }
 
 float Combat::chooseWeapon(int shooter, float dist) {
@@ -430,7 +454,10 @@ bool Combat::fire(int shooter, const Vec3& muzzle, const Vec3& aim) {
     Loadout& l = it->second.loadout[size_t(it->second.selected)];
     if (l.cooldown > 0 || l.ammo == 0 || weaponBroken(shooter, it->second.selected)) return false;
     const WeaponDef& w = *l.def;
+    // the weapon's cadence (FUN_100ece00 / FUN_100ef270 / FUN_100ecd40): Next_Round_Time between rounds; after Burst
+    // rounds a NextBurst pause, after which Next_Round_Time runs again
     l.cooldown = std::max(0.03f, w.nextRoundTime);
+    if (w.burst > 0 && ++l.burstCount >= w.burst) l.burstCount = 0, l.cooldown += std::max(0.f, w.nextBurst);
     it->second.firedAt = clock_;
     if (l.ammo > 0) l.ammo--;
     shotsBy[shooter]++;
@@ -530,24 +557,27 @@ void Combat::impact(const Vec3& p, const WeaponDef& w, int object, int shooter, 
     auto sh = units_.find(shooter);
     if (sh != units_.end()) fc = std::max(-6, std::min(4, sh->second.fireControl));
     float d = w.damage * 10.f * kFireControl[fc + 6] * scale;
-    // blast weapons also hurt whatever is near the impact (Collateral_Radius), falling off with distance
+    // haywire rounds (FUN_100f3da0) carry the 0x40 flag and the critical mask 0x35; everything else 0xe
+    const bool haywire = w.type == 0x84;
+    const uint32_t mask = haywire ? 0x35u : 0xeu;
+    // the explosion (FUN_100f3140 with the weapon's Collateral_Radius, damage by FUN_100f3430): everything else
+    // within the radius takes the same damage, delayed by its distance / 60
     if (w.collateralRadius > 1.f) {
         const auto& objs = scene_->mission().objects;
         for (size_t i = 0; i < objs.size(); i++) {
             if (int(i) == object || (!units_.count(int(i)) && !structure_.count(int(i)))) continue;
             Vec3 q;
             if (!scene_->objectPosition(int(i), q) || scene_->objectHidden(int(i))) continue;
-            float dist = length(q + Vec3(0, 2, 0) - p);
-            if (dist < w.collateralRadius) applyDamage(int(i), shooter, d * 0.5f * (1.f - dist / w.collateralRadius), p);
+            float dist = length(q - p);
+            if (dist <= w.collateralRadius) blasts_.push_back({int(i), dist / 60.f, d, p, shooter, mask, haywire});
         }
     }
     if (object < 0 || size_t(object) >= damage.size()) return;
     if (audio && !explosive(w)) audio->play("hitbull6.wav", 0.5f, &p, 200.f);
-    if (w.type == 0x84 && field(object, 0, 17, 1)) d *= 0.25f;  // Haywire Resistant shrugs off the haywire effect (FUN_100594b0)
-    applyDamage(object, shooter, d, p);
+    applyDamage(object, shooter, d, p, mask, haywire);
 }
 
-void Combat::applyDamage(int object, int shooter, float d, const Vec3& p) {
+void Combat::applyDamage(int object, int shooter, float d, const Vec3& p, uint32_t mask, bool haywire) {
     if (object < 0 || size_t(object) >= damage.size() || d <= 0) return;
     damage[size_t(object)] += d;
     const MissionObject& o = scene_->mission().objects[size_t(object)];
@@ -571,74 +601,51 @@ void Combat::applyDamage(int object, int shooter, float d, const Vec3& p) {
         return;
     }
     int level = 2;
-    if (shooter < 0 && object >= 0) {  // terrain heat: Heat Resistant Armor levels and hostile-environment protection
-        d /= 1.f + float(un.perks >> 18 & 15);
-        if (un.perks >> 22 & 3) d *= 0.5f;
-    }
-    {
-        int reinforced = 0, weak = 0;  // Reinforced Armor per facing (2 bits x 4), Weak Facing (1 bit x 4)
-        for (int k = 0; k < 4; k++) reinforced += int(un.flaws >> (2 * k) & 3), weak += int(un.flaws >> (28 + k) & 1);
-        d *= std::max(0.5f, 1.f - 0.04f * float(reinforced)) * (1.f + 0.1f * float(weak));
-    }
     if (!un.invincible) {
+        // FUN_100f3630: the hit's direction against the unit's axes; within 60 deg of its fore-aft axis it is a
+        // front / back hit (word bits 1 / 2), otherwise a side hit (8 / 4)
+        int dirBit = 0;
+        {
+            Vec3 tp, src = p;
+            if (shooter >= 0 && shooter != object) scene_->objectPosition(shooter, src);
+            Vec3 back, side;
+            if (scene_->objectPosition(object, tp) && scene_->objectAxis(object, 2, back) && scene_->objectAxis(object, 0, side)) {
+                Vec3 dv = tp - src;
+                if (length(dv) > 1e-3f) {
+                    dv = normalize(dv);
+                    float fb = dot(dv, back);
+                    dirBit = std::fabs(fb) >= 0.5f ? (fb < 0 ? 1 : 2) : (dot(dv, side) < 0 ? 8 : 4);
+                }
+            }
+        }
         float before = un.hp, A = un.hp, lost = 0;
+        // the facing's Reinforced Armor level adds 2 per level to the armour the hit is measured against (+0xc34)
+        if (dirBit) {
+            int k = dirBit == 1 ? 0 : dirBit == 2 ? 1 : dirBit == 4 ? 2 : 3;
+            A += 2.f * float(un.flaws >> (2 * k) & 3);
+        }
         bool kill = false;
-        int critical = -1;  // 0 heavy roll, 1 medium roll
+        uint32_t crit = 0;
         if (!un.armoured) {
             lost = d;
-        } else if (d >= 6.f * A) {
-            kill = true;
-        } else if (d >= 3.f * A) {
-            lost = 20.f, level = 4, critical = 0;
-        } else if (d >= 2.f * A) {
-            lost = 10.f, level = 3, critical = 1;
-        } else if (d >= 0.2f * A) {
-            lost = 5.f;
-        }
-        if (critical >= 0) {
-            // critical hit roll: mobility -1/-2, manoeuvre -1/-2, a weapon knocked out, or the gear destroyed
-            int r;
-            // exposed systems (flaws) make criticals worse (FUN_100618a0 adds them to the roll)
-            int exposed = int(un.flaws >> 20 & 1) + int(un.flaws >> 22 & 1) + int(un.flaws >> 23 & 1);
-            do r = int(std::lround(float(rand() % 6000) * 0.001f)) + (critical == 0 ? 0 : -1) + exposed;
-            while (r < 0);
-            // perks that take a critical instead (and are used up): Reinforced Chassis / Rugged Movement System for
-            // the drive, Backup Fire Control for the gyro and targeting, Reinforced Crew Compartment for the crew
-            auto absorb = [&](uint32_t& w, int bit) {
-                if (!(w >> bit & 1)) return false;
-                w &= ~(1u << bit);
-                if (object == playerObject_) log.push_back("BACKUP SYSTEM ENGAGED");
-                return true;
-            };
-            if (r <= 1 && (absorb(un.flaws, 8) || absorb(un.perks, 30))) r = -1;
-            else if ((r == 2 || r == 3) && absorb(un.perks, 3)) r = -1;
-            else if (r == 4 && absorb(un.perks, 31)) r = -1;  // Shielded Weapons
-            else if (r >= 5 && (absorb(un.flaws, 9) || absorb(un.perks, 16) || absorb(un.perks, 4))) r = -1;  // crew: compartment, medical, backup life support
-            // heavy criticals also knock out a system a level (FUN_10062180): ECM, ECCM, jump jets, stealth
-            if (critical == 0) switch (rand() % 6) {
-                case 1: dropLevel(un.perks, 10, 3); break;
-                case 2: dropLevel(un.perks, 13, 3); break;
-                case 4: dropLevel(un.perks, 24, 2); break;
-                case 5: dropLevel(un.flaws, 10, 3); break;
-                default: break;
+        } else {
+            // FUN_100618a0 / FUN_10058fd0: D >= 6A destroys, >= 3A heavy, >= 2A medium, >= 0.2A light
+            const int sev = d >= 6.f * A ? 6 : d >= 3.f * A ? 3 : d >= 2.f * A ? 2 : d >= 0.2f * A ? 1 : 0;
+            crit = criticalRoll(object, un, float(sev), mask);
+            // heavy hits on a gear from the front or back knock it over (single player, ECY 0x11 / 0x12)
+            if ((crit & 0x40000000u) && un.gear && !multiplayer && !un.knock && (dirBit == 1 || dirBit == 2))
+                un.knock = dirBit == 1 ? 0x11 : 0x12;
+            level = sev >= 3 ? 4 : sev == 2 ? 3 : 2;
+            float hp0 = un.hp;
+            applyCritical(object, un, crit, kill);
+            // haywire (damage word bit 0x40, FUN_10063460): unless Haywire Resistant (perk bit 17), another critical
+            // roll, and a third with flaw bit 27
+            if (haywire && un.gear && !(un.perks >> 17 & 1) && !kill) {
+                applyCritical(object, un, criticalRoll(object, un, float(sev), mask), kill);
+                if ((un.flaws >> 27 & 1) && !kill) applyCritical(object, un, criticalRoll(object, un, float(sev), mask), kill);
             }
-            switch (r) {
-                case -1: break;
-                case 0: un.mobility = std::max(0, un.mobility - 1); break;
-                case 1: un.mobility = std::max(0, un.mobility - 2); break;
-                case 2: un.manoeuvre = std::max(-4, un.manoeuvre - 1); break;
-                case 3: un.manoeuvre = std::max(-4, un.manoeuvre - 2); break;
-                case 4:
-                    if (!un.broken.empty()) {
-                        size_t k = size_t(rand()) % un.broken.size();
-                        un.broken[k] = true;
-                        if (object == playerObject_) log.push_back("WEAPON DAMAGED");
-                    }
-                    break;
-                default: kill = true; break;
-            }
-            if (object == playerObject_ && r <= 1) log.push_back("DRIVE SYSTEM DAMAGED");
-            if (object == playerObject_ && (r == 2 || r == 3)) log.push_back("GYRO DAMAGED");
+            lost = hp0 - un.hp;
+            un.hp = hp0;
         }
         un.hp = kill ? 0.f : std::max(0.f, un.hp - lost);
         // locate the hit on the damage hierarchy: the nearest surviving part takes the same wear
@@ -667,6 +674,143 @@ void Combat::applyDamage(int object, int shooter, float d, const Vec3& p) {
             if (!particles || !particles->spawn("EXP_HG", p, 1.5f)) flashes_.push_back({p, 0.f, 6.f});
         } else {
             destroyObject(object, p);
+        }
+    }
+}
+
+uint32_t Combat::criticalRoll(int object, Unit& u, float level, uint32_t mask) {
+    // level: 6 destroyed (D >= 6A), 3 heavy (>= 3A), 2 medium (>= 2A), 1 light (>= 0.2A), 0 nothing
+    auto roll = [](int range) { return int(std::lround(float(rand() % range) * 0.001f)); };  // round(0 .. range/1000)
+    const int lv = int(level);
+    if (lv >= 6) return 0x100000;
+    if (lv <= 0) return 0;
+    if (lv == 1) return 0x10000000;
+    const bool heavy = lv >= 3;
+    const uint32_t base = heavy ? 0x40000000u : 0x20000000u;
+    if (!u.gear) {
+        // FUN_10058fd0 (vehicles, turrets): one roll on a single table, a step lower for medium hits
+        for (;;) switch (roll(6000) + (heavy ? 0 : -1)) {
+            case 0: return base | 0x10000;
+            case 1: return base | 0x20000;
+            case 2: return base | 0x800;
+            case 3: return base | 0x1000;
+            case 4: return base | 0x2000;
+            case 5: return 0x80000;
+            case 6: return 0x100000;
+            default: break;
+        }
+    }
+    // FUN_100618a0: a random system group (bit 0 .. 3 medium, 0 .. 4 heavy, rounded), affected only if the
+    // weapon's mask has it; then a roll on that group's table, shifted by the matching Exposed flaw
+    uint32_t P = u.perks, F = u.flaws;
+    uint32_t g = 1u << roll(heavy ? 5000 : 4000);
+    if (!(mask & g)) return base;
+    const int shift = heavy ? 0 : -1;
+    switch (g) {
+        case 1:  // fire control / weapons (Exposed Fire Control, flaw bit 20)
+            for (;;) switch (roll(6000) + int(F >> 20 & 1) + shift) {
+                case 0: case 1: return base | 0x800;
+                case 2: return base | 0x1000;
+                case 3: case 4: return base | 0x2000;
+                case 5:
+                    if (P >> 3 & 1) { u.perks &= ~(1u << 3); return base; }  // Backup Fire Control
+                    return base | 0x4000;
+                case 6: return base | 0x8000;
+                default: break;
+            }
+        case 2:  // movement (Reinforced Chassis flaw-word bit 8 takes it once; Exposed Movement, bit 23)
+            if (F >> 8 & 1) { u.flaws &= ~(1u << 8); return base; }
+            for (;;) switch (roll(6000) + int(F >> 23 & 1) + shift) {
+                case 0: case 1: return base | 0x80;
+                case 2: return base | 0x10000;
+                case 3: return base | 0x20000;
+                case 4: return base | 0x100;
+                case 5: return base | 0x80000;
+                case 6: return base | 0x100000;
+                default: break;
+            }
+        case 4:  // crew (flaw bit 21: knocked down; Reinforced Crew Compartment bit 9, Emergency Medical perk 16)
+            if (!heavy) {
+                if (F >> 21 & 1) return 0x80000;
+                if (F >> 9 & 1) { u.flaws &= ~(1u << 9); return base; }
+                if (P >> 16 & 1) { u.perks &= ~(1u << 16); return base; }
+                return base | 0x40;
+            }
+            if (F >> 9 & 1) { u.flaws &= ~(1u << 9); return base; }
+            return 0x80000;
+        case 8:  // power plant (Rugged Movement System perk 30 takes it once; Exposed Power Plant, flaw bit 22)
+            if (P >> 30 & 1) { u.perks &= ~(1u << 30); return base; }
+            if (!heavy) return base | (F >> 22 & 1 ? 0x100u : 0x80u);
+            return base | (F >> 22 & 1 ? 0x40000u : 0x100u);  // (flaw 22: 0x3ff00 + 0x100 = movement to 1)
+        case 0x10: return base | (heavy ? 0x200 : 0x400);  // auxiliary systems
+        default: return base;
+    }
+}
+
+void Combat::applyCritical(int object, Unit& u, uint32_t bits, bool& kill) {
+    // FUN_10062430 (gears) / FUN_10059240 (other units), lowest bit first
+    auto msg = [&](const char* m) { if (object == playerObject_) log.push_back(m); };
+    auto fc = [&](int step) { u.fireControl = std::max(-5, u.fireControl - step); };
+    auto immobile = [&]() { u.movement = 1; };
+    for (uint32_t b = 1; b && bits; b <<= 1) {
+        if (!(bits & b)) continue;
+        bits &= ~b;
+        switch (b) {
+            case 0x80: u.movement = std::max(1, u.movement - 1), msg("DRIVE SYSTEM DAMAGED"); break;
+            case 0x100: u.movement = std::max(1, u.movement >> 1), msg("DRIVE SYSTEM DAMAGED"); break;
+            case 0x200:  // FUN_100622b0: one system lost entirely
+                for (;;) {
+                    int r = int(std::lround(float(rand() % 7000) * 0.001f));
+                    if (r == 1) { u.perks &= ~(7u << 10); break; }                      // ECM
+                    if (r == 2) { u.perks &= ~(7u << 13); break; }                      // ECCM
+                    if (r == 3) { if (u.perks >> 4 & 1) u.perks &= ~(1u << 4); else u.flaws &= ~(1u << 14); break; }
+                    if (r == 4) { u.perks &= ~(3u << 24); break; }                      // jump jets
+                    if (r == 5) { if (u.perks >> 5 & 1) u.perks &= ~(1u << 5); else u.sensorsLost = true; break; }
+                    if (r == 6) { u.flaws &= ~(7u << 10); break; }                      // stealth
+                    if (r == 7) { if (u.perks >> 2 & 1) u.perks &= ~(1u << 2); else u.commsLost = true; break; }
+                }
+                break;
+            case 0x400:  // FUN_10062180: one system down a level
+                for (bool done = false; !done;) {
+                    int r = int(std::lround(float(rand() % 7000) * 0.001f));
+                    done = true;
+                    if (r == 1) dropLevel(u.perks, 10, 3);
+                    else if (r == 2) dropLevel(u.perks, 13, 3);
+                    else if (r == 4) dropLevel(u.perks, 24, 2);
+                    else if (r == 6) dropLevel(u.flaws, 10, 3);
+                    else if (r == 0 || r == 7) done = false;
+                }
+                break;
+            case 0x800: fc(1), msg("FIRE CONTROL DAMAGED"); break;
+            case 0x1000: fc(u.fireControl < -3 ? 1 : 2), fc(1), msg("FIRE CONTROL DAMAGED"); break;
+            case 0x2000:
+                if (u.gear && (u.perks >> 31 & 1)) { u.perks &= ~(1u << 31); break; }  // Shielded Weapons
+                if (!u.broken.empty()) {
+                    u.broken[size_t(rand()) % u.broken.size()] = true;
+                    msg("WEAPON DAMAGED");
+                } else if (!u.gear && u.maneuverNow > 0) {
+                    u.maneuverNow--;
+                }
+                break;
+            case 0x4000: fc(1), fc(1), msg("FIRE CONTROL DAMAGED"); break;
+            case 0x8000:  // cockpit (Backup Life Support perk bit 0 takes it once)
+                if (u.perks & 1) { u.perks &= ~1u; break; }
+                if ((u.flaws >> 24 & 1) ? (rand() & 2) != 0 : (rand() & 1) == 0) kill = true;
+                else immobile(), msg("DRIVE SYSTEM DAMAGED");
+                break;
+            case 0x10000: if (u.maneuverNow > 0) u.maneuverNow--; msg("GYRO DAMAGED"); break;
+            case 0x20000: u.maneuverNow -= u.maneuverNow < 2 ? 1 : 2; msg("GYRO DAMAGED"); break;
+            case 0x40000: immobile(); break;
+            case 0x80000:
+                if (!u.gear) { kill = true; break; }
+                if (!multiplayer && !u.knock) u.knock = (rand() & 1) ? 0x13 : 0x14;
+                break;
+            case 0x100000: kill = true; break;
+            // armour: gears -3 / -8 / -25 (FUN_10062430), other units -5 / -10 / -20 (FUN_10059240), on armour x 10
+            case 0x10000000: u.hp = std::max(0.f, u.hp - (u.gear ? 3.f : 5.f)); break;
+            case 0x20000000: u.hp = std::max(0.f, u.hp - (u.gear ? 8.f : 10.f)); break;
+            case 0x40000000: u.hp = std::max(0.f, u.hp - (u.gear ? 25.f : 20.f)); break;
+            default: break;
         }
     }
 }
@@ -849,7 +993,7 @@ void Combat::updateShells(float dt) {
         if ((blasts_[i].wait -= dt) > 0) { i++; continue; }
         Blast b = blasts_[i];
         blasts_.erase(blasts_.begin() + long(i));
-        if (!scene_->objectHidden(b.object)) applyDamage(b.object, -1, b.damage, b.at);
+        if (!scene_->objectHidden(b.object)) applyDamage(b.object, b.shooter, b.damage, b.at, b.mask, b.haywire);
     }
 }
 }  // namespace hg2

@@ -36,7 +36,9 @@ bool Audio::init(const FileSystem& fs) {
     return true;
 }
 
-// Sounds.lst: "Sound_Object { file: x.wav  maximum_Volume: 0..10000  outer_Range: decimetres  EAR_PERF_LOOP ... }"
+// Sounds.lst: "Sound_Object { file: x.wav  channel: n  minimum_Volume / maximum_Volume: 0..10000  outer_Range /
+// inner_Range: centimetres  priority: n  EAR_PERF_DISTANCE  EAR_PERF_LOOP ... }" (FUN_1012d380: a looping sound on a
+// channel below 5 goes to channel 2)
 void Audio::loadSoundList() {
     Bytes b;
     if (!fs_->read("Sounds.lst", b)) return;
@@ -52,7 +54,7 @@ void Audio::loadSoundList() {
         if (h != std::string::npos) line.resize(h);
         auto val = [&](const char* key, float& out) {
             size_t k = line.find(key);
-            if (k != std::string::npos) out = float(atof(line.c_str() + k + strlen(key)));
+            if (k != std::string::npos) out = float(atoi(line.c_str() + k + strlen(key)));  // "%i"
             return k != std::string::npos;
         };
         float v;
@@ -65,17 +67,49 @@ void Audio::loadSoundList() {
             while (q < line.size() && !isspace((unsigned char)line[q])) q++;
             file = upper(line.substr(k, q - k));
         } else if (val("maximum_Volume:", v)) {
-            cur.volume = std::max(0.f, std::min(1.f, v / 10000.f));
+            cur.maxVol = std::min(10000.f, v);
+        } else if (val("minimum_Volume:", v)) {
+            cur.minVol = v;
         } else if (val("outer_Range:", v)) {
-            cur.range = v / 10.f;
+            cur.outer = v / 100.f;
+        } else if (val("inner_Range:", v)) {
+            cur.inner = v / 100.f;
+        } else if (val("channel:", v)) {
+            cur.channel = int(v);
+        } else if (val("priority:", v)) {
+            cur.priority = int(v);
+        } else if (line.find("EAR_PERF_DISTANCE") != std::string::npos) {
+            cur.distance = true;
         } else if (line.find("EAR_PERF_LOOP") != std::string::npos) {
             cur.loop = true;
+            if (cur.channel < 5) cur.channel = 2;
         } else if (line.find('}') != std::string::npos && !file.empty()) {
+            if (cur.loop && cur.channel < 5) cur.channel = 2;
+            cur.volume = cur.maxVol / 10000.f, cur.range = cur.outer;
             infos_[file] = cur;
             file.clear();
         }
     }
     SDL_Log("audio: %zu sound objects from Sounds.lst", infos_.size());
+}
+
+float Audio::earLevel(const SoundInfo& si, float dist) {
+    if (!si.distance || dist <= si.inner) return si.maxVol;
+    if (dist >= si.outer) return si.minVol;
+    float v = si.maxVol - std::floor((dist - si.inner) * (si.maxVol - si.minVol) / std::max(0.01f, si.outer - si.inner));
+    return v >= 10000.f ? 10000.f : v;
+}
+
+float Audio::earAmplitude(float level) {
+    float x = std::max(0.f, std::min(100.f, level / 100.f));
+    float db = -(60.f + x * (-2.73303f + x * (0.0586456f + x * (-0.00058625f + x * 2.131e-06f))));
+    return std::min(1.f, std::pow(10.f, db / 20.f));
+}
+
+float Audio::loopLevel(const std::string& wav, const Vec3& at) const {
+    static const SoundInfo kDefault;
+    const SoundInfo* si = info(wav);
+    return earLevel(si ? *si : kDefault, length(at - listener_));
 }
 
 const Audio::SoundInfo* Audio::info(const std::string& wav) const {
@@ -190,17 +224,18 @@ std::shared_ptr<Audio::Clip> Audio::clip(const std::string& name) {
     return c;
 }
 
-void Audio::gains(float volume, const Vec3* at, float range, float& l, float& r) const {
-    l = r = volume;
+void Audio::gains(float volume, const Vec3* at, const SoundInfo& si, float& l, float& r) const {
+    float level = at ? earLevel(si, length(*at - listener_)) : si.maxVol;
+    float amp = level * volume > 0 ? earAmplitude(level * volume) : 0.f;
+    l = r = amp;
     if (!at) return;
     Vec3 d = *at - listener_;
     float dist = length(d);
-    float att = std::max(0.f, 1.f - dist / range);
-    att *= att;
+    // panning: EAR pans through its registered matrices (RegisterMatrix); not decoded, a plain left / right balance
     // listener faces -Z rotated by yaw; screen right (left-handed view) = (-cos, 0, sin)
     float pan = dist > 0.1f ? dot(d * (1.f / dist), Vec3(-std::cos(yaw_), 0, std::sin(yaw_))) : 0.f;
-    l = volume * att * std::min(1.f, 1.f - pan * 0.6f);
-    r = volume * att * std::min(1.f, 1.f + pan * 0.6f);
+    l = amp * std::min(1.f, 1.f - pan * 0.6f);
+    r = amp * std::min(1.f, 1.f + pan * 0.6f);
 }
 
 bool Audio::play(const std::string& wav, float volume, const Vec3* at, float range) {
@@ -209,12 +244,10 @@ bool Audio::play(const std::string& wav, float volume, const Vec3* at, float ran
     if (!stream_) return fs_ && clip(wav), false;  // no device: still resolve the name (reports missing files)
     auto c = clip(wav);
     if (!c) return false;
-    if (const SoundInfo* si = info(wav)) {
-        volume *= si->volume;
-        if (si->range > 0) range = std::max(range, si->range);
-    }
+    static const SoundInfo kDefault;
+    const SoundInfo* si = info(wav);
     float l, r;
-    gains(volume * effectsVolume, at, range, l, r);
+    gains(volume * effectsVolume, at, si ? *si : kDefault, l, r);
     if (l <= 0.01f && r <= 0.01f) return true;
     std::lock_guard<std::mutex> g(mutex_);
     if (voices_.size() >= 48) {
@@ -232,14 +265,27 @@ int Audio::startLoop(const std::string& wav, float volume) {
     if (!c || c->pcm.size() < 4) return -1;
     std::lock_guard<std::mutex> g(mutex_);
     int id = nextLoop_++;
-    voices_.push_back({c, 0, volume * effectsVolume, volume * effectsVolume, false, id});
+    float a = volume > 0 ? earAmplitude((info(wav) ? info(wav)->maxVol : 10000.f) * volume * effectsVolume) : 0.f;
+    voices_.push_back({c, 0, a, a, false, id});
+    voices_.back().name = wav;
     return id;
 }
 
 void Audio::setLoop(int handle, float volume, const Vec3* at, float range) {
     if (handle < 0) return;
-    float l, r;
-    gains(volume * effectsVolume, at, range, l, r);
+    float l = 0, r = 0;
+    if (volume > 0) {
+        // the loop's own sound object: find it by the voice's clip
+        std::string name;
+        {
+            std::lock_guard<std::mutex> g(mutex_);
+            for (auto& v : voices_)
+                if (v.loop == handle) name = v.name;
+        }
+        static const SoundInfo kDefault;
+        const SoundInfo* si = info(name);
+        gains(volume * effectsVolume, at, si ? *si : kDefault, l, r);
+    }
     std::lock_guard<std::mutex> g(mutex_);
     for (auto& v : voices_)
         if (v.loop == handle) v.l = l, v.r = r;

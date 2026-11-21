@@ -152,6 +152,73 @@ Fixed-size records read whole (`fread`) by the loaders in hg2sim.dll; the detail
   are uninitialised memory from the editor (`PSEDIT`).
 - `.vf` vector fields (7 files) are not used yet.
 
+### Particle system behaviour (decoded for 0.27.x)
+- **Types** (`FUN_10126a30`): +0x100 life, +0x104 extra life (a particle lives `life + rand·var`, `FUN_10125fb0`);
+  +0x108 flags: bit 0 drag, bit 1 gravity, 0x100 additive (material `0x15 | 0x400`); +0x110 drag rate; +0x114 gravity
+  factor, ×9.8 at load and added to the vertical speed (smoke has positive values and rises); the size curve is
+  halved at load (it is the sprite's half-size at scale 1). +0x21c 16 × {u, v} cell origins per frame, +0x29c / +0x2a0
+  cell width / height (negative heights flip); +0x1aac bit 31 = the air velocity is the wind; +0x1ab0 frame cycles over
+  the life (0 in the 0x1ab0-byte files, which keep frame 0). Mode 0 with frames > 1 becomes 11; `MUZZLE_FLASH.PTL` 10.
+- **Motion** (`FUN_10127920`, table at `0x10296ca8` filled by `FUN_10127a50`): index `(flags & 3) | 4 if wind`:
+  0 plain, 1 drag to rest, 2 gravity, 3 drag + gravity, 4/6/8 still, 5 drag toward the wind, 7 wind + gravity; a
+  plain particle slower than 0.01 is still. Wind air = `wind × (1 − on × (b − 128) × gust / 128)`,
+  `b = byte(int(dot(pos, wind)) + phase)`; the phase steps `int(dt × 64)` a frame and the gust switch `on` (starts 1)
+  flips each time `(count & 15)` seconds have passed (count +1 per flip) (`FUN_10124ee0`). At the high setting
+  (`FUN_10127e90` / `FUN_101286b0`) a wind particle within 5 m of the ground bounces its air velocity off the slope
+  ahead (`air += n × (n·air) × −3` when heading into it). Steps are 1/30 s, at most 5 a frame.
+- **Effects** (`FUN_101260c0`): .ped entries {emitter, particle, u32 attach (follows the object passed), f32 scale,
+  scale variance, velocity, velocity variance, cone}; each makes an emitter of scale `(s ± var) × caller scale`; a
+  velocity over 0.01 sets the emitter moving along a random unit vector bent into the cone (cos ≤ 0: negative y
+  scaled by −cos; else x, z × sin and y = |y|). Lone particles at +0x2284 name types no folder ships. Names without
+  a .ped make nothing (`FUN_10124480`).
+- **Emitters** (`FUN_10123480`, `FUN_10123600`, `FUN_10123bd0`): .emt +0x104 shape (0 point, 1 cone shell, 2 ring),
+  +0x108 drag, +0x10c / +0x110 emission time ± variance, +0x124 radius; flags 2 inherit the emitter's velocity, 0x10
+  loop, 0x20 gravity, 0x80 drag, 0x100 the emitter flies. Particles per frame = the rate curve integrated over the
+  emission-time fraction since the last emission (`FUN_10124030`), spread along the emitter's path, capped by the
+  count alive (+0x178, decremented as they die, `FUN_10124180`). Speed `(speed ± var) × speed curve × scale`; shape 1/2
+  offset by `radius × speed curve × scale`.
+- **Drawing** (`FUN_10128ac0`): camera-aligned squares (`FUN_10128fd0`, no spin, no near fade) of half-size
+  `size × scale`; frame `int(age × anim × frames) % frames`; modes 0/11 plain, 1/9 tinted RGB, 2/9 sprites filling the
+  gap to the emitter's previous particle (`FUN_10129230`, `1 + dist / (2 × size)` of them, cells rotating), 3 screen
+  sized (`size² × scale × depth / focal`), 4 flat, 5 flat on the water (+0.1), 6 sprite under water else flat on it,
+  8 sprite above water else flat, 10 attached; others are not drawn.
+
+## Weather (`FUN_100f6c90` .. `FUN_100f8630`, object vtable 0x1014b4d0)
+- `SetWeatherType(t)` (`FUN_100f6e80`): sim +0x50 = No/Rain/Snow_Weather (0x14c..0x14e); a rain or snow object is
+  made and the level reset to 0. `SetWeather(level)` (`FUN_100f6ec0`): the particle setting caps the level
+  (`FUN_100f7110`: low drops the tier, medium caps it at 2); level % 5 picks {rain speed, snow speed, grid side,
+  drops drawn, rain sound}: 1 {60, 4, 5, 500, Envrain2}, 2 {80, 7, 7, 750, Envrain2}, 3 {90, 9, 11, 1000, Envrain1},
+  4 {100, 12, 15, 1500, Envrain1}, 0 off; levels 5..9 add lightning at 100 a second, 10..14 at 600 (`FUN_100f7560`).
+- Drops: an N × N field falling along `normalize(1, −3, 0)` at the speed; each lives 1..3 s (snow 3..5) and starts
+  again at `(32r/N × j, y, −32q/N × j')` (cell r = i % N, q = i / N; j, j' = ±16/N jitter **multiplied** in;
+  y = lifeMin × speed .. 50) (`FUN_100f7a20`); snow wobbles `cos(left / life × 10π) × 0.2` per frame.
+- The field is drawn for every visible terrain tile (`FUN_10096fe0` → `FUN_100f7f00`) at (tile x, tile max height,
+  tile z), up to the frame's allowance. Rain (`FUN_100f8390`): an untextured sliver from the drop 5 m along the fall,
+  1 pixel each side at the far end (640 × 480 terms), white at alpha 20. Over a tile with samples below the water a
+  drop under the surface (+0.08) draws a ring there instead (`FUN_100f8630`, effect2c.tga 0.5..0.75 × 0..0.25, colour
+  0xd2dce6ff, half-size `((1 − left/life) × 0.9)²`). Snow builds its triangle from three points on one line, so the
+  flakes draw nothing.
+- Lightning (`FUN_100f7b50` / `FUN_100f7c40`, rain only): a counter grows by `max(1, int(rate × dt))`; once over
+  0x1fff a strike happens when `rand() + 1 < counter`, then 1000..60000 is taken off (≤ 0x7fff, else 0). The strike is
+  50..180 m from the camera with envthnd1.wav there; the bolt object (`FUN_100f0400`, vtable 0x1014a6a0) is not drawn
+  by the port.
+- Water (`FUN_100a5790`): level = base + sin(Water_Tidal_Rate × t) × 0.09.
+
+## Sound (EAR, `earias.dll` / `earpds.dll` from `Setup\iasinst.exe`)
+- Sounds.lst (`FUN_1012d380`, `%i` fields): defaults minimum 0, maximum 10000, outer 10000, inner 0, channel 1;
+  `EAR_PERF_LOOP` moves a channel below 5 to 2. Positions go to EAR listener-relative × 100 (`FUN_1012bf2e`), so ranges
+  are centimetres.
+- Level at a distance (`earpds FUN_10004504`, EAR_PERF_DISTANCE): maximum inside the inner range, minimum past the
+  outer, linear between. DirectSound volume (`FUN_1001528c`): x = level / 100 (× gain) and
+  `mB = −100 × (60 − 2.73303x + 0.0586456x² − 0.00058625x³ + 2.131e−6x⁴)`.
+- Channels (`FUN_1012e708` → RegisterChannel): 2 (loops) 16 voices at the high sound setting (8 medium, 4 low), 3, 4, 6
+  likewise, 7 and 9 half. Every object plays its own event (`FUN_1012f608`). Which events EAR drops when a channel is
+  full, and its matrix panning, are not decoded.
+- Footsteps (`FUN_10067570` → `FUN_10036310`): the surface's footstep wav else the gear's; unless the foot is under
+  water, FOOT_DUST0/1 by the surface DustIndex in its DustColor (none for other indices), FOOT_RAIN / FOOT_SNOW in rain
+  / snow; at the unit's position, scale = its radius, only radius > 2, within 250 m of the camera, not at the low
+  particle setting.
+
 
 ## Mission blocks decoded in 0.9
 - `0xd2` Surfaces (`crc, size, '{'`): `0xd3 count`, then `0xd6` entries `{0xd4 index, 0xd5 r g b, 0xd7 f32 friction,
@@ -217,12 +284,120 @@ disabled (+0x2b4), destroyed.
 - `INSTACTN.TXT` arena names; `INSTCTNF.TXT` their `.ANN` files (16-byte NUL-padded records).
 - `CREDIT.TXT`: pages split by `<E>`; `<t:font>`, `<p:size>`, `<c:r,g,b>` and their closing tags style the lines.
 
-## Team alert and dozing (0.10)
-- Teams start at defcon 0 (`FUN_100b89e0(0)` in the brain constructor) and step up as alert points pass thresholds
-  (each defcon level selects a 0x44-byte behaviour record), decaying back over time.
-- `AutoSleep(unit, allowed)` (`FUN_10049a10`): with sleeping allowed (the default), every 2 s a unit outside the view
-  frustum and over 300 m (`0x10141f30`) from the camera stops being simulated (`FUN_10049a40`).
+## Team alert and dozing
+- The team object (`FUN_100b8330`) starts at alert level 1 (limits +0x12 = 1, +0x14 = 5; `SetMinDefcon` / `SetMaxDefcon`
+  move them). Each level selects a 0x44-byte behaviour record (`FUN_100b89e0`: team config +0x248 + level × 0x44,
+  filled by `FUN_100bb970`; every brain's +0x14 points at it). Changing level clears the alert points (+0x18) and sets
+  the time left at the level (+0x1c) to the record's +0x38.
+- Alert events (`FUN_100b8900`): points 1 / 10 / 25 / 5 / 25 / 100 / 50 for events 0..6 — 2 a unit entering combat
+  (`FUN_100b9ae0`), 3 an enemy round passing close (`FUN_100553f0`), 4 a unit hit (`FUN_100b82a0`), 5 a unit destroyed
+  (`FUN_10062980`). The time left grows by half the points (up to +0x38); points over the record's +0x3c raise the level.
+  At the end of every brain pass (`FUN_100ba7c0`) the points drain at 0.5 / s and the time left by dt; when it runs out
+  the level drops one.
+- Records (level: sensor reach +0x00 (`FUN_100b8fc0`, clamped 50..400), engage range +0x0c, seconds in view before
+  engaging +0x10, gunner rest +0x18, hit memory +0x1c, post-combat time +0x28, throttle non-combat / combat / post
+  +0x2c..+0x34, time at level +0x38, points to rise +0x3c; +0x40 the engage test `FUN_100bddd0`):
 
+  | lvl | +00 | +0c | +10 | +18 | +1c | +28 | throttle | +38 | +3c |
+  |---|---|---|---|---|---|---|---|---|---|
+  | 0 | 400 | 48 | 0 | 0.1 | 8 | 10 | 1.5 / 1.5 / 1.5 | 1e30 | 1e30 |
+  | 1 | 100 | 64 | 8 | 3 | 5 | 10 | 0.3 / 0.85 / 0.3 | 1e30 | 100 |
+  | 2 | 150 | 80 | 5 | 2.7 | 5 | 10 | 0.4 / 0.85 / 0.5 | 20 | 150 |
+  | 3 | 250 | 120 | 2 | 2 | 10 | 10 | 0.5 / 0.85 / 0.6 | 40 | 100 |
+  | 4 | 300 | 250 | 1 | 1 | 10 | 10 | 0.6 / 0.9 / 0.8 | 30 | 100 |
+  | 5 | 400 | 300 | 0.5 | 0.5 | 20 | 20 | 0.8 / 1.0 / 0.9 | 15 | 1e30 |
+
+  (+0x04, +0x08, +0x14, +0x20, +0x24 are filled too — 1/1/1.5/2/3/1e30, 3/2/2/1/0.5/0, 8/1/8/15/20/30,
+  64/64/120/180/256/1e30, 0.25/0.05/0.25/0.5/2/0.95 — their readers are not traced.)
+- `AutoSleep(unit, allowed)` (`FUN_10049a10`): with sleeping allowed (the default), every 2 s a unit outside the view
+  frustum and over 300 m (`0x10141f30`) from the camera stops being simulated (`FUN_10049a40`). No other exceptions.
+
+## Unit brain (gear +0xd8c, `FUN_100b77a0` defaults; per frame `FUN_100b9ae0`)
+- Defaults: visibility range +0x54 = 250 m (`SetVisibilityRange`), enemy notify range +0x74 = 180 m
+  (`SetEnemyNotifyRange`), friend notify +0x60 = 64 m (`SetFriendlyNotifyRange`), focus +0xbc = 180 m
+  (`SetFocusNotifyRange`). `CanTarget(unit, on)` sets brain +0x1a: whether *other* units may target this one.
+- Perception (`FUN_100ba1c0`): over the sensor's contact list (+0x1cc +0x1e8), same-team units within the visibility
+  range give the nearest friend (+0x5c / +0x64); other-team, targetable units within it whose sensor signal (+0xc50,
+  set by the sensor code `FUN_10111xxx`) reaches their concealment (+0xc2c, 0.15 standing; halved by object flag bit 20)
+  give the nearest enemy (+0x70 / +0x78). The notify events fire when those distances cross the notify ranges. +0x3c
+  counts the time an enemy has been in view, capped at the record's +0x10, and drains at 2 / s.
+- Target (`FUN_100b9300`): a target locked by `Attack` (+0xa4, `FUN_10050440`) is kept; otherwise the target is held
+  for the team's +0x23c (5 s) and then chosen again: the attacker (+0x1e0) if it hit within the record's +0x1c, else
+  by the team's targeting mode (+0x22, default 2: `FUN_100bcaf0`, the contact with the highest
+  `-distance + 5 × Σ loaded weapons' damage + armour points (+0xbec) − 0.5 × last frame's score (+0xd4c)`
+  (`FUN_100502d0`), × 100 when it is showing on the sensors; mode 1 `FUN_100bc9e0` the lowest, mode 0 the nearest),
+  else the nearest contact; with none it looks again in 0.5 s. +0x20 keeps where the target was last seen.
+- Engage (`FUN_100bddd0`): a target showing on the sensors (+0xa5), not holding fire (+0xe6), and: hit within +0x1c, or
+  a friend's attacker within +0x1c (+0x1d8), or a near shot this frame (+0xca), or the nearest enemy within the
+  record's +0x0c, or (unless +0xe7) an enemy in view for the record's +0x10.
+- Modes (+0x44, 0 non-combat, 1 combat, 2 post-combat): 0 → 1 when it engages (alert event 2), 0 → 2 with a target it
+  doesn't engage; in combat a 6 s timer (+0x4c; 2 s for flag +0x194 bit 4 on the user's side) restarts while it
+  engages and its end starts the post mode with the record's +0x28 (+0x50); in post mode engaging cuts the time to 2 s,
+  and when it runs out the unit goes back to combat (engaging) or non-combat. Cinematic mode without
+  `AllowCinematicCombat` holds every brain in mode 0. COMBAT_START (29) / COMBAT_END (30) are raised on entering and
+  leaving mode 1 (`FUN_100b9fe0`, brain +0x48 bit 1).
+- Tactics: on a mode change, or when the tactic's Think returns false, `FUN_100b9510` takes the script's tactic for the
+  mode (combat +0x1a0 `SetCombatTactic`, post +0x1a4, non-combat +0x1a8 `SetNonCombatTactic`; `SetGeneralTactic` sets
+  all three; `Attack` makes HuntTarget the non-combat one) if it applies, else `FUN_100dd910` picks from the class's
+  list for the mode the applying tactic with the highest weight − uses (weights are 0, so the least used; the first
+  registered wins ties) and counts the use; else the default list (combat DefaultRunAway, post DefaultHoldGround,
+  non-combat DefaultPatrol). Class lists (`FUN_100da380`): gear (2) combat GearCombat1, GearCombat3,
+  GearCombatHand2Hand, GearFlankRight, GearFlankLeft / post GearPursue1 / non-combat GearPatrol1; infantry (3)
+  InfantryCombat1, InfantryCover / InfantryPursue1 / InfantryPatrol1; frame (4), mount (5) MountCombat1 /
+  MountPursue1 / MountPatrol1; chicken walker (6) ChickenWalkerCombat1, ChickenWalkerCombat2 / Pursue1 / Patrol1;
+  plane (7); turret (8) TurretCombat1; vehicle (9) TankAttack / JeepPursue / VehiclePatrol1; hover (10)
+  HoverCombat1, HoverFlankRight, HoverFlankLeft, HoverCircle / HoverPursue1 / Pa_t1_c3..Pa_t3_c3. Registered for any
+  class with mode flags (combat, post, non-combat): PathFollow1/2 (1,1,1), FreeRange1, SquadMateFollow / Defend / Guard,
+  ChaseEnemy, HuntUser, HuntTarget (0,1,1), Frontal, FlankRight1/2, FlankLeft1/2, GearCombat2 (1,0,0).
+  Applies (+0x20): most combat tactics need a usable weapon (`FUN_100bc870`: best of `Auto_Burst × damage² − +0x1d0`);
+  GearCombatHand2Hand needs a melee weapon and no target 16 m or more away while a gun is usable (`FUN_100aa8d0`);
+  DefaultRunAway: hit in the last 6 s, out of non-combat mode, or an enemy in view (`FUN_100ab460`).
+- GearCombat1 / InfantryCombat1 / HoverCombat1 / FrameCombat1 (`FUN_100a84d0`, start `FUN_100a8440`: four rounds, a
+  POSITION order with the mode's throttle): each round, with the target in sight: not facing it (75°, +0xa0 bit 4) →
+  TURNTO; in reach (+0xa9): ≥ 32 m 20 % FIREWPN_V 2 s, else a run across its front (its position + its heading × 32 m
+  ± 64 m sideways, MOVETO flags 0x199, 4 s); < 32 m and it isn't facing the unit: 10 % FIREWPN_V, else a 64 m move at
+  90° round it (0xb9, 4 s, backwards); < 32 m and it is facing the unit: the run across; out of reach → MOVETO it
+  (flags 1) until in reach, holding combat (+0x4c = 2). Target out of sight: MOVETO where it was last seen (flags 9),
+  STAND, until it shows.
+- GearCombat3 / HoverCircle (`FUN_100a90e0`): every 2 s it checks there's a weapon; a move (0x109) to where the target
+  was last seen (not in sight / reach), a random point within 32 m (32 m or more away), or 32 m straight away from it
+  (closer), then back to where it started.
+- Order parameters the tactics post (`FUN_100d9620(run, kind, flags, param)`): Flank* MOVETO 0x109 / 0x189, TURNTO 9,
+  FIREWPN_V flags 10, 5 s; TurretCombat1 / TankAttack FIREWPN_V 5 s (TankAttack moves 9); GearCombat2 TURNTO, FIREWPN_V
+  3 s, MOVETO home 1; StandAndShoot FIREWPN_V 4 s; Hand2Hand MOVETO 1 then NOP 3 s; DefaultRunAway MOVETO 0x211 30 s;
+  Pursue / Patrol MOVETO 1, STAND, NOP 3 s; HuntUser / HuntTarget MOVETO 1; SquadMateDefend / Guard MOVETO 1;
+  PathFollow1 MOVE_DIRECT 8, PathFollow2 in combat 0x108.
+
+## Orders and the gunner
+- Executors (`FUN_10039f40` by kind): 0 NOP waits `param` s; 1 STAND (`FUN_10036ea0`) stops; 2 MOVETO (`FUN_100373c0`);
+  6 TURNTO (`FUN_10038490`); 10 FIREWPN_V (`FUN_100371d0`): stops (+0x158(0,0)), makes the order's object the target
+  (`FUN_100503c0`) and holds the trigger (+0x1ac) until the order's `param` runs out or the target dies; 11 FIREWPN_A
+  (`FUN_10036bc0`): holds it for `count × Next_Round_Time + Burst × NextBurst` (weapon +0xec, `FUN_100efd50`).
+- MOVETO flags (+0x28): 1 the goal is the point, 2 the goal is the order's object, 8 hold the trigger every frame while
+  the brain is in combat mode (`FUN_100b7c60`: +0x44 == 1), 0x10 the move ends after `param` s, 0x20 drive backwards,
+  0x100 flip 0x20 once the target is more than 135° (`DAT_10140bd8`) off the nose (latched until it comes back),
+  0x80 the pathfinder's wading flag. The throttle is the brain mode's from the record (`FUN_100b7d00`); the order's
+  `param` is only a time. The gear drives on when the heading is within two turn steps of the goal, else turns on the
+  spot with the throttle at 0. FOLLOW_PATH uses brain +0x1d4 (`SetSpeed`: `kph × 0.278 / top speed`, clamped ±1, or a
+  tactic's POSITION order).
+- Gunner (`FUN_1003ab40` → vtable +0x12c `FUN_1002ef10` while AutoAim +0xe8, whatever the mode, when there is a
+  target): `FUN_10036f10` aims the torso twist and every weapon at the target's lead point (`FUN_100b6960`): its
+  position plus its velocity × flight time × 1.25 (flight time = distance / Bullet_Velocity; none when the velocity is
+  under 1e-5). No random scatter.
+- Whether a held trigger lets a round go (`FUN_10050500`, vtable +0x180, into the weapon's +0xf8): never while holding
+  fire (+0xe6) or without a target; after the burst limit (+0xdc = Auto_Burst, at most the rounds left) the gunner rests
+  (+0xe5) for the record's +0x18 + rand − 0.5 s (`FUN_100b7cd0`); otherwise only with a line of sight (+0xa0 bit 2,
+  `FUN_10053d10`: terrain samples from the first weapon to the target) and the weapon on (+0x118 `FUN_100efaf0`: melee
+  always; else the lead point within Max_Range and within the target's bounding radius (+0x98) of the gun's line,
+  `FUN_100b63f0`), and no same-team or neutral unit nearer than the target + 5 m in the line of fire
+  (`FUN_100b7e00` → `FUN_100bab20` / `FUN_100b64a0`).
+- Weapon cadence (`FUN_100ece00` / `FUN_100ef270` / `FUN_100ecd40`): Next_Round_Time (+0x1a0) between rounds; after
+  Burst (+0x1b0) rounds a NextBurst (+0x1bc) pause, then Next_Round_Time again. Auto_Burst (+0x1b8) is only the AI's
+  burst length and part of the weapon score.
+- Squad commands (`FUN_100d1bc0` for the four mates, +0x128 + i × 0x140): fire at will / return fire / hold fire set
+  brain +0xe7 / +0xe6 (`FUN_100cfd00`: 0 → both clear, 1 → +0xe7, 2 → both); Go To places each mate at its
+  formation offset round the nav point (`FUN_100cef60` → `FUN_100be4f0`, formation tables `FUN_100be020`, scaled by
+  `SetUserSquadSeparation`); Attack / Defend My Target pass the user's target (`+0x24` / `+0x28`).
 
 ## Decoded in 0.11
 - **Terrain surfaces**: each height sample's u16 attribute word carries the surface type in bits 8..10
@@ -270,15 +445,15 @@ waits for the gear's order queue (+0x21c) to drain. The port runs the same machi
 
 | Tactic | Function | Behaviour |
 |---|---|---|
-| GearCombat1 | `FUN_100a84d0` | turn to target; no shot → MOVETO target; ≥32 m: 20 % FIREWPN 2 s else run laterally ±64 m; <32 m: 10 % volley else 64 m sidestep at ±90° |
+| GearCombat1 | `FUN_100a84d0` | four rounds of: turn to target; out of reach → MOVETO it; ≥32 m: 20 % FIREWPN_V 2 s else a run across its front; <32 m: 10 % FIREWPN_V else a 64 m move at 90° (see "Unit brain") |
 | GearCombat2 | `FUN_100a8dd0` | hold home, TURNTO + FIREWPN 3 s when visible, else back to home |
-| GearCombat3 / HoverCircle | `FUN_100a90e0` | re-plan every 2 s to a random point 32 m round the target |
+| GearCombat3 / HoverCircle | `FUN_100a90e0` | a move firing on the way (last seen spot / random point within 32 m / 32 m away), then back to the start point (see "Unit brain") |
 | Flank* | `FUN_100a9ee0` | approach at ±75° (Left1/Right1 ±45°, Left2/Right2 ±90°, Frontal 0°), volley 5 s |
-| Hand2Hand | `FUN_100aacc0` | close to 8 m |
+| Hand2Hand | `FUN_100aacc0` | MOVETO the target, wait 3 s |
 | StandAndShoot | `FUN_100a8ba0` | POSITION by range, TURNTO, FIREWPN 4 s |
 | TurretCombat1 | `FUN_100aaef0` | FIREWPN 5 s |
-| TankAttack | `FUN_100ab040` | 80 % volley 5 s / 20 % reposition |
-| DefaultRunAway | `FUN_100ab550` | turn away, move 30 m |
+| TankAttack | `FUN_100ab040` | in sight: 80 % FIREWPN_V 5 s / 20 % a move firing on the way; else at it |
+| DefaultRunAway | `FUN_100ab550` | drop the target, turn away, MOVETO 30 m away (at most 30 s); the combat default when nothing else applies (no usable weapon) |
 | HuntUser | `FUN_100ab880` | MOVETO the user, re-plan once the user is >128 m from the goal |
 | HuntTarget | `FUN_100aba50` | MOVETO target ±16 m random, re-plan past 64 m |
 | GearPatrol1 / VehiclePatrol / FreeRange | `FUN_100abee0` / `FUN_100af590` / `FUN_100af2f0` | random point round home (64 m), MOVETO, STAND, wait ~3 s |
@@ -465,7 +640,7 @@ Models wider than 200 m (Gomorrah's city, `epl10005.m`) get one grid per mesh. O
   or DAMAGEH (1; anything else → 0) at 1.5× scale to the damage frame or 0.65 × radius above the origin; 0 removes it.
 - **SetGlobalWindVariables(vec, gust)** (`FUN_10124c00`): wind at 0x1026d200, |wind| at 0x10296bb0, gust 0x10296bc8.
   Start-up value (6, 0, 0), gust 1.5 (`FUN_101246e0`). Particles relax toward `wind × (1 − gust × (b − 128) / 128)`
-  with `b = byte(dot(pos, wind) + phase)` at their type's +0x110 rate (`FUN_10127c90`; the port keeps its own drag rate).
+  with `b = byte(dot(pos, wind) + phase)` at their type's +0x110 rate (`FUN_10127c90`).
 - **AutoScan(unit, on)** (`FUN_100d7470` → brain +0xe9; set by default, cleared while a target is assigned
   `FUN_100503c0`, set again on dropping it or AutoPilot): the idle sweep `FUN_10037e30` turns the torso at π/2 rad/s
   (+0x13b8) to yaw goals of `rand × π/2 / 32767` on alternate sides and pitch goals of `rand × 0.3 / 32767`, resting
@@ -534,10 +709,85 @@ Models wider than 200 m (Gomorrah's city, `epl10005.m`) get one grid per mesh. O
 - Geometry names longer than 8.3 (`pAbpg20005.m` S25 / S27, `pAmrd30005.m` H07 / H09 / S27, `pAmbo10005.m` S37,
   `pAbwr10005.m` S27) have no file of that name; the shipped files are the last 8 characters of the base (BPG20005.M,
   MRD30005.M, MBO10005.M, BWR10005.M). The port falls back to that (a heuristic: the original's lookup for these was not
-  traced).
+  traced). Decoded since: the model loader (`FUN_100110f0`) strips the extension and asks the archive
+  (`FUN_10130b20` → `FUN_10130f10` / `FUN_10131370`) with the upper-cased base, and the archive's binary search
+  compares only the first 8 characters (`FUN_101314f0`): "PABPG200" against "BPG20005" matches nothing, and the direct
+  file fallback fails too, so how the original showed these objects is still open; the port keeps the fallback.
 - T05_PATROL1..4 call FollowPath("patrol1".."patrol4"), but T05 only has the paths cam1, user1 and failcam: the original
   data has no such paths either (`FUN_1008c960` finds nothing and the order is skipped).
 - `redbkNNN.wav` cues (TriggerSound in many scripts; Sounds.lst marks them "#CD audio track N") have no files: CD audio.
 - FLARE_LAR (Flash_Effect 5) is missing from every particle folder.
 - S27_GATE1 assigns "gatepth1", which S27 doesn't have (data). Still unsimulated: S22's bldg1frm on a class 0x53 frame
   object and the fountain-spawned VTOL (vtol1path), which AssignPath but aren't units the port moves.
+
+## Gear locomotion, pilot input and criticals (0.27.x physics audit)
+Gear class vtable 0x101434a0. All of this replaces earlier port estimates in `player.cpp` / `combat.cpp`.
+
+**Speeds** (`FUN_10035460`, `FUN_10064700`, `FUN_10063a10`): vmax (+0x270) = Movement (+0xbf8) × 6 × 0.278 m/s
+(DAT_10143408, km/h → m/s); on skates (ECY states 9 / 0x2e / 0x53 / 0x78) the second Movement (+0xbfc) × 6 × 0.278.
+Walk / run boundary +0x10b4 = MaxWalkSpeed, or 0.35 vmax when 0; +0x10b8 = MaxRunSpeed or 0.65 vmax. Criticals lower
+the Movement words, so vmax follows them.
+
+**Pilot input** (`FUN_10063a10`, action names from the key table at `FUN_10135...` init, 0x10297xxx):
+Forward + Backward axis → throttle +0x131c; steering with no axis drives at 0.05; below −0.5 it is held at −0.5.
+Throttle setting +0x1b18: 1/3 (0.333), 2/3 (0.667), Full (1), Increase / Decrease ±0.05 a poll (to 1 / down to 0.05),
+Full Stop (0, forward mode). Reverse Direction toggles +0x1b1c (1 = forward, the initial value). Forward mode: an axis
+in 0 .. setting becomes the setting; reverse mode: axis − setting × 0.5. The result and the steer axis go to vtable
++0x158 (`FUN_1003aaf0`): turn command = steer × (0.6 + 0.05 × Maneuverability +0xbf4), throttle stored at +0xf48.
+Jump → ECY trigger 8 (only on the ground, no thrust left); Jump_Jets → 9 (also needs perk bits 24-25); Crouch → 6;
+Stand_Up → 7; Wheels → request +0x1314 (needs Movement2 > 0), sent as trigger 4 once |v| ≤ 0.25 vmax, the throttle
+held at 0 meanwhile.
+
+**ECY states** (group 0 of four 37-state groups, triggers 24..27 switch groups): 0 stand, 1 walk, 2 run, 3 crouch,
+4 prone, 5 crouch-walk, 6 crawl, 7 skates on → 9 skating (type 2) → 8 skates off → walk, 12 → 13 → 14 Jump (to run),
+15 → 16 → 17 Jump Jets (to run), 18 (trigger 0x10, airborne physics), 19 / 20 heavy-hit falls (0x11 / 0x12),
+21 / 22 knock-downs (0x13 / 0x14); 19 .. 22 are left with Stand Up (7). 23 .. 36 mirror 0 .. 14 for trigger 15
+(the immobilised stance, sent when a critical takes Movement to 1). Each transition's f32 is the playback rate
+(keys a second) of the state it enters.
+
+**Locomotion triggers** (`FUN_10064700`): with |throttle| > 0.05, |v| > 0.01 vmax, a sidestep or any turn → 2 if
+|v| ≤ +0x10b4 else 3; otherwise 1 once. `FUN_10064d20` per state: cycles play at speed / stride (`FUN_100344e0`,
+inverse root travel per loop, 8 when it is ≤ 0.125 m); +0x124a (moving) set for locomotion / posture-walk / jump /
+skate states, clear for stand, crouch, prone and the rest; +0x1249 set for the posture walks (5, 6); skating moves by
+velocity only (no root motion) and leans by the turn rate (+0x13d8, ×0.93 decay, ±0.5).
+
+**Physics** (`FUN_1003af10`, step ≤ 0.1 s, forces × +0xd98 = 1/mass): gravity 20 (DAT_10163ae8, `FUN_1003d1f0`, always);
+drive (20 + 2m) × throttle (+0xf58, `FUN_1003c0b0`); resistance (`FUN_1003c5f0`, ground only) (20 + 2m)(r|r| + 2r
+without throttle), r = v / vmax × 4 with +0x1249, × 10 without +0x124a, velocity scaled by 1/r past r = 2; sideways
+(400 + 30m) v_side / vmax (`FUN_1003c750`); traction cap 2g (`FUN_1003c8f0`). Yaw: torque (20 + 4m) × turn command
+(+0xf50), damping 10 ω (+0x1010, `FUN_1003d390`) and, with no turn input, another 3 ω (`FUN_1003c750`, 30 × −0.1).
+Slope force (`FUN_1003cc30`) only for the player's gear (+0x1f0); AI gears get none. Ground contact: snapped when the
+body is at or under the ground; the grounded flag +0xf78 clears more than 2 m above it (player: 0.5 m). Landing faster
+than 40 m/s down (+0x1080 = 2g) damages the gear in proportion up to 80 m/s (+0x1088 = 4g); the damage value is
+behind an ftol the decompiler lost.
+Jump (`FUN_10064d20` states 13 / 16): thrust timer +0x1070 = 0.45 s (+0x1068) × 0.5 for Jump, the whole 0.45 s for
+Jump Jets (with the JUMP_JET effect, `FUN_10065b00(0)`); while it runs a force (0, 3.5 g, −0.7 g) in the body frame
+(+0x1060 = 3.5): 70 up, 14 forward.
+
+**Criticals, gears** (`FUN_10063460` vtable +0x8c → `FUN_100618a0` → `FUN_10062430`). Damage word = D << 14 | flags;
+the low nibble is the hit direction (`FUN_100f3630`: within 60° of the fore-aft axis 1 / 2, else sides 8 / 4).
+D ≥ 6A destroyed (0x100000); D ≥ 3A heavy (0x40000000; single player: direction 1 / 2 knocks the gear over, ECY
+0x11 / 0x12); D ≥ 2A medium (0x20000000); D ≥ 0.2A light (0x10000000). Medium / heavy pick a system group
+1 << round(rand % 4000 / 1000) (heavy: % 5000), applied only if the caller's mask has it (bullets and explosions 0xe,
+`FUN_100f3430`; haywire 0x35, `FUN_100f3da0`, which also sets flag 0x40). Group tables (roll = round(rand % 6000 /
+1000), −1 for medium, + the Exposed flaw):
+- 1 fire control (flaw 20): 0-1 FC −1 (0x800); 2 FC −2/−3 (0x1000); 3-4 weapon destroyed (0x2000; Shielded Weapons
+  perk 31 absorbs once); 5 FC −2 (0x4000; Backup Fire Control perk 3 absorbs once); 6 cockpit (0x8000).
+- 2 movement (Reinforced Chassis flaw-word bit 8 absorbs once; flaw 23): 0-1 Movement −1 (0x80); 2 Maneuver −1
+  (0x10000); 3 Maneuver −1/−2 (0x20000); 4 Movement halved (0x100); 5 knocked down (0x80000); 6 destroyed.
+- 4 crew: medium: flaw 21 → knocked down; Reinforced Crew Compartment (flaw-word 9) / Emergency Medical (perk 16)
+  absorb; else 0x40 (cockpit shake). Heavy: flaw-word 9 absorbs, else knocked down.
+- 8 power (Rugged Movement System perk 30 absorbs once; flaw 22): medium Movement −1 (halved with the flaw); heavy
+  Movement halved (Movement 1 with the flaw).
+- 0x10: medium 0x400 (`FUN_10062180`: ECM / ECCM / jump jets / sensors / stealth down a level), heavy 0x200
+  (`FUN_100622b0`: one of ECM, ECCM, life support, jump jets, sensors, stealth, comms lost entirely).
+Effects (`FUN_10062430`): Movement words min 1 (at 1 the gear takes trigger 15); Maneuver +0xbf4; fire control
++0xbe8 (min −5, accuracy +0xb90 = clamp((FC + 5) / 8, 0.05, 1)); 0x8000: Backup Life Support (perk 0) absorbs, else
+(rand & 1, or rand & 2 with flaw 24) destroyed or Movement 1; 0x80000: ECY 0x13 / 0x14 (rand & 1) once, single player;
+armour (+0xbec, Armor × 10) −3 / −8 / −25 for light / medium / heavy. Haywire hits (flag 0x40): unless Haywire
+Resistant (perk 17) a 5 s timer (+0xc8c) and a second critical roll, a third with flaw 27; the damage itself is not
+reduced. Non-gear units (`FUN_10058fd0` / `FUN_10059240`): one table (Maneuver −1 / −2, FC −1 / −2, weapon,
+destroyed ×2) and armour −5 / −10 / −20.
+
+**Weapon explosions**: a round with a Collateral_Radius explodes (`FUN_100f3140`); `FUN_100f3430` gives every other
+unit or structure inside the radius the same damage word, delayed by distance / 60 s.

@@ -16,7 +16,7 @@ struct Settings {
     bool externalView = false;   // start missions in the chase view
     bool invertMouse = false;
     float mouseSpeed = 1.0f;     // 0.25 .. 3
-    int particles = 2;           // 0 off, 1 reduced, 2 full
+    int particles = 2;           // the original's particle detail: 0 low, 1 medium, 2 high
     bool fullscreen = false;
     int msaa = 4;                // anti-aliasing samples: 1 (off), 2, 4, 8
     int movieFilter = 0;         // full-screen movies: 0 off, 1 CRT, 2 interlaced

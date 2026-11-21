@@ -1,9 +1,11 @@
-// Unit AI: gears, vehicles and turrets with the brain settings the mission scripts drive (notify ranges,
-// visibility, focus, team alert level / defcon, combat and non-combat tactics, posture, paths), and the
-// brain events the scripts listen for (FUN_100b9fe0). Target selection and fighting are still a simplified
-// stand-in for the original tactic code.
+// Unit AI: gears, vehicles and turrets with the original's brain (FUN_100b9ae0: perception, target selection
+// FUN_100b9300, engagement FUN_100bddd0, the non-combat / combat / post mode machine), the team alert levels with their
+// behaviour records (FUN_100bb970), the tactic table (FUN_100dadc0 / FUN_100dd910) whose Think methods post orders
+// (FUN_100d9620) to the unit's order executors (FUN_10039f40), and the gunner (FUN_1002ef10 -> FUN_10036f10).
+// See docs/FORMATS.md "Unit brain".
 #pragma once
 #include <functional>
+#include <map>
 #include <random>
 #include <string>
 #include <vector>
@@ -37,9 +39,7 @@ public:
         audioHook_ = a;
         for (auto& u : units_) u.body.audio = a, u.body.soundVolume = 0.8f;
     }
-    // Pilot difficulty (the campaign pilot's setting, 0 easy .. 1 hard): how far hostiles see and how well they shoot.
     void setGravity(float g) { for (auto& u : units_) u.body.gravityScale = g; }
-    void setDifficulty(float d) { difficulty_ = d < 0 ? 0.f : d > 1 ? 1.f : d; }
     // Cinematic mode without AllowCinematicCombat: brains don't pick or engage targets (FUN_100b9ae0, +0x521).
     void setCombatHold(bool on) { combatHold_ = on; }
     void setParticles(Particles* p) {
@@ -88,22 +88,33 @@ public:
     }
 
 private:
+    // An order in a unit's queue (FUN_100be7f0 record: +0xc kind, +0x10 state, +0x18 timer, +0x28 flags, +0x30 point /
+    // object). Kinds (FUN_100bdb90): 0 NOP (wait `param` s), 1 STAND, 2 MOVETO, 4 MOVE_DIRECT, 6 TURNTO, 10 FIREWPN_V.
+    // MOVETO flags (FUN_100373c0): 1 goal is the point, 2 goal is the object `obj`, 8 hold the trigger while moving
+    // in combat mode, 0x10 the move ends after `param` s, 0x20 drive backwards, 0x100 flip to backwards while the
+    // target is more than 135 degrees off the nose, 0x80 the pathfinder's wading flag.
+    struct Order {
+        int kind = 0, flags = 0, obj = -1;
+        float param = 0;
+        Vec3 pos;
+        bool started = false;
+        float best = 1e30f, patience = 5.f;  // MOVETO progress watchdog (FUN_100bf300)
+        bool rerouted = false, reverse = false, revLatch = false;
+    };
     struct Unit {
         Player body;
         int object = -1, team = 0, type = 0;
-        bool mobile = true, awake = false;
-        float think = 0, detect = 250;
-        int target = -1;  // object index
+        bool mobile = true;
         bool asleep = false;
-        int forced = -1;            // Attack() target
-        std::vector<Vec3> path;     // FollowPath / AssignPath waypoints
+        int forced = -1;            // Attack() / squad Attack target, kept (brain +0xa4) until it dies
+        std::vector<Vec3> path;     // FollowPath / goto waypoints
         size_t pathIdx = 0;
         std::vector<Vec3> route;    // the last path given: PathFollow1/2 keep walking it
-        int routeIdx = -1, routeDir = 1;
+        int routeIdx = -1;
         bool hop = false, assigned = false;
         float freeRadius = 0;       // ActivateFreeRange radius (+0x1ac)
         bool freeRange = false;
-        float guardBest = 1e30f;    // SquadMateGuard: nearest it has been to the point           // the current path is one PathFollow hop (no path-end event)
+        float guardBest = 1e30f;    // SquadMateGuard: nearest it has been to the point
         Vec3 leaderLast;            // SquadMateFollow: where the leader was last frame
         bool following = false;
         std::vector<Vec3> detour;   // route round an obstacle to detourGoal (planRoute)
@@ -112,24 +123,44 @@ private:
         float detourCheck = 0;
         bool wantRoute = false;
         bool pathPaused = false;
-        float speedFrac = 1.f;      // SetSpeed relative to maximum
-        // brain settings
-        float enemyRange = 0, friendRange = 0;
-        int enemyNear = -1, friendNear = -1, attacker = -1, lookAt = -1;
+        float speedSet = -1;        // SetSpeed throttle (brain +0x1d4, FUN_100d8790); < 0: the mode's throttle
+        // brain (gear +0xd8c)
+        float visRange = 250.f;     // SetVisibilityRange (+0x54, default 250 m)
+        float enemyRange = 180.f;   // SetEnemyNotifyRange (+0x74, default 180 m)
+        float friendRange = 64.f;   // SetFriendlyNotifyRange (+0x60, default 64 m)
+        int target = -1;            // +0x84
+        float targetHold = 0;       // +0x88: seconds before the target is chosen again
+        int nearEnemy = -1, nearFriend = -1;  // +0x70 / +0x5c
+        float nearEnemyDist = 1e30f, nearFriendDist = 1e30f;  // +0x78 / +0x64
+        float seen = 0;             // +0x3c: how long an enemy has been in view
+        int attacker = -1;          // +0x1e0
+        float hitAgo = 1e30f;       // +0x1e4: seconds since it was hit
+        bool heardShot = false;     // +0xca: an enemy round passed close this frame
+        bool exposed = false;       // +0xa5: the target shows up on the sensors
+        bool los = false;           // +0xa0 bit 2: line of sight to the target
+        bool inRange = false;       // +0xa9: within the selected weapon's range
+        bool facing = false;        // +0xa0 bit 4: the target within 75 degrees of the nose
+        bool targetFacing = false;  // +0xa0 bit 5: the unit within 75 degrees of the target's nose
+        float targetDist = 0;       // +0x90
+        float losCheck = 0;
+        Vec3 lastKnown;             // +0x20: where the target was last seen
+        int mode = 0;               // +0x44: 0 non-combat, 1 combat, 2 post-combat
+        float combatTimer = 0;      // +0x4c
+        float postTimer = 0;        // +0x50
+        bool holdFire = false;      // +0xe6: never engage (squad Hold Fire)
+        bool noSeenEngage = false;  // +0xe7: don't engage just for having seen an enemy a while
         bool enemyIn = false, friendIn = false, inCombat = false;
-        float calm = 0;             // seconds without a target while in combat
         float clock = 0;
         Vec3 lastTargetPos;
-        // the original's tactic layer (hg2sim FUN_100dadc0 table, Think methods FUN_100a84d0 ...): a combat tactic
-        // runs a small state machine that posts orders; the orders drive the body; a gunner fires on its own
-        struct Order { int kind = 0; Vec3 pos; float speed = 0, timer = 0, best = 1e30f, patience = 5.f; bool rerouted = false; };  // kind: 0 none, 1 stand, 2 move, 6 turn, 10 volley, 99 wait
-        Order ord;
-        std::string tactic;         // the combat tactic running ("" = none chosen yet)
-        int step = 0, count = 0;
-        float replan = 0, tacTimer = 0;
-        Vec3 point, goal, home;
-        bool visible = false, engaged = false;       // target in sight (terrain line)
         int lastTarget = -1;
+        // the tactic running (FUN_100ddbd0 run record: +8 step, +0xc timer, +0x18 counter) and its order queue
+        std::string tactic;
+        int tacMode = -1;
+        int step = 0, count = 0;
+        float tacTimer = 0;
+        Vec3 point, home, goalPos;
+        int lookAt = -1;
+        std::vector<Order> orders;
         bool canTarget = true;
         int drive = 0;              // Forward / Backward
         bool braked = false;        // FullBrake
@@ -137,18 +168,17 @@ private:
         bool dozing = false;
         float dozeCheck = 0;
         int leader = -1;            // squad formation
-        float blocked = 0;          // seconds the target has been out of the line of fire
         int order = 0, orderObj = -1;  // squad command (SquadOrder) and its object
         Vec3 orderPos;
-        float disengage = 0;        // Regroup: no fighting for a few seconds
-        bool scriptStance = false;  // the script set posture / skates: leave them alone
-        bool autoSkates = false, autoKneel = false;
-        float stuckClock = 0, unstick = 0;  // no progress while driving: back off and turn
-        Vec3 stuckFrom;
+        bool scriptStance = false;  // the script set posture / skates
         Vec3 slot;
         std::string combatTactic, nonCombatTactic;
         bool cinematic = false;     // SetCinematicControl(unit): script-driven, no targets of its own (brain +0x198)
-        bool autoAim = true;        // AutoAim (brain +0xe8): the gunner tracks and shoots its target
+        bool autoAim = true;        // AutoAim (brain +0xe8): the gunner tracks its target
+        bool trigger = false;       // the trigger is held this frame (gear +0xbc9)
+        bool resting = false;       // +0xe5: the burst is over, the gunner rests +0xe0 seconds
+        float restTimer = 0;        // +0xe0
+        int burstLimit = -1, burstFired = 0;  // +0xdc (Auto_Burst, at most the rounds left) / weapon +0x1e8
         bool arc = false;           // SetWeaponConstraints on a turret (FUN_100ec400): yaw limits about its placement
         float arcMin = 0, arcMax = 0, arcHome = 0;  // radians, positive = to the right of the placement
         // turret gun elevation limits (pitch joint JXA): +-30 degrees from the turret's setup (FUN_100eb0c0) until
@@ -160,6 +190,24 @@ private:
         int lastTarget2 = -1;
         float scanGoal = 0, scanPause = 0;
     };
+    // Team alert (the team object FUN_100b8330): defcon level (+0x244, starts at 1, limits +0x12 / +0x14 = 1 / 5),
+    // alert points (+0x18) and the time left at this level (+0x1c).
+    struct Team {
+        int defcon = 1, minDefcon = 1, maxDefcon = 5;
+        float points = 0, timer = 1e30f;
+    };
+    void setLevel(int team, int level);
+    void alertEvent(int team, int event);  // FUN_100b8900
+    int unitClass(const Unit& u) const;    // tactic table class (FUN_100da380)
+    bool tacticApplies(const Unit& u, const std::string& t, int mode) const;
+    std::string pickTactic(Unit& u, int mode);
+    bool think(Unit& u, float dt);           // the running tactic's Think; false = finished
+    void post(Unit& u, int kind, int flags, float param, const Vec3& pos = Vec3(), int obj = -1);
+    float modeThrottle(const Unit& u) const;  // FUN_100b7d00: the team record's throttle for the brain mode
+    void setThrottle(const Unit& u, PlayerInput& in, float throttle) const;
+    std::map<std::string, int> tacticUses_;
+    std::map<int, bool> untargetable_;        // CanTarget(unit, 0): brain +0x1a clear, others skip it
+    bool targetable(int object) const { auto it = untargetable_.find(object); return it == untargetable_.end() || !it->second; }   // FUN_100dd910's per-tactic use counts (+0x14)
     void scan(Unit& u, float dt);
     Unit* find(int object);
     const Unit* find(int object) const;
@@ -190,11 +238,8 @@ private:
     const FileSystem* fs_ = nullptr;
     Audio* audioHook_ = nullptr;
     Particles* particlesHook_ = nullptr;
-    int defcon_[16], minDefcon_[16], maxDefcon_[16];
+    Team teams_[16];
     float viewDist_ = 0;
-    float difficulty_ = 0.5f;
-    float alert_[16];
-    void raiseAlert(int team, float points);
 };
 
 }  // namespace hg2

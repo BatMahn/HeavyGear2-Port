@@ -10,7 +10,7 @@ installation needed).
 
 See [CHANGELOG.md](CHANGELOG.md) for what each release changed.
 
-## Status (v0.27.2) — the whole single-player game
+## Status (v0.28.0) — the whole single-player game
 
 The game now starts in the original shell, drawn from the game's own layouts and artwork:
 
@@ -373,7 +373,9 @@ Controls (the original numeric-pad layout works too, so the training messages ma
 
 | Action | Keys |
 |---|---|
-| Throttle / turn | `W` `S` `A` `D` or pad `8` `2` `4` `6`; hold `Shift` to run |
+| Forward / back, turn | `W` `S` `A` `D` or pad `8` `2` `4` `6` (held: full forward; turning alone drives at a crawl) |
+| Throttle setting (the original's) | `,` 1/3, `.` 2/3, `/` full, `=` / `-` up / down, `0` full stop, `Backspace` reverse |
+| Jump jets (gears with the perk) | `J` |
 | Sidestep | `Q` / `E` or pad `7` / `9` |
 | Posture down / up (stand → kneel → prone) | `Z` / `X` or pad `/` / `*` |
 | Jump | `Space` or pad `Enter` |

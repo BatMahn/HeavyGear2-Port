@@ -349,10 +349,12 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
                     if (!on) lightsOff.push_back(int(i));
                 }
         }
-        int weatherType = 0, weatherPreset = 0;
-        void weather(int type, int preset) override {
-            if (type >= 0) weatherType = type;
-            if (preset >= 0) weatherPreset = preset;
+        Particles* particles = nullptr;
+        void weather(int type, int level) override {  // SetWeatherType / SetWeather
+            if (getenv("HG2_DEBUG")) SDL_Log("weather type %d level %d", type, level);
+            if (!particles) return;
+            if (type >= 0) particles->setWeatherType(type);
+            if (level >= 0) particles->setWeatherLevel(level);
         }
         int endCode = -1;
         float endDelay = 0;
@@ -372,6 +374,7 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
     scripts.load(scene.mission(), &err);
     Player player;
     bool chase = player.init(fs, scene) && !camSet;
+    player.pilot = true;
     float camPitch = 0.25f, camOrbit = 0;
     if (player.active() && T.startX >= 0) {
         player.teleport(Vec3(T.startX, 0, T.startZ));
@@ -379,6 +382,7 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
     }
     Combat combat;
     if (player.active()) combat.init(fs, scene, player.def(), player.object());
+    combat.multiplayer = setup.net != nullptr;
     if (player.active() && getenv("HG2_FOOTDBG")) SDL_Log("player object %d", player.object());
     if (player.active() && !setup.player.weapons.empty()) combat.setLoadout(player.object(), setup.player.weapons);
     if (player.active() && setup.player.armor > 0) combat.setStats(player.object(), setup.player.armor, setup.player.fireControl);
@@ -386,7 +390,6 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
         combat.setSystems(player.object(), setup.player.sensors, setup.player.maneuver, setup.player.perks, setup.player.flaws);
     AiSystem ai;
     if (player.active()) ai.init(fs, scene, combat, player);
-    ai.setDifficulty(setup.difficulty);
     combat.setSpace(setup.space);
     if (setup.space) player.gravityScale = 0.35f, ai.setGravity(0.35f);
     world.ai = &ai;
@@ -407,7 +410,6 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
     world.combat = &combat;
     world.player = player.object();
     world.pl = &player;
-    if (const char* w = getenv("HG2_WEATHER")) sscanf(w, "%d,%d", &world.weatherType, &world.weatherPreset);  // test
     FountainSystem fountains;
     fountains.init(scene.mission());
     world.fountains = &fountains;
@@ -469,14 +471,19 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             const GearChoice& eg = setup.enemies[i].gear;
             if (eg.hasSystems) combat.setSystems(idx, eg.sensors, eg.maneuver, eg.perks, eg.flaws);
             ai.command(idx, "nonCombatTactic", 0, 0, 0, "hunt");
+            ai.setAutoSleep(idx, false);  // the waves come at the user from out of view
             waveUnits.push_back(idx);
         }
         ai.setDefcon(userTeam + 1 - 99, 5, 0);
         wave++;
         banner = "WAVE " + std::to_string(wave) + " OF " + std::to_string(setup.waves), bannerUntil = scripts.time() + 4.f;
     };
-    // ambient sound objects: buildings / props whose definition names a looping sound (Sounds.lst EAR_PERF_LOOP)
-    struct Ambient { int object; std::string wav; float range; int handle = -1; };
+    // ambient sound objects: buildings / props whose definition names a looping sound (Sounds.lst EAR_PERF_LOOP).
+    // Every object plays its own instance (FUN_1012f608 makes one EAR event per object), at EAR's level for its
+    // distance; looping sounds share EAR channel 2, registered with 16 voices at the high sound setting
+    // (FUN_1012e708 -> RegisterChannel(2, 0x10, .., 16 << 16)). Which voices EAR keeps when more are due is not
+    // decoded: the port keeps the 16 loudest.
+    struct Ambient { int object; std::string wav; int handle = -1; };
     std::vector<Ambient> ambients;
     if (audio) {
         const Mission& mm = scene.mission();
@@ -487,7 +494,7 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             GearDef g;
             if (!parseGearDef(mm.defs[size_t(o.defIndex)].data, mm.defs[size_t(o.defIndex)].size, g) || g.soundMotor.empty()) continue;
             const Audio::SoundInfo* si = audio->info(g.soundMotor);
-            if (si && si->loop) ambients.push_back({int(i), g.soundMotor, si->range > 0 ? si->range : 200.f});
+            if (si && si->loop) ambients.push_back({int(i), g.soundMotor});
         }
         if (getenv("HG2_DEBUG")) {
             std::map<std::string, int> n;
@@ -496,29 +503,50 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
         }
     }
     auto updateAmbient = [&]() {
-        Vec3 lp = player.position();
-        // A sound plays once, from its nearest source: the marshes place the same loop on dozens of props (S2J has 31
-        // envswmpa crickets), and played together they added up to many times the sound's volume. EAR's channels
-        // and priorities (Sounds.lst channel / EAR_PERF_PRIORITIZE) likewise keep one voice per sound.
-        std::map<std::string, std::pair<float, const Ambient*>> nearest;
+        std::vector<std::pair<float, Ambient*>> due;
         for (auto& a : ambients) {
             Vec3 p;
             if (scene.objectHidden(a.object) || !scene.objectPosition(a.object, p)) continue;
-            float d = length(p - lp);
-            auto it = nearest.find(a.wav);
-            if (d < a.range && (it == nearest.end() || d < it->second.first)) nearest[a.wav] = {d, &a};
+            float lv = audio->loopLevel(a.wav, p);
+            if (lv > 0) due.push_back({lv, &a});
         }
+        std::sort(due.begin(), due.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+        if (due.size() > 16) due.resize(16);
         for (auto& a : ambients) {
+            bool on = std::any_of(due.begin(), due.end(), [&](const auto& d) { return d.second == &a; });
             Vec3 p;
-            auto it = nearest.find(a.wav);
-            bool on = it != nearest.end() && it->second.second == &a && scene.objectPosition(a.object, p);
             if (on && a.handle < 0) a.handle = audio->startLoop(a.wav, 0.f);
             if (!on && a.handle >= 0) audio->stopLoop(a.handle), a.handle = -1;
-            if (a.handle >= 0) audio->setLoop(a.handle, 0.6f * (audio->info(a.wav) ? audio->info(a.wav)->volume : 1.f), &p, a.range);
+            if (a.handle >= 0 && scene.objectPosition(a.object, p)) audio->setLoop(a.handle, 1.f, &p);
         }
     };
     Particles particles;
-    particles.init(fs, r);
+    // the particle setting picks the original's detail (DAT_101fcf44 +0xb0: 0 low, 1 high, 2 medium)
+    particles.init(fs, r, app.settings.particles <= 0 ? 0 : app.settings.particles == 1 ? 2 : 1);
+    particles.groundHeight = [&](float x, float z) { return scene.groundHeight(x, z); };
+    particles.groundNormal = [&](float x, float z) { return scene.groundNormal(x, z); };
+    world.particles = &particles;
+    if (const char* w = getenv("HG2_WEATHER")) {  // test: "type:level", e.g. 1:3
+        particles.setWeatherType(atoi(w));
+        particles.setWeatherLevel(atoi(strchr(w, ':') ? strchr(w, ':') + 1 : "3"));
+    }
+    // weather sounds: the rain loop (FUN_100f7560: Envrain2.wav for the light levels, Envrain1.wav for the heavy)
+    // and the thunder at each lightning strike (FUN_100f7c40, envthnd1.wav)
+    int rainLoop = -1, rainLoopKind = -1;
+    particles.onLightning = [&](const Vec3& at) {
+        if (getenv("HG2_DEBUG")) SDL_Log("lightning at %.0f,%.0f", at.x, at.z);
+        if (audio) audio->play("envthnd1.wav", 1.f, &at);
+    };
+    auto weatherSound = [&]() {
+        int k = particles.rainSound();
+        if (!audio || k == rainLoopKind) return;
+        if (rainLoop >= 0) audio->stopLoop(rainLoop), rainLoop = -1;
+        rainLoopKind = k;
+        if (k < 0) return;
+        const char* wav = k == 0 ? "Envrain2.wav" : "Envrain1.wav";
+        rainLoop = audio->startLoop(wav, 1.f);
+        if (getenv("HG2_DEBUG")) SDL_Log("rain loop %s", wav);
+    };
     combat.particles = &particles;
     player.particles = &particles;
     ai.setParticles(&particles);
@@ -972,13 +1000,6 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
         }
         r.setOverlay(hud.vertices());
     };
-    auto glowLights = [&]() {
-        for (size_t i = 0; i < scene.mission().objects.size(); i++) {  // mission lights glow
-            const auto& o = scene.mission().objects[i];
-            if (o.isLight && std::find(world.lightsOff.begin(), world.lightsOff.end(), int(i)) == world.lightsOff.end())
-                particles.flare(Vec3(float(o.pos[0]), float(o.pos[1]), float(o.pos[2])), o.lightColor, std::max(0.6f, o.lightRange * 0.06f));
-        }
-    };
     // ---------------------------------------------------------------- network play
     NetGame* net = setup.net;
     struct Remote {
@@ -1185,7 +1206,8 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             const bool straight = getenv("HG2_STRAIGHT") != nullptr;  // test: straight line, walk / run / coast / run
             if (straight) {
                 int q = f * 4 / std::max(1, T.driveFrames);
-                pin.turn = 0, pin.throttle = q == 2 ? 0.f : 1.f, pin.run = q == 1 || q == 3;
+                pin.turn = 0, pin.run = q == 1 || q == 3;
+                pin.throttle = q == 2 ? 0.f : pin.run ? 1.f : 0.2f;  // walk: throttle 0.2 holds ~0.45 vmax
             }
             if (T.startX >= 0 && f % 3 == 0 && !getenv("HG2_DRIVETO") && !straight) {  // test mode: hold position and fire forward
                 Vec3 mz, aim;
@@ -1211,6 +1233,7 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
                 if (act == "down") pin.down = true;
                 else if (act == "up") pin.up = true;
                 else if (act == "jump") pin.jump = true;
+                else if (act == "jets") pin.jumpJets = true;
                 else if (act == "skates") pin.toggleSkates = true;
                 else if (act == "view") external = !external;
                 else if (act == "flinch") player.hitReaction(3);
@@ -1224,7 +1247,9 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
                     at.y = scene.groundHeight(at.x, at.z);
                     printf("effect %s: %s\n", fxn, particles.spawn(fxn, at, 1.5f) ? "ok" : "not found");
                 }
-            player.speedScale = combat.mobility(player.object()), player.turnScale = combat.manoeuvre(player.object());
+            player.speedScale = combat.mobility(player.object()), player.maneuverNow = combat.maneuverNow(player.object());
+            player.jumpJets = combat.jumpJets(player.object());
+            if (int kd = combat.takeKnock(player.object())) player.knockDown(kd);
             if (player.active() && !combat.alive(player.object())) player.die();
             player.update(1.f / 30.f, pin);
             ai.setCombatHold(scripts.combatHold());
@@ -1232,9 +1257,7 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             ai.update(1.f / 30.f);
             updateFlyers(1.f / 30.f);
             combat.update(1.f / 30.f);
-            if (const char* w = getenv("HG2_WEATHER")) particles.setWeather(atoi(w), atoi(strchr(w, ':') ? strchr(w, ':') + 1 : "3"));  // test: "1:3"
-            else particles.setWeather(world.weatherType, world.weatherPreset % 5);
-        particles.setWind(world.windV, world.gust);
+            particles.setWind(world.windV, world.gust);
             particles.setViewer(frameParams().eye);
             particles.update(1.f / 30.f);
             fountains.update(1.f / 30.f, player.position(), spawnUnit, unitAlive);
@@ -1287,9 +1310,9 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             particles.update(1.f / 30.f);
         }
         buildHud(frameParams());
-        glowLights();
         particles.setViewer(frameParams().eye);
-        particles.submit(frameParams().view);
+        particles.setWater(scene.mission().hasWater, scene.waterLevel());
+        particles.submit(frameParams().view, frameParams().proj);
         if (r.beginFrame(frameParams())) {
             scene.render(frameParams());
             combat.draw();
@@ -1312,6 +1335,10 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
     SDL_Window* win = app.win;
     SDL_SetWindowRelativeMouseMode(win, true);
     PlayerInput edge;  // one-shot actions gathered from key presses
+    // throttle setting (+0x1b18, FUN_10063a10): 1/3, 2/3, full, increase / decrease by 0.05, Full Stop; Reverse
+    // Direction flips the mode (+0x1b1c, forward after Full Stop and at the start)
+    float throttleSet = 0.f;
+    bool throttleForward = true;
     Uint64 last = SDL_GetTicksNS();
     float deadTime = 0;
     float sens = 0.003f * app.settings.mouseSpeed, inv = app.settings.invertMouse ? -1.f : 1.f;
@@ -1378,6 +1405,12 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
                 else if (kc == SDLK_KP_MULTIPLY || kc == SDLK_X) edge.up = true;
                 else if ((kc == SDLK_KP_ENTER || kc == SDLK_SPACE) && scripts.cinematic.active) scripts.skipCinematic();
                 else if (kc == SDLK_KP_ENTER || kc == SDLK_SPACE) edge.jump = chase;
+                else if (kc == SDLK_J) edge.jumpJets = chase;
+                else if (kc == SDLK_COMMA) throttleSet = 0.333f;      // 1/3 Throttle (0x3eaaa64c)
+                else if (kc == SDLK_PERIOD) throttleSet = 0.6666f;    // 2/3 Throttle (0x3f2aa64c)
+                else if (kc == SDLK_SLASH) throttleSet = 1.f;         // Full Throttle
+                else if (kc == SDLK_0) throttleSet = 0.f, throttleForward = true;  // Full Stop
+                else if (kc == SDLK_BACKSPACE) throttleForward = !throttleForward;  // Reverse Direction
                 else if (kc == SDLK_KP_0 || kc == SDLK_INSERT || kc == SDLK_R) edge.toggleSkates = true;
                 else if (kc == SDLK_C) {  // view toggle (FUN_10093490 -> FUN_10092ff0(0/1)): also leaves a scripted camera
                     external = !external, app.settings.externalView = external;
@@ -1407,8 +1440,8 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             if (net) net->poll();  // keep the connection alive; the world goes on without us
             FrameParams fp = frameParams();
             buildHud(fp);
-            glowLights();
-            particles.submit(fp.view);
+            particles.setWater(scene.mission().hasWater, scene.waterLevel());
+            particles.submit(fp.view, fp.proj);
             if (r.beginFrame(fp)) {
                 scene.render(fp);
                 combat.draw();
@@ -1425,8 +1458,22 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             pin.throttle = (k[SDL_SCANCODE_W] || k[SDL_SCANCODE_KP_8] ? 1.f : 0.f) - (k[SDL_SCANCODE_S] || k[SDL_SCANCODE_KP_2] ? 1.f : 0.f);
             pin.turn = (k[SDL_SCANCODE_D] || k[SDL_SCANCODE_KP_6] ? 1.f : 0.f) - (k[SDL_SCANCODE_A] || k[SDL_SCANCODE_KP_4] ? 1.f : 0.f);
             pin.strafe = (k[SDL_SCANCODE_E] || k[SDL_SCANCODE_KP_9] ? 1.f : 0.f) - (k[SDL_SCANCODE_Q] || k[SDL_SCANCODE_KP_7] ? 1.f : 0.f);
-            pin.run = k[SDL_SCANCODE_LSHIFT];
-            pin.down = edge.down, pin.up = edge.up, pin.jump = edge.jump, pin.toggleSkates = edge.toggleSkates;
+            pin.run = true;
+            // Increase / Decrease Throttle (held): +-0.05 a poll, up to 1, down to 0.05 (FUN_10063a10)
+            if (k[SDL_SCANCODE_EQUALS] || k[SDL_SCANCODE_KP_PLUS]) {
+                if (throttleSet < 1.f) throttleSet = std::min(1.f, throttleSet + 0.05f);
+            } else if (k[SDL_SCANCODE_MINUS] || k[SDL_SCANCODE_KP_MINUS]) {
+                if (throttleSet > 0.05f) throttleSet -= 0.05f;
+            }
+            // Forward / Backward is an axis (-1 .. 1); steering with no axis drives at 0.05, reverse is held to
+            // -0.5; then the setting: in forward mode the axis is at least the setting, in reverse the setting backs
+            // the gear at half of it
+            if (std::fabs(pin.turn) > 0.05f && std::fabs(pin.throttle) < 0.05f) pin.throttle = 0.05f;
+            if (pin.throttle < -0.5f) pin.throttle = -0.5f;
+            if (!throttleForward) pin.throttle -= throttleSet * 0.5f;
+            else if (pin.throttle >= 0 && pin.throttle < throttleSet) pin.throttle = throttleSet;
+            pin.down = edge.down, pin.up = edge.up, pin.jump = edge.jump, pin.jumpJets = edge.jumpJets;
+            pin.toggleSkates = edge.toggleSkates;
             // arrow keys orbit / tilt the camera, Home / End zoom the external camera
             camOrbit += ((k[SDL_SCANCODE_RIGHT] ? 1.f : 0.f) - (k[SDL_SCANCODE_LEFT] ? 1.f : 0.f)) * 1.5f * dt;
             camPitch = std::max(-0.2f, std::min(1.3f, camPitch + ((k[SDL_SCANCODE_DOWN] ? 1.f : 0.f) - (k[SDL_SCANCODE_UP] ? 1.f : 0.f)) * dt));
@@ -1441,8 +1488,9 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
         userAutopilot(pin, dead);
         player.twist = chase ? std::max(-1.2f, std::min(1.2f, camOrbit)) : 0.f;  // torso follows the aim
         edge = PlayerInput{};
-        player.speedScale = combat.mobility(player.object()), player.turnScale = combat.manoeuvre(player.object());
+        player.speedScale = combat.mobility(player.object()), player.maneuverNow = combat.maneuverNow(player.object());
         player.jumpJets = combat.jumpJets(player.object());
+        if (int kd = combat.takeKnock(player.object())) player.knockDown(kd);
         combat.setPosture(player.object(), player.postureCode());
         if (botClose && !dead) pin.throttle = 1;
         player.update(dt, pin);
@@ -1460,8 +1508,7 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
                 audio->setListener(cam.pos, std::atan2(-cam.forward().x, -cam.forward().z));
             }
             audio->update();
-            static float ambT = 0;
-            if ((ambT += dt) > 0.25f) ambT = 0, updateAmbient();
+            updateAmbient();  // EAR moves its events every frame (FUN_1012e708)
         }
         pickTarget();
         if (player.active() && combat.designator(player.object()))
@@ -1489,11 +1536,10 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             }
         netStep(dt, fired, fmz, faim);
         combat.update(dt);
-        if (const char* w = getenv("HG2_WEATHER")) particles.setWeather(atoi(w), atoi(strchr(w, ':') ? strchr(w, ':') + 1 : "3"));  // test: "1:3"
-        else particles.setWeather(world.weatherType, world.weatherPreset % 5);
         particles.setWind(world.windV, world.gust);
         particles.setViewer(frameParams().eye);
         particles.update(dt);
+        weatherSound();
         fountains.update(dt, player.position(), spawnUnit, unitAlive);
         if (setup.waves > 0 && world.endCode < 0) {
             bool cleared = std::none_of(waveUnits.begin(), waveUnits.end(), [&](int o) { return combat.alive(o); });
@@ -1539,8 +1585,8 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
         FrameParams fp = frameParams();
         missionClock += dt;
         buildHud(fp);
-        glowLights();
-        particles.submit(fp.view);
+        particles.setWater(scene.mission().hasWater, scene.waterLevel());
+            particles.submit(fp.view, fp.proj);
         if (r.beginFrame(fp)) {
             scene.render(frameParams());
             combat.draw();

@@ -263,6 +263,15 @@ bool Scene::objectPosition(int object, Vec3& out) const {
     return false;
 }
 
+bool Scene::objectAxis(int object, int row, Vec3& out) const {
+    for (auto& i : instances_)
+        if (i.object == object) {
+            out = Vec3(i.world.m[row][0], i.world.m[row][1], i.world.m[row][2]);
+            return true;
+        }
+    return false;
+}
+
 bool Scene::frameWorld(int object, const std::string& frame, Vec3& out) const {
     for (auto& i : instances_) {
         if (i.object != object || !i.rig) continue;
@@ -432,9 +441,6 @@ void Scene::buildTerrain() {
                     if (n.dim < t.dim) v.pos[1] = terrain_.sample(px, pz);
                 }
             }
-            // ground lying at the water's surface was coplanar with it and flickered through it; the drawn ground
-            // under the water (and level with it) is lowered a little
-            if (mission_.hasWater && v.pos[1] < mission_.waterLevel + 0.15f) v.pos[1] -= 0.3f;
             float e = 4.f;
             float hx = terrain_.sample(x + e, z) - terrain_.sample(x - e, z);
             float hz = terrain_.sample(x, z + e) - terrain_.sample(x, z - e);
@@ -604,7 +610,7 @@ void Scene::render(const FrameParams& fp) {
             r_.draw(i.mesh, i.world, true);
         }
     }
-    if (waterMesh_) r_.draw(waterMesh_, Mat4::translate(Vec3(0, waterOffset_, 0)), false);
+    if (waterMesh_) r_.draw(waterMesh_, Mat4::translate(Vec3(0, waterLevel() - mission_.waterLevel, 0)), false);
     if (getenv("HG2_COLLVIEW")) drawCollision();
 }
 

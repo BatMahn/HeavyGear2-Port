@@ -1,5 +1,6 @@
 // World scene: terrain, sky and placed mission objects, built from a loaded mission.
 #pragma once
+#include <cmath>
 #include <functional>
 #include <memory>
 #include <string>
@@ -57,6 +58,7 @@ public:
     bool frameWorld(int object, const std::string& frame, Vec3& out) const;
     bool frameBottom(int object, const std::string& frame, Vec3& out) const;  // bottom centre (the lower Y face) of a part's mesh, posed
     bool objectPosition(int object, Vec3& out) const;  // current placement of any instance
+    bool objectAxis(int object, int row, Vec3& out) const;  // a row of its world matrix (0 local x, 2 local z)
     std::string nearestFrame(int object, const Vec3& p, const std::vector<std::string>& frames) const;
     bool frameUnder(int object, const std::string& frame, const std::string& ancestor) const;
     void hideFrame(int object, const std::string& frame);
@@ -64,7 +66,8 @@ public:
     // Battle damage: the frame is overdrawn with the definition's damaged skin at this strength (0..1).
     void setFrameDamage(int object, const std::string& frame, const std::string& texture, float amount);
     void setWaterLevel(float y) { waterOffset_ = y - mission_.waterLevel; }  // SetWaterLevel
-    float waterLevel() const { return mission_.waterLevel + waterOffset_; }
+    // FUN_100a5790: the surface bobs 0.09 m on a sine whose phase runs at Water_Tidal_Rate radians a second
+    float waterLevel() const { return mission_.waterLevel + waterOffset_ + std::sin(mission_.waterTidal * time_) * 0.09f; }
     // First object box hit by the segment a->b (returns object index or -1; t = fraction along the segment).
     int raycast(const Vec3& a, const Vec3& b, int ignoreObject, float& t) const;
     void hideObject(int object);

@@ -22,7 +22,8 @@ public:
     ~Audio();
     bool init(const FileSystem& fs);
     void setListener(const Vec3& pos, float yaw) { listener_ = pos, yaw_ = yaw; }
-    // Positional when `at` is given, otherwise centred. Returns false if the sound can't be found.
+    // Positional when `at` is given, otherwise centred. Returns false if the sound can't be found. Levels and ranges
+    // are the sound's own (Sounds.lst); `volume` scales the level, `range` is ignored.
     bool play(const std::string& wav, float volume = 1.f, const Vec3* at = nullptr, float range = 300.f);
     void queueDialog(const std::string& wav);  // played one after another
     void flushDialog();                         // drop queued and playing dialog
@@ -40,8 +41,15 @@ public:
     bool dialogPlaying();
     void stopAll();  // everything except music (between screens and missions)
     void shutdown();  // close the device (before SDL_Quit)
-    // Per-sound parameters from Sounds.lst (EAR sound objects): maximum volume, audible range, looping.
-    struct SoundInfo { float volume = 1.f, range = 0.f; bool loop = false; };
+    // Per-sound parameters from Sounds.lst (EAR sound objects, parsed by FUN_1012d380): volumes 0..10000, ranges in
+    // metres (the file's centimetres: FUN_1012bf2e hands EAR listener-relative positions x 100), channel, priority.
+    // Defaults as the parser's: minimum 0, maximum 10000, outer 100 m, inner 0, channel 1.
+    struct SoundInfo {
+        float minVol = 0, maxVol = 10000, outer = 100.f, inner = 0;
+        int channel = 1, priority = 0;
+        bool loop = false, distance = false;
+        float volume = 1.f, range = 100.f;  // maxVol / 10000 and outer, for callers
+    };
     const SoundInfo* info(const std::string& wav) const;
     // Music: ripped CD tracks (.mp3 / .wav) in a folder, played in shuffled order. False if none were found.
     bool startMusic(const std::string& folder);
@@ -53,7 +61,7 @@ public:
 
 private:
     struct Clip { std::vector<int16_t> pcm; };  // stereo 44.1 kHz
-    struct Voice { std::shared_ptr<Clip> clip; size_t pos; float l, r; bool dialog; int loop = -1; bool music = false; };
+    struct Voice { std::shared_ptr<Clip> clip; size_t pos; float l, r; bool dialog; int loop = -1; bool music = false; std::string name; };
     std::unordered_map<std::string, SoundInfo> infos_;
     void loadSoundList();
     std::vector<std::string> tracks_;
@@ -64,7 +72,15 @@ private:
     std::atomic<bool> loadingTrack_{false};
     bool musicOn_ = false;
     std::shared_ptr<Clip> decodeTrack(const std::string& path);
-    void gains(float volume, const Vec3* at, float range, float& l, float& r) const;
+    void gains(float volume, const Vec3* at, const SoundInfo& si, float& l, float& r) const;
+  public:
+    // EAR's level for a sound at a distance (FUN_10004504): the maximum inside the inner range, falling in a straight
+    // line to the minimum at the outer range (EAR_PERF_DISTANCE sounds only), 0..10000.
+    static float earLevel(const SoundInfo& si, float dist);
+    // The DirectSound attenuation EAR gives a level (FUN_1001528c): -(60 + a polynomial of the level in percent) dB.
+    static float earAmplitude(float level);
+    float loopLevel(const std::string& wav, const Vec3& at) const;  // a positional sound's EAR level here
+  private:
     int nextLoop_ = 1;
     std::shared_ptr<Clip> clip(const std::string& name);
     static void SDLCALL callback(void* user, SDL_AudioStream* s, int additional, int total);

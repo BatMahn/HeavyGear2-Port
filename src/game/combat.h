@@ -21,6 +21,7 @@ struct Loadout {
     int slot = 0;      // hardpoint
     int ammo = 0;      // -1 unlimited
     float cooldown = 0;
+    int burstCount = 0;  // rounds of the current burst (weapon +0x1b4)
 };
 
 class Combat {
@@ -48,12 +49,14 @@ public:
     void setSpace(bool on) { space_ = on; }
     bool zeroG(int object) const { return field(object, 1, 14, 1) != 0; }
     // Squad radio: lost with the sensor head unless there's a Backup Communication System.
-    bool commsOk(int object) const { return sensorsOkRaw(object) || field(object, 0, 2, 1) != 0; }
+    bool commsOk(int object) const {
+        auto it = units_.find(object);
+        if (it != units_.end() && it->second.commsLost) return false;
+        return sensorsOkRaw(object) || field(object, 0, 2, 1) != 0;
+    }
     bool sensorsOkRaw(int object) const;
     bool ejection(int object) const { return field(object, 0, 9, 1) != 0; }
     bool amphibious(int object) const { return field(object, 0, 1, 1) != 0; }
-    // Speed factor for wading: below the water surface gears slow down unless Amphibious.
-    float wading(int object, float waterLevel) const;
     bool sniper(int object) const { return field(object, 0, 29, 1) != 0; }
     bool designator(int object) const { return field(object, 1, 13, 1) != 0; }
     bool uplink(int object) const { return field(object, 0, 31, 1) != 0; }
@@ -77,6 +80,12 @@ public:
     void setAimTarget(int shooter, int target) { aimTarget_[shooter] = target; }
     bool fireAs(int shooter, const Vec3& muzzle, const Vec3& aim) { return fire(shooter, muzzle, aim); }
     float range(int shooter) const;
+    int autoBurst(int shooter) const;  // Auto_Burst (keyword 0x16d, weapon +0x1b8)
+    // AI target choice (FUN_100502d0): the summed damage of its loaded weapons and its armour points (gear +0xbec)
+    float firepower(int object) const;
+    float hitpoints(int object) const;
+    float muzzleVelocity(int shooter) const;
+    int ammoLeft(int shooter) const;  // of the selected weapon, -1 unlimited  // Bullet_Velocity of the selected weapon (0 for melee)
     // AI: switch to the best usable weapon for a target at `dist` (melee up close, otherwise the hardest hitter
     // that reaches); returns its range, 0 if nothing usable.
     float chooseWeapon(int shooter, float dist);
@@ -118,14 +127,17 @@ public:
     // Per-part damage (gears with a Damage_Hierarchy): health 0..1 of a region (H head, T torso, A/a right/left
     // arm, L/l right/left leg; 1 if the unit has no such parts), movement left after leg damage, sensors working.
     float regionHealth(int object, char region) const;
-    float mobility(int object) const;
-    float manoeuvre(int object) const;     // turn-rate multiplier after critical hits
+    float mobility(int object) const;      // Movement left after criticals / the original Movement (vmax scales with it)
+    int maneuverNow(int object) const;     // Maneuverability after criticals (+0xbf4); 0x7fff for non-units
+    // Knock-downs from criticals (0x80000, FUN_10062430: ECY trigger 0x13 or 0x14) waiting for the unit's body.
+    int takeKnock(int object) { auto it = units_.find(object); if (it == units_.end()) return 0; int k = it->second.knock; it->second.knock = 0; return k; }
     bool weaponBroken(int object, int index) const;
     std::vector<int> hitLevel;             // per drained hit: 2 light / none, 3 medium, 4 heavy (engine events)
     bool sensorsOk(int object) const;
     // Muzzle of the selected weapon: its hardpoint frame (frm-hpN) at the current pose. False if unknown.
     bool muzzle(int shooter, Vec3& out) const;
     std::vector<std::string> log;  // part-destroyed messages for the HUD (drained by the game)
+    bool multiplayer = false;  // DAT_101fcf44 + 0x1b: heavy hits / criticals don't knock gears down in network play
     Audio* audio = nullptr;
     Particles* particles = nullptr;  // effects for hits, explosions and muzzle flashes when set
 
@@ -166,9 +178,12 @@ private:
         float surfaceTimer = 1.f;
         // original damage model (FUN_10058fd0 / FUN_10059240): hp holds the armour value x10, which hits wear down
         bool armoured = false;      // gear / vehicle with an armour stat; otherwise structure points
-        int fireControl = 0;        // damage multiplier index for its own shots
-        int mobility = 4;           // critical hits take mobility (speed) and manoeuvre (turning) levels
-        int manoeuvre = 0;
+        int fireControl = 0;        // damage multiplier index for its own shots (+0xbe8, criticals lower it)
+        bool gear = false;          // bipedal gear (vtable 0x101434a0): FUN_100618a0 / FUN_10062430 criticals
+        int movement = 0, movementBase = 0;  // +0xbf8 (criticals take it down to 1)
+        int maneuverNow = 0;        // +0xbf4
+        int knock = 0;              // pending knock-down trigger
+        bool sensorsLost = false, commsLost = false;  // FUN_100622b0
         std::vector<bool> broken;   // per loadout entry: knocked out by a critical hit
         std::string damageTexture;
     };
@@ -183,9 +198,13 @@ private:
         uint32_t m = ((1u << width) - 1) << shift;
         if (w & m) w = (w & ~m) | ((((w & m) >> shift) - 1) << shift);
     }
+    // FUN_100618a0 (gears) / FUN_10058fd0 (other units): the critical-effect bits for a hit of damage d with the
+    // weapon's system mask (bullets and blasts 0xe, haywire 0x35); FUN_10062430 / FUN_10059240 apply them.
+    uint32_t criticalRoll(int object, Unit& u, float severity, uint32_t mask);
+    void applyCritical(int object, Unit& u, uint32_t bits, bool& kill);
     struct Flash { Vec3 pos; float age, size; };
     struct Shell { Vec3 pos, vel; int trail = 0; };         // ArtilleryStrike shells in flight
-    struct Blast { int object; float wait, damage; Vec3 at; };  // explosion damage on its way (dist / 60 s)
+    struct Blast { int object; float wait, damage; Vec3 at; int shooter = -1; uint32_t mask = 0xe; bool haywire = false; };  // explosion damage on its way (dist / 60 s)
     std::vector<Shell> shells_;
     std::map<int, int> smoking_;          // script-set smoke levels (override the damage smoke)
     std::map<int, float> smokeTimers_;
@@ -201,7 +220,7 @@ private:
     int startTrail(int ammoClass, const Vec3& pos);
     void explosionEffect(int ammoClass, const Vec3& p, bool onObject);
     void bulletEffect(const Vec3& p, bool onObject);
-    void applyDamage(int object, int shooter, float d, const Vec3& p);
+    void applyDamage(int object, int shooter, float d, const Vec3& p, uint32_t mask = 0xe, bool haywire = false);
     void destroyObject(int object, const Vec3& p);
     std::map<int, float> structure_;  // destructible objects without an armour stat: structure points left
     std::vector<Loadout> buildLoadout(const GearDef& def);

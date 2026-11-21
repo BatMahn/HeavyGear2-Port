@@ -1,7 +1,9 @@
 // Particle effects from the game's "Particle System" folder: .ped effects (emitter + particle pairs),
 // .emt emitters and .ptl particle types (fixed-size records read straight into memory by
-// FUN_10126a30 / FUN_10127110 / FUN_101272a0). Drawn as camera-facing billboards.
+// FUN_10126a30 / FUN_10127110 / FUN_101272a0), and the weather (rain / snow, FUN_100f71f0). All of it is the
+// original's model as decoded in docs/FORMATS.md ("Particle System", "Weather").
 #pragma once
+#include <functional>
 #include <map>
 #include <memory>
 #include <random>
@@ -14,99 +16,143 @@
 
 namespace hg2 {
 
-struct ParticleType {          // .ptl, 0x1ab4 bytes
+struct ParticleType {          // .ptl, 0x1ab4 bytes (FUN_10126a30)
     std::string name, texture;
     int tex = -1;
-    float life = 1;            // +0x100 seconds
-    float gravity = 0;         // +0x110
-    uint32_t flags = 0;        // +0x108 (0x100: additive)
-    float rgba[256][4];        // colour over life: R +0x2ac, G +0x6ac, B +0xaac, A +0xeac (256 floats each)
-    float size[256];           // size over life, +0x16ac
-    // texture atlas cell: 4x4 grid of 32-pixel cells; +0x21c u0, +0x220 v0 of the sprite. Animated types
-    // (+0x2a4 frames > 1, smokmuzc.tga) step through 0.25 x 0.1875 cells in reading order over their life.
-    float u0 = 0, v0 = 0, cellW = 1, cellH = 1;
-    int frames = 1;
-    // +0x2a8 draw mode: modes 1 and 9 take their RGB from the emitting stream's colour (FUN_101260c0's last argument,
-    // 0xffffffff = white) and only their alpha from the curve (FUN_10128fd0 callers)
-    int mode = 0;
+    float life = 1, lifeVar = 0;   // +0x100 seconds, +0x104 random extra (0..var)
+    uint32_t flags = 0;            // +0x108: bit 0 drag, bit 1 gravity, 0x100 additive
+    float drag = 0;                // +0x110 rate (1/s) toward the air velocity
+    float gravity = 0;             // +0x114 x 9.8 (added to the vertical speed; smoke rises, sparks fall)
+    bool wind = false;             // +0x1aac bit 31: the air velocity is the wind (FUN_10127920)
+    float anim = 0;                // +0x1ab0 frame cycles over the life (0 in the short 0x1ab0-byte files)
+    float rgba[256][4];            // colour over life: R +0x2ac, G +0x6ac, B +0xaac, A +0xeac
+    float size[256];               // +0x16ac, halved at load: the sprite's half-size at scale 1
+    float uv[16][2] = {};          // +0x21c: texture cell origin per frame
+    float cellW = 0.25f, cellH = 0.25f;  // +0x29c / +0x2a0 cell size (negative heights flip the cell)
+    int frames = 1;                // +0x2a4
+    int mode = 0;                  // +0x2a8 draw mode (FUN_10128ac0)
 };
 struct Emitter {               // .emt, 0x928 bytes
     std::string name;
-    uint32_t flags = 0;
-    float duration = 1;        // +0x10c emission time
-    int count = 8;             // +0x114
-    float speed = 1, speedVar = 0, cone = 90;  // +0x118, +0x11c, +0x120 (degrees)
-    // curves over the emission time (256 steps): +0x128 emission rate (particles per second), +0x528 speed factor
+    uint32_t flags = 0;        // +0x100: 2 inherit the emitter's velocity, 0x10 loop, 0x20 gravity, 0x80 drag, 0x100 moves
+    int shape = 0;             // +0x104: 0 point, 1 cone shell, 2 ring (FUN_10123bd0)
+    float drag = 0;            // +0x108 (flag 0x80)
+    float duration = 1, durationVar = 0;  // +0x10c, +0x110
+    int count = 8;             // +0x114 most particles alive at once
+    float speed = 1, speedVar = 0, cone = 90, radius = 0;  // +0x118, +0x11c, +0x120 (degrees), +0x124
+    // curves over the emission time (256 steps): +0x128 particles per whole emission time, +0x528 speed factor
     float rate[256] = {}, speedCurve[256] = {};
-    bool hasCurves = false;
 };
-struct Effect {                // .ped: n x {emitter name[256], particle name[256], u32, f32 scale, f32 delay, f32 velocity, f32, f32 cone}
-    struct Part { const Emitter* emitter; const ParticleType* type; float scale, delay, velocity, cone; };
+struct Effect {                // .ped: n x {emitter name[256], particle name[256], u32 attach, f32 scale, scale var,
+                               // velocity, velocity var, cone}
+    struct Part { const Emitter* emitter; const ParticleType* type; uint32_t attach; float scale, scaleVar, vel, velVar, cone; };
     std::vector<Part> parts;
 };
 
 class Particles {
 public:
-    void init(const FileSystem& fs, Renderer& r, const std::string& detail = "hi");
-    // Start an effect by name (.ped, or an .emt/.ptl pair, or a lone .ptl). `up` orients the emission cone.
-    // `density` scales the particle counts (weapon hits use a fraction so sustained fire stays readable).
+    // detail: the original's particle setting (DAT_101fcf44 +0xb0): 0 low, 1 high, 2 medium.
+    void init(const FileSystem& fs, Renderer& r, int detail = 1);
+    // Terrain queries for ground-hugging particles, weather tiles and the water plane.
+    std::function<float(float, float)> groundHeight;
+    std::function<Vec3(float, float)> groundNormal;
+    void setWater(bool has, float level) { hasWater_ = has, water_ = level; }
+    // Start an effect (.ped) by name (FUN_10124480 -> FUN_101260c0). `up` is the effect's frame (the emission cone
+    // axis). `density` is accepted for the callers but has no effect: the original has no such thing.
     // `tint` (0x00RRGGBB, 0xffffffff none) colours particle types of draw mode 1 / 9.
     bool spawn(const std::string& name, const Vec3& pos, float scale = 1.f, const Vec3& up = Vec3(0, 1, 0), float density = 1.f,
                uint32_t tint = 0xffffffffu);
-    // An effect attached to a moving object (projectile trails, FUN_101260c0 with a parent): its emitters keep
-    // running, looping their emission time, at the position last given by move(), until detach(). Returns 0 if the
-    // effect is missing.
+    // An effect on a moving object: its attached parts (.ped flag 1) follow the position given by move() until
+    // detach(), which ends the emitters (their particles live on). Returns 0 if the effect is missing.
     int attach(const std::string& name, const Vec3& pos, float scale = 1.f, uint32_t tint = 0xffffffffu);
     void move(int handle, const Vec3& pos, const Vec3& dir);
     void detach(int handle);
     void update(float dt);
-    // Builds the billboards for this camera and hands them to the renderer (before beginFrame).
-    void submit(const Mat4& view);
+    // Builds the sprites and the weather for this camera and hands them to the renderer (before beginFrame).
+    void submit(const Mat4& view, const Mat4& proj);
     size_t live() const { return parts_.size(); }
-    // Precipitation around the viewer (SetWeatherType 1 rain / 2 snow, SetWeather preset: level = preset % 5).
-    void setWeather(int type, int level) { weatherType_ = type, weatherLevel_ = level; }
-    // Wind (SetGlobalWindVariables / FUN_10124c00): particles drift toward the wind velocity, scaled per particle by
-    // 1 - gust * (b - 128) / 128 where b = byte(dot(position, wind) + a running phase) (FUN_10127c90): gusts travel
-    // along the wind as a 256-step sawtooth.
+    // SetWeatherType (FUN_100f6e80: 1 rain, 2 snow, else none; resets the level to 0) and SetWeather (FUN_100f6ec0).
+    void setWeatherType(int type);
+    void setWeatherLevel(int level);
+    // Wind (SetGlobalWindVariables / FUN_10124c00), see FORMATS.md.
     void setWind(const Vec3& w, float gust) { wind_ = w, gust_ = gust; }
     void setViewer(const Vec3& eye) { eye_ = eye; }
-    // A glow drawn this frame only (mission lights).
-    void flare(const Vec3& pos, const uint8_t rgb[3], float size) { flares_.push_back({pos, {rgb[0], rgb[1], rgb[2]}, size}); }
+    // Weather sounds: the rain loop to play (-1 none, 0 Envrain2.wav, 1 Envrain1.wav) and lightning strikes.
+    int weatherType() const { return w_.type; }
+    int detail() const { return detail_; }
+    const Vec3& viewer() const { return eye_; }
+    bool underWater(const Vec3& p) const { return hasWater_ && p.y < water_; }
+    int rainSound() const { return w_.enabled ? w_.sound : -1; }
+    std::function<void(const Vec3&)> onLightning;  // envthnd1.wav at the strike
 
 private:
     const Effect* effect(const std::string& name);
     const ParticleType* type(const std::string& name);
     const Emitter* emitter(const std::string& name);
     bool read(const std::string& file, Bytes& out) const;
+    int texture(const std::string& name);
+    void step(float dt);
+    void stepWeather(float dt);
+    float rnd() { return float(rng_() & 0x7fff) / 32767.f; }  // rand() / 32767
+    Vec3 randomUnit();
 
-    struct Particle { Vec3 pos, vel; float age, life, scale, spin; const ParticleType* type; int stream = 0; uint32_t tint = 0xffffffffu; };
-    // One emitter running: it emits at its rate curve for its emission time, keeping at most `total` of its
-    // particles alive.
-    struct Stream { Effect::Part part; Vec3 pos, up; float scale, t, acc; int total, id, alive; uint32_t tint = 0xffffffffu; int handle = 0; };
-    void emit(const Effect::Part& p, const Vec3& pos, const Vec3& up, float scale, int n, float speedMul = 1.f, int stream = 0,
-              uint32_t tint = 0xffffffffu);
-    int nextStream_ = 1, nextHandle_ = 1;
+    struct Particle {
+        Vec3 pos, vel, air;
+        float age = 0, rate = 1, scale = 1;  // age 0..1 of the life, rate = 1 / life
+        const ParticleType* type;
+        int motion = 0;    // FUN_10127920: (flags & 3) | 4 with wind; 8 at rest
+        int id = 0, link = 0, emitter = 0;  // link: the particle the same emitter made before this one (trails)
+        uint32_t tint = 0xffffffffu;
+    };
+    struct Inst {      // a running emitter (FUN_10123480)
+        Effect::Part part;
+        Vec3 pos, prev, vel, ax, ay, az;  // ay: the effect's up
+        float scale = 1, t = 0, prevT = 0, rate = 1;
+        int id = 0, handle = 0, alive = 0, last = 0;
+        bool attached = false;
+        uint32_t tint = 0xffffffffu;
+    };
+    void emitOne(Inst& e, const Vec3& at, float speedFactor);
+    int nextId_ = 1, nextHandle_ = 1;
 
     const FileSystem* fs_ = nullptr;
     Renderer* r_ = nullptr;
+    int detail_ = 1;
     std::string dir_;
     std::map<std::string, std::unique_ptr<ParticleType>> types_;
     std::map<std::string, std::unique_ptr<Emitter>> emitters_;
     std::map<std::string, std::unique_ptr<Effect>> effects_;
     std::map<std::string, int> textures_;
     std::vector<Particle> parts_;
-    std::vector<Stream> streams_;
+    std::vector<Inst> insts_;
     std::mt19937 rng_{1234};
-    int weatherType_ = 0, weatherLevel_ = 0;
     Vec3 eye_;
     Vec3 wind_;
-    float gust_ = 0, windPhase_ = 0;
-    float weatherAcc_ = 0;
-    std::unique_ptr<ParticleType> rain_, snow_;
-    struct Flare { Vec3 pos; uint8_t rgb[3]; float size; };
-    std::vector<Flare> flares_;
-    int dotTex_ = -1;
-    int dotTexture();
+    float gust_ = 0, gustTime_ = 0, acc_ = 0;
+    uint8_t phase_ = 0, gustCount_ = 0;
+    bool gustOn_ = true;
+    bool hasWater_ = false;
+    float water_ = 0;
+
+    // Weather object (vtable 0x1014b4d0): an N x N field of drops shared by every visible terrain tile.
+    struct Drop { float life = 0, left = 0; Vec3 pos, wob; };
+    struct Weather {
+        int type = 0;              // 1 rain, 2 snow
+        bool enabled = false;
+        bool snow = false;
+        float fall = 30;           // _DAT_10163638: fall speed
+        float lifeMin = 1, lifeMax = 3;  // +0xdb0 / +0xdb4
+        float width = 1.f;         // +0xdd0 streak / flake width (pixels at 640 x 480)
+        float splash = 0.9f;       // +0xdd8 splash ring growth
+        float length = 5.f;        // DAT_10163640: streak length (1.5 for snow)
+        int n = 7;                 // +0xdc4 grid side
+        int maxDraw = 500;         // +0xde4 drops drawn per frame
+        int sound = -1;
+        unsigned lightning = 0, lightningRate = 0;  // +0xe0c counter, +0xe10 per second
+        std::vector<Drop> drops;
+        float acc = 0;
+    } w_;
+    Vec3 fallDir_ = normalize(Vec3(1, -3, 0)) * 0.9999999f;  // DAT_1026b1c0
 };
 
 }  // namespace hg2

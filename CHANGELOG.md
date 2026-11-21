@@ -5,6 +5,102 @@ Heavy Gear II native port - https://github.com/BatMahn/HeavyGear2-Port
 Each release's source and the macOS / Linux / Windows builds are on the GitHub releases page. No game data is ever
 included: you need your own copy of Heavy Gear II (see the README's "Setting up the game folder").
 
+## 0.28.0 - 2026-11-21
+
+A review pass replacing behaviour the port had invented or estimated with the original game's, decoded from
+`hg2sim.dll` (addresses in docs/FORMATS.md).
+
+### AI
+- **Firing:**
+  - The gunner fires through the original's fire gate: Auto_Burst rounds, then a rest set by the team's alert level.
+  - Units fire on the move only when their move order carries the fire flag. Volleys last the order's time.
+  - The port's spread, its difficulty scaling and the "blocked line of fire" repositioning are gone.
+  - Leading uses the original's formula.
+  - Fire needs line of sight, range, the target on the gun line, and no friend in the way.
+- **Brain:**
+  - Non-combat, combat and post-combat modes, with six alert-level records setting sight, reaction and throttle.
+  - Alert points and decay.
+  - Target choice by recent attacker, then distance / firepower / armour every 5 s.
+  - Visibility 250 m, notify ranges 180 / 64 m.
+- **Tactics:**
+  - Default tactics are picked from the per-class tactic table (least-used first) instead of invented percentages.
+  - GearCombat1/2/3, the flanks and the other tactics are rewritten from their decoded think functions and order
+    flags.
+  - Movement speed comes from the alert record's throttle; the 3/4/5 order value is a timer, not a speed.
+- **Removed (no original counterpart):**
+  - retreat below 25 % health
+  - stuck back-off
+  - lava escape and lava route cost
+  - squad mates' auto-skate and auto-kneel
+  - squad leash ranges
+  - the pilot difficulty's effect on AI (the sim has no difficulty setting)
+- `CanTarget(unit, 0)` makes the unit untargetable, as in the original. It used to stop the unit itself from
+  targeting.
+- Squad Go To uses each mate's formation offset round the nav point. Fire At Will clears hold fire.
+
+### Your gear
+- **Speed:**
+  - Top speed = Movement × 6 km/h; skates use the second Movement stat.
+  - Walk/run switch at MaxWalkSpeed (or 0.35 × top speed).
+- **Throttle:** the original's controls. The forward/back axis plus throttle settings (`,` 1/3, `.` 2/3, `/` full,
+  `=` / `-` step, `0` stop, `Backspace` reverse). Shift-to-run is gone; the throttle sets the pace.
+- **Turning:** the torque model with Maneuverability and critical-hit losses.
+- **Jumps:** jump and jump jets as the original (separate triggers, thrust for 0.225 / 0.45 s, gravity 20). `J` fires
+  jump jets on gears with the perk.
+- **Skates:** deploy and retract with their animations, and switch only at low speed.
+- **Ground:** the gear stands on the ground under its centre. The slope force applies to the user's gear only.
+- **Animation:** the walk/run cross-fade is gone; one-shot animations play at their scripted rate.
+
+### Damage
+- Critical hits use the original's system-group tables, with perks, flaws and each weapon's system mask:
+  - armour −3 / −8 / −25 for gears
+  - knock-downs
+  - vehicles use their own table
+- Haywire, collateral damage (full damage in the radius, delayed by distance) and Reinforced Armour follow the original.
+- The port's speed penalties for lost legs, wading and low gravity are gone.
+
+### World and sound
+- **Rain:** the original's weather field. Thin, faint 5 m drops drawn over the visible terrain tiles, with rings on
+  water.
+- **Weather levels:**
+  - 20 levels, with lightning and thunder from level 5.
+  - The particle setting caps the level.
+  - Snow draws nothing, as in the original.
+- **Particles:**
+  - Sizes, drag, gravity, wind, gusts, animation cells and draw modes are as decoded.
+  - The detail slider picks the Low / Med / Hi particle folders.
+  - No near-camera fade or random spin.
+- **Footsteps:** the surface's step sound and FOOT_DUST0/1 (FOOT_RAIN / FOOT_SNOW in weather), scaled by the unit's
+  size.
+- **Sound:**
+  - Sounds.lst ranges are centimetres, with a linear fade from the inner to the outer range and a decibel volume
+    curve.
+  - Looping sounds share 16 voices, and every source plays its own.
+- **Water:** the surface bobs ±0.09 m. The lowered-ground hack is gone.
+- **Mission lights:** they're lights, not glow sprites.
+
+### Still the port's own, not yet decoded
+- **Collision and spawns:**
+  - collision boxes built from model geometry
+  - fountain spawn placement
+  - instant-action waves
+  - squad formation slots
+- **Sensors and the camera:** the sensor/stealth detection formula, and chase camera limits.
+- **Damage details:** lava damage rate, hard-landing damage, and the ejection rules.
+- **Animation and sound timing:** sidestep leg swing and footstep contact timing.
+- **Not in the port at all:**
+  - water buoyancy
+  - the crippled-gear animation set
+  - the lightning bolt shape
+
+## 0.27.3 - 2026-11-21
+
+- AI fire discipline: gunners fire one trigger pull of their weapon's Auto_Burst rounds per volley order, as the
+  original's FIREWPN does, and on the move only in bursts with a 1.5-3 s pause; autocannons no longer hose a
+  continuous stream from every enemy.
+- Hostile units no longer auto-skate; only squad mates skate to keep up with you (enemies were closing at skating
+  speed, ~90 km/h).
+
 ## 0.27.2 - 2026-11-21
 
 - Ambient loops play once, from their nearest source: the marsh maps put the same cricket loop on dozens of props

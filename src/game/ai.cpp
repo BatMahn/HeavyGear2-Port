@@ -22,16 +22,38 @@ std::string lowerCopy(std::string s) {
     for (auto& c : s) c = char(tolower((unsigned char)c));
     return s;
 }
-// How far a unit notices enemies at each team alert level (defcon 0..5) relative to its sensor range.
-constexpr float kAlert[6] = {0.25f, 0.45f, 0.65f, 0.85f, 1.0f, 1.25f};
+bool has(const std::string& s, const char* k) { return s.find(k) != std::string::npos; }
+float rand01() { return float(rand() % 32768) * (1.f / 32767.f); }  // rand() * DAT_101472c8 (1/32767)
+
+// The team behaviour records, one per alert level (FUN_100bb970 fills them at +0x248 + level * 0x44 of the team
+// configuration; FUN_100b89e0 points the team and every brain's +0x14 at the current one). Fields used:
+// +0x00 sensor reach (FUN_100b8fc0, clamped 50..400), +0x0c engage range, +0x10 seconds in view before engaging,
+// +0x18 the gunner's rest between bursts (FUN_100b7cd0: +- 0.5 s at random), +0x1c how long a hit (or a hit on a friend) keeps a unit engaged, +0x28 post-combat time, +0x2c/+0x30/+0x34 throttle
+// in the non-combat / combat / post modes (FUN_100b7d00), +0x38 seconds before the level drops, +0x3c alert points
+// that raise it, +0x40 the engage test (FUN_100bddd0 at every level).
+struct Rec {
+    float sight, engage, seenTime, react, hitMemory, postTime, throttle[3], decay, escalate;
+};
+constexpr Rec kRec[6] = {
+    {400, 48, 0.f, 0.1f, 8, 10, {1.5f, 1.5f, 1.5f}, 1e30f, 1e30f},
+    {100, 64, 8.f, 3.f, 5, 10, {0.3f, 0.85f, 0.3f}, 1e30f, 100},
+    {150, 80, 5.f, 2.7f, 5, 10, {0.4f, 0.85f, 0.5f}, 20, 150},
+    {250, 120, 2.f, 2.f, 10, 10, {0.5f, 0.85f, 0.6f}, 40, 100},
+    {300, 250, 1.f, 1.f, 10, 10, {0.6f, 0.9f, 0.8f}, 30, 100},
+    {400, 300, 0.5f, 0.5f, 20, 20, {0.8f, 1.f, 0.9f}, 15, 1e30f},
+};
+// FUN_100b8900: alert points per event (0 a sighting, 1, 2 entering combat, 3 an enemy round close by, 4 hit,
+// 5 a unit of the team destroyed, 6)
+constexpr float kAlertPoints[7] = {1, 10, 25, 5, 25, 100, 50};
+constexpr float kFacing = 1.30899675f;  // DAT_10148278: 75 degrees
 }  // namespace
 
 void AiSystem::init(const FileSystem& fs, Scene& scene, Combat& combat, const Player& player) {
     scene_ = &scene;
     combat_ = &combat;
     player_ = &player;
-    // teams start relaxed (defcon 0, FUN_100b89e0(0)) and grow alert from what their units see and suffer
-    for (int t = 0; t < 16; t++) defcon_[t] = 0, minDefcon_[t] = 0, maxDefcon_[t] = 5, alert_[t] = 0;
+    // the team object (FUN_100b8330) starts at alert level 1 between the limits 1 and 5
+    for (int t = 0; t < 16; t++) teams_[t] = Team{}, teams_[t].timer = kRec[1].decay;
     fs_ = &fs;
     for (size_t i = 0; i < scene.mission().objects.size(); i++)
         if (int(i) != player.object()) addUnit(int(i));
@@ -52,10 +74,8 @@ bool AiSystem::addUnit(int index, bool neutral) {
     u.team = o.team;
     u.type = o.type;
     u.mobile = !turret;
-    u.detect = 220.f + 15.f * float(u.body.def().sensors);
     u.home = u.body.position();
     combat_->addUnit(index, u.body.def());
-    u.think = float(index % 10) * 0.05f;
     if (audioHook_) u.body.audio = audioHook_, u.body.soundVolume = 0.8f;
     if (particlesHook_) u.body.particles = particlesHook_;
     units_.push_back(std::move(u));
@@ -105,13 +125,16 @@ void AiSystem::stop(int o) {
     if (Unit* u = find(o)) u->path.clear(), u->drive = 0, u->braked = true;  // FullBrake: hold until ordered or attacked
 }
 void AiSystem::speed(int o, float kph) {
+    // SetSpeed (FUN_100d8790): brain +0x1d4 = kph x 0.278 / top speed, clamped to -1..1 — the throttle path orders use
     Unit* u = find(o);
     if (!u) return;
-    float maxKph = std::max(1.f, u->body.def().maxRunSpeed * 3.6f);
-    u->speedFrac = std::max(0.05f, std::min(1.f, kph / maxKph));
+    float vmax = u->body.def().maxRunSpeed;
+    u->speedSet = vmax > 1e-5f ? std::clamp(kph * 0.278f / vmax, -1.f, 1.f) : 0.f;
 }
 void AiSystem::attack(int o, int t) {
-    if (Unit* u = find(o)) u->forced = t, u->target = t, u->asleep = false, u->awake = true;
+    // Attack (FUN_100d89f0): lock the target (vtable +0x1c4 -> FUN_10050440, brain +0xa4) and make HuntTarget the
+    // non-combat tactic
+    if (Unit* u = find(o)) u->forced = t, u->target = t, u->asleep = false, u->nonCombatTactic = "hunttarget";
 }
 void AiSystem::notifyRange(int o, float r) {
     if (Unit* u = find(o)) u->enemyRange = std::max(0.f, r);
@@ -119,14 +142,15 @@ void AiSystem::notifyRange(int o, float r) {
 
 void AiSystem::command(int o, const std::string& c, float a, float b, float cc, const std::string& s, float d) {
     (void)b, (void)cc;
+    if (c == "canTarget") {  // CanTarget (builtin 174): brain +0x1a, whether other units may target this one
+        untargetable_[o] = a == 0;
+        return;
+    }
     Unit* u = find(o);
     if (!u) return;
-    if (c == "visibility") u->detect = std::max(0.f, a);
+    if (c == "visibility") u->visRange = std::max(0.f, a);  // SetVisibilityRange (+0x54)
     else if (c == "friendRange") u->friendRange = std::max(0.f, a);
-    else if (c == "canTarget") {
-        u->canTarget = a != 0;
-        if (!u->canTarget) u->target = -1, u->forced = -1;
-    } else if (c == "movementMode") u->body.setSkates(int(a) == 3), u->scriptStance = true;
+    else if (c == "movementMode") u->body.setSkates(int(a) == 3), u->scriptStance = true;
     else if (c == "standingMode") {
         u->scriptStance = true;
         // script codes: 0/4 prone, 1/3 standing (3 = on skates), 2 kneeling (FUN_100d7030)
@@ -142,7 +166,7 @@ void AiSystem::command(int o, const std::string& c, float a, float b, float cc, 
     else if (c == "lookAt") u->lookAt = int(a);
     else if (c == "autoSleep") u->autoSleep = a != 0, u->dozing = u->dozing && a != 0;
     else if (c == "autopilot") {  // back to the brain's own behaviour; FUN_100d7280 also resets auto aim and cinematic control
-        u->asleep = false, u->forced = -1, u->drive = 0, u->braked = false;
+        u->asleep = false, u->forced = -1, u->drive = 0, u->braked = false, u->orders.clear();
         u->autoAim = true, u->cinematic = false, u->autoScan = true;
     } else if (c == "fullStop") u->body.halt();       // FUN_100d44f0: +0x158(0,0), orders kept
     else if (c == "cinematicControl") u->cinematic = a != 0;  // FUN_100d66d0
@@ -173,11 +197,12 @@ void AiSystem::scan(Unit& u, float dt) {
 }
 
 void AiSystem::hitBy(int o, int shooter) {
+    // FUN_100b82a0: the attacker goes to +0x1e0 with its clock +0x1e4 at 0; the team takes alert event 4
     Unit* u = find(o);
     if (!u || shooter < 0 || shooter == o) return;
-    u->attacker = shooter;
-    if (u->canTarget && teamOf(shooter) != u->team) u->awake = true, u->braked = false;
-    if (teamOf(shooter) != u->team) raiseAlert(u->team - 99, 3.f);
+    u->attacker = shooter, u->hitAgo = 0;
+    u->braked = false;
+    if (teamOf(shooter) != u->team) alertEvent(u->team - 99, 4);
 }
 
 bool AiSystem::teleport(int o, const Vec3& p) {
@@ -195,21 +220,30 @@ bool AiSystem::face(int o, const Vec3& p) {
 }
 
 void AiSystem::follow(int object, int leader, const Vec3& slot) {
-    if (Unit* u = find(object)) u->leader = leader, u->slot = slot, u->awake = true, u->autoSleep = false;
+    if (Unit* u = find(object)) u->leader = leader, u->slot = slot, u->autoSleep = false;
 }
 
 void AiSystem::squadOrder(int leader, int order, int object, const Vec3& pos) {
+    // The user's squad commands (FUN_100d1bc0). Attack / Defend give the mates the user's target as a locked target /
+    // SquadMateDefend charge; Hold and Go To run SquadMateGuard on a point (Go To: the mate's formation offset round
+    // the nav point, FUN_100cef60 -> FUN_100be4f0); Fire At Will clears the hold-fire flags (FUN_100cfd00(mate, 0):
+    // +0xe6 / +0xe7); Regroup drops the order and goes back to SquadMateFollow.
     for (auto& u : units_) {
         if (u.leader != leader || !combat_->alive(u.object)) continue;
         u.order = order, u.orderObj = object, u.orderPos = pos;
         u.braked = false;
-        if (order == OrderAttack) u.forced = object;
-        else u.forced = -1;
+        u.forced = order == OrderAttack ? object : -1;
+        if (order == OrderAttack) u.target = object, u.targetHold = 0;
         if (order == OrderHold) u.orderPos = u.body.position();
-        if (order == OrderRegroup) u.disengage = 6.f, u.target = -1, u.order = OrderFollow;
-        if (order == OrderGoto) {  // spread round the nav point
-            int k = int(&u - units_.data());
-            u.orderPos = pos + Vec3(std::sin(float(k) * 2.1f), 0, std::cos(float(k) * 2.1f)) * 15.f;
+        if (order == OrderFireAtWill) u.holdFire = false, u.noSeenEngage = false, u.order = OrderFollow;
+        if (order == OrderRegroup) u.order = OrderFollow;
+        if (order == OrderGoto) {
+            Vec3 lp;
+            float ly = player_ && leader == player_->object() ? player_->yaw() : 0.f;
+            if (const Unit* l = find(leader)) ly = l->body.yaw();
+            (void)lp;
+            Vec3 right(-std::cos(ly), 0, std::sin(ly)), back(std::sin(ly), 0, std::cos(ly));
+            u.orderPos = pos + right * u.slot.x + back * u.slot.z;
         }
     }
 }
@@ -230,41 +264,45 @@ int AiSystem::relation(int o, int ref) const {
     }
     const Unit* u = find(o);
     if (!u) return -1;
-    if (ref == 1) return u->enemyNear >= 0 ? u->enemyNear : u->target;
-    if (ref == 2) return u->friendNear;
+    if (ref == 1) return u->nearEnemy >= 0 ? u->nearEnemy : u->target;
+    if (ref == 2) return u->nearFriend;
     if (ref == 5) return u->attacker >= 0 ? u->attacker : u->target;
     return -1;
 }
 
-void AiSystem::raiseAlert(int team, float points) {
+// ---- team alert (FUN_100b89e0 / FUN_100b8900, the decay at the end of the brain pass FUN_100ba7c0)
+void AiSystem::setLevel(int team, int level) {
     if (team < 0 || team >= 16) return;
-    alert_[team] += points;
-    // escalate a level each time the points pass the next threshold (FUN_100b8xxx), clamped to the script limits
-    while (defcon_[team] < maxDefcon_[team] && alert_[team] > float(defcon_[team] + 1) * 6.f) defcon_[team]++;
+    Team& T = teams_[team];
+    T.defcon = std::max(T.minDefcon, std::min(T.maxDefcon, level));
+    T.points = 0, T.timer = kRec[std::clamp(T.defcon, 0, 5)].decay;
+}
+void AiSystem::alertEvent(int team, int ev) {
+    if (team < 0 || team >= 16 || ev < 0 || ev > 6) return;
+    Team& T = teams_[team];
+    const Rec& R = kRec[std::clamp(T.defcon, 0, 5)];
+    float p = kAlertPoints[ev];
+    T.points += p;
+    T.timer = std::min(T.timer + 0.5f * p, R.decay);
+    if (T.points > R.escalate) setLevel(team, T.defcon + 1);
 }
 
 void AiSystem::setDefcon(int team, int level, int mode) {
     if (team < 0 || team >= 16) return;
+    Team& T = teams_[team];
     level = std::max(0, std::min(5, level));
-    if (mode == 1) {
-        minDefcon_[team] = level;
-        defcon_[team] = std::max(defcon_[team], level);
-    } else if (mode == 2) {
-        maxDefcon_[team] = level;
-        defcon_[team] = std::min(defcon_[team], level);
-    } else {
-        defcon_[team] = std::max(minDefcon_[team], std::min(maxDefcon_[team], level));
-    }
-    alert_[team] = std::max(alert_[team], float(defcon_[team]) * 6.f + 30.f);  // a scripted alert lasts a while
+    if (mode == 1) T.minDefcon = level, setLevel(team, std::max(T.defcon, level));
+    else if (mode == 2) T.maxDefcon = level, setLevel(team, std::min(T.defcon, level));
+    else setLevel(team, level);
 }
-int AiSystem::defcon(int team) const { return team >= 0 && team < 16 ? defcon_[team] : 6; }
+int AiSystem::defcon(int team) const { return team >= 0 && team < 16 ? teams_[team].defcon : 6; }
 
 void AiSystem::dump() const {
     for (auto& u : units_) {
         Vec3 p = u.body.position();
-        SDL_Log("  unit %d %s team %d at %.0f,%.0f %s%s path %zu/%zu tgt %d hp %.2f", u.object,
+        SDL_Log("  unit %d %s team %d at %.0f,%.0f %smode %d tac %s path %zu/%zu tgt %d hp %.2f", u.object,
                 scene_->mission().objects[size_t(u.object)].name.c_str(), u.team, p.x, p.z, u.asleep ? "asleep " : "",
-                u.inCombat ? "combat " : "", u.pathIdx, u.path.size(), u.target, combat_->health(u.object));
+                u.mode, u.tactic.c_str(), u.pathIdx, u.path.size(), u.target, combat_->health(u.object));
     }
 }
 
@@ -300,6 +338,357 @@ bool AiSystem::positionOf(int object, Vec3& out) const {
     return false;
 }
 
+// ---- tactics (FUN_100dadc0's table, FUN_100dd910's choice)
+int AiSystem::unitClass(const Unit& u) const {
+    // brain +0x42 by unit class: 2 gear, 3 infantry, 5 mount, 6 chicken walker, 8 turret, 9 vehicle (jeep / tank),
+    // 10 hover
+    switch (u.type) {
+        case 0x4b: return 8;
+        case 0x4e: return 9;
+        case 0x4f: return 10;
+        case 0x50: return 3;
+        case 0x51: return 5;
+        case 0x52: return 6;
+        default: return 2;
+    }
+}
+
+bool AiSystem::tacticApplies(const Unit& u, const std::string& t, int mode) const {
+    // each tactic's +0x20 "applies" method, with the modes it was registered for (+0x1c combat, +0x1d post,
+    // +0x1e non-combat)
+    bool weapon = combat_->longestRange(u.object) > 0;  // FUN_100bc870: a usable weapon
+    if (t == "gearcombathand2hand")  // FUN_100aa8d0: a melee weapon, and no target 16 m or more away while a gun is usable
+        return mode == 1 && combat_->hasMelee(u.object) && !(u.target >= 0 && u.targetDist >= 16.f && weapon);
+    if (t == "infantrycover") return mode == 1;  // FUN_100a9500: somewhere to take cover (not modelled: always)
+    if (t == "defaultrunaway")  // FUN_100ab460: hit in the last 6 s, or out of non-combat, or an enemy in view
+        return (u.attacker >= 0 && u.hitAgo < 6.f) || mode != 0 || u.nearEnemy >= 0;
+    if (has(t, "pursue") || t == "chaseenemy" || has(t, "patrol") || t == "defaultholdground") return true;
+    return mode == 1 ? weapon : true;  // FUN_100a8410 / FUN_100a9000 / FUN_100a9830
+}
+
+std::string AiSystem::pickTactic(Unit& u, int mode) {
+    // FUN_100b9510: the script's tactic for the mode if it applies, else FUN_100dd910: of the class's tactics for the
+    // mode that apply, the one used least so far (weight +0x10 = 0 minus uses +0x14; the first registered wins a tie),
+    // else the default list (combat DefaultRunAway, post DefaultHoldGround, non-combat DefaultPatrol)
+    std::string mine = mode == 1 ? u.combatTactic : mode == 0 ? u.nonCombatTactic : std::string();
+    if (!mine.empty() && mine != "default" && mine != "none" && tacticApplies(u, mine, mode)) return mine;
+    static const std::vector<std::string> kGear[3] = {{"gearpatrol1"}, {"gearcombat1", "gearcombat3", "gearcombathand2hand", "gearflankright", "gearflankleft"}, {"gearpursue1"}};
+    static const std::vector<std::string> kInf[3] = {{"infantrypatrol1"}, {"infantrycombat1", "infantrycover"}, {"infantrypursue1"}};
+    static const std::vector<std::string> kMount[3] = {{"mountpatrol1"}, {"mountcombat1"}, {"mountpursue1"}};
+    static const std::vector<std::string> kCw[3] = {{"chickenwalkerpatrol1"}, {"chickenwalkercombat1", "chickenwalkercombat2"}, {"chickenwalkerpursue1"}};
+    static const std::vector<std::string> kTurret[3] = {{}, {"turretcombat1"}, {}};
+    static const std::vector<std::string> kVehicle[3] = {{"vehiclepatrol1"}, {"tankattack"}, {"jeeppursue"}};
+    static const std::vector<std::string> kHover[3] = {{"pa_t1_c3", "pa_t2_c3", "pa_t3_c3"}, {"hovercombat1", "hoverflankright", "hoverflankleft", "hovercircle"}, {"hoverpursue1"}};
+    static const std::string kDefault[3] = {"defaultpatrol", "defaultrunaway", "defaultholdground"};
+    const std::vector<std::string>* list = kGear;
+    switch (unitClass(u)) {
+        case 3: list = kInf; break;
+        case 5: list = kMount; break;
+        case 6: list = kCw; break;
+        case 8: list = kTurret; break;
+        case 9: list = kVehicle; break;
+        case 10: list = kHover; break;
+        default: break;
+    }
+    const std::string* best = nullptr;
+    int bestScore = 0;
+    for (auto& t : list[mode])
+        if (tacticApplies(u, t, mode) && (!best || -tacticUses_[t] > bestScore)) best = &t, bestScore = -tacticUses_[t];
+    if (best) return tacticUses_[*best]++, *best;
+    if (tacticApplies(u, kDefault[mode], mode)) return tacticUses_[kDefault[mode]]++, kDefault[mode];
+    return std::string();
+}
+
+void AiSystem::post(Unit& u, int kind, int flags, float param, const Vec3& pos, int obj) {
+    Order o;
+    o.kind = kind, o.flags = flags, o.param = param, o.pos = pos, o.obj = obj;
+    u.orders.push_back(o);
+}
+
+float AiSystem::modeThrottle(const Unit& u) const {
+    int lvl = std::clamp(defcon(u.team - 99), 0, 5);
+    return kRec[lvl].throttle[std::clamp(u.mode, 0, 2)];
+}
+
+void AiSystem::setThrottle(const Unit& u, PlayerInput& in, float t) const {
+    // The original's throttle drives the gear's force model, whose steady speed on the flat is sqrt(throttle) of the
+    // top speed (FUN_1003c0b0 / FUN_1003c5f0, see "Gear ground physics"); the port's body takes a walk / run choice
+    // and a fraction of that pace.
+    float a = std::min(1.f, std::fabs(t)), walk = std::max(0.1f, u.body.def().maxWalkSpeed), run = std::max(walk, u.body.def().maxRunSpeed);
+    float v = std::sqrt(a) * run;
+    if (t < 0) in.throttle = -std::min(1.f, v / walk), in.run = false;
+    else if (v > walk) in.throttle = v / run, in.run = true;
+    else in.throttle = v / walk, in.run = false;
+}
+
+// The running tactic's Think (vtable slot 11), posting orders and stepping its run record; false when it is done
+// (the brain then picks again, FUN_100dddd0 / FUN_100b9510).
+bool AiSystem::think(Unit& u, float dt) {
+    const std::string& tac = u.tactic;
+    Vec3 me = u.body.position(), tp;
+    bool haveTarget = u.target >= 0 && combat_->alive(u.target) && positionOf(u.target, tp);
+    bool queued = !u.orders.empty();
+    auto around = [&](const Vec3& c, float r, float ang) { return c + Vec3(std::sin(ang), 0, std::cos(ang)) * r; };
+    auto randomWithin = [&](float r) {  // FUN_100b6db0(0, r, -pi, pi): a random offset up to r at a random bearing
+        float rr = r * rand01(), ang = (rand01() * 2.f - 1.f) * kPi;
+        return Vec3(std::sin(ang) * rr, 0, std::cos(ang) * rr);
+    };
+    // ---- combat tactics
+    if (tac == "gearcombat1" || tac == "infantrycombat1" || tac == "hovercombat1" || tac == "framecombat1") {
+        // FUN_100a84d0 (start FUN_100a8440: counter 4, a POSITION order with the mode's throttle)
+        switch (u.step) {
+            case 0: {
+                if (u.count <= 0) return false;
+                u.count--;
+                if (haveTarget && u.los) {
+                    if (!u.facing) { post(u, 6, 0, 3.f, tp, u.target); u.step = 1; return true; }  // TURNTO
+                    if (u.inRange) {
+                        if (combat_->longestRange(u.object) <= 0) return false;  // vtable +0x18c: nothing to fire
+                        float r = rand01();
+                        if (u.targetDist >= 32.f) u.step = r < 0.2f ? 4 : 6;
+                        else if (!u.targetFacing) u.step = r < 0.1f ? 4 : 5;
+                        else u.step = 6;
+                        return true;
+                    }
+                    post(u, 2, 1, 3.f, tp);  // MOVETO the target until in range
+                    u.step = 2;
+                    return true;
+                }
+                // no target in sight: to where it was last seen, shooting if it shows, then stand
+                post(u, 2, 9, 3.f, u.lastKnown), post(u, 1, 0, 0);
+                u.step = 3;
+                return true;
+            }
+            case 1:
+                if (!queued) u.step = 0;
+                return true;
+            case 2:
+                u.combatTimer = 2.f;  // brain +0x4c: stay in combat while closing
+                if (queued && !u.inRange) return true;
+                u.orders.clear(), u.step = 0;  // FUN_100534b0
+                return true;
+            case 3:
+                if (haveTarget && u.los) u.orders.clear(), u.step = 0;
+                else if (!queued) u.step = 0;
+                return true;
+            case 4:  // FIREWPN_V 2 s
+                if (!haveTarget) { u.step = 0; return true; }
+                post(u, 10, 2, 2.f, tp, u.target);
+                u.step = 1;
+                return true;
+            case 5: {  // a 64 m move at 90 degrees round the target, backwards, firing, 4 s at most
+                if (!haveTarget) { u.step = 0; return true; }
+                float b = std::atan2(me.x - tp.x, me.z - tp.z);
+                post(u, 2, 0xb9, 4.f, around(tp, 64.f, b + kPi * 0.5f));
+                u.step = 1;
+                return true;
+            }
+            case 6: {  // a run across the target's front: its position + its heading x 32 + a 64 m side step
+                if (!haveTarget) { u.step = 0; return true; }
+                Vec3 fwd(0, 0, -1);
+                if (const Unit* t = find(u.target)) fwd = Vec3(-std::sin(t->body.yaw()), 0, -std::cos(t->body.yaw()));
+                else if (u.target == player_->object()) fwd = Vec3(-std::sin(player_->yaw()), 0, -std::cos(player_->yaw()));
+                Vec3 side(-fwd.z, 0, fwd.x);
+                Vec3 p = tp + fwd * 32.f + side * (rand01() < 0.5f ? 64.f : -64.f);
+                post(u, 2, 0x199, 4.f, p);
+                u.step = 1;
+                return true;
+            }
+        }
+        return false;
+    }
+    if (tac == "gearcombat3" || tac == "hovercircle" || tac == "framecombat3") {
+        // FUN_100a90e0: every 2 s check there's still a weapon (+0x18c); step 0 picks a spot and returns to the start
+        // point afterwards: no target in sight / reach -> where it was last seen; 32 m or more away -> a random point
+        // within 32 m; closer -> straight away from the target. Moves fire on the way (0x109).
+        if ((u.tacTimer -= dt) < 0) {
+            if (combat_->longestRange(u.object) <= 0) return false;
+            u.tacTimer = 2.f;
+        }
+        switch (u.step) {
+            case 0: {
+                Vec3 goal = me;
+                u.point = me, u.step = 2;
+                if (!haveTarget) goal = me + randomWithin(32.f), u.step = 3;
+                else if (!u.los || !u.inRange) goal = u.lastKnown, u.step = 3;
+                else if (u.targetDist >= 32.f) goal = me + randomWithin(32.f);
+                else {
+                    Vec3 away = flat(me - tp);
+                    float l = length(away);
+                    goal = me + (l > 0.01f ? away * (32.f / l) : Vec3(32.f, 0, 0));
+                    u.point = goal;
+                }
+                post(u, 2, 0x109, 3.f, goal);
+                return true;
+            }
+            case 1: post(u, 2, 0x109, 3.f, u.point), u.step = 4; return true;
+            case 2: if (!queued) u.step = 1; return true;
+            case 3:
+                if (u.los && u.inRange) u.orders.clear();
+                if (u.orders.empty()) u.step = 0;
+                return true;
+            case 4: if (!queued) u.step = 0; return true;
+        }
+        return false;
+    }
+    if (has(tac, "flank") || tac == "frontal") {
+        // FUN_100a9ee0 (angles from the constructor FUN_100a9770: GearFlankLeft / Right +-75, FlankLeft1 / Right1 +-45,
+        // FlankLeft2 / Right2 +-90, Frontal 0): round to the angle off the target's bearing firing on the way, turn in,
+        // FIREWPN_V 5 s
+        float ang = has(tac, "left") ? 75.f : has(tac, "right") ? -75.f : 0.f;
+        if (tac == "flankleft1") ang = 45.f;
+        if (tac == "flankright1") ang = -45.f;
+        if (tac == "flankleft2") ang = 90.f;
+        if (tac == "flankright2") ang = -90.f;
+        if (queued) return true;
+        if (!haveTarget) return false;
+        if (u.step == 0) {
+            float b = std::atan2(me.x - tp.x, me.z - tp.z);
+            float r = std::min(u.targetDist, std::max(32.f, combat_->range(u.object) * 0.7f));
+            post(u, 2, 0x109, 3.f, around(tp, r, b + ang * 0.017453f));
+            u.step = 1;
+        } else if (u.step == 1) {
+            post(u, 6, 9, 3.f, tp, u.target);
+            u.step = 2;
+        } else {
+            if (u.los) post(u, 10, 10, 5.f, tp, u.target);
+            u.step = 0;
+            return u.los;
+        }
+        return true;
+    }
+    if (has(tac, "hand2hand")) {
+        // FUN_100aacc0: MOVETO the target (flags 1), then wait 3 s (NOP)
+        if (queued) return true;
+        if (!haveTarget) return false;
+        if (u.step == 0) post(u, 2, 1, 3.f, tp, u.target), post(u, 0, 0, 3.f), u.step = 1;
+        else return false;
+        return true;
+    }
+    if (has(tac, "turretcombat") || tac == "planecombat1") {
+        // FUN_100aaef0: FIREWPN_V 5 s at the target in sight
+        if (queued) return true;
+        if (!haveTarget) return false;
+        if (u.los) post(u, 10, 10, 5.f, tp, u.target);
+        return true;
+    }
+    if (tac == "tankattack") {
+        // FUN_100ab040: in sight 80 % FIREWPN_V 5 s, else a move firing on the way (9); out of sight, at it
+        if (queued) return true;
+        if (!haveTarget) return false;
+        if (u.los) {
+            if (rand01() > 0.8f) post(u, 2, 9, 3.f, around(me, 40.f, rand01() * 2 * kPi));
+            else post(u, 10, 10, 5.f, tp, u.target);
+        } else {
+            post(u, 2, 9, 3.f, u.lastKnown);
+        }
+        return true;
+    }
+    if (tac == "gearcombat2" || tac == "chickenwalkercombat2" || tac == "mountcombat1") {
+        // GearCombat2 / ChickenWalkerCombat2 / MountCombat1 (FUN_100a8dd0, start FUN_100a8da0: five rounds): in sight
+        // and reach TURNTO + FIREWPN_V 3 s; else MOVETO where the target was last seen (flags 1) until it is in
+        // sight and reach; the tactic ends when that move ends
+        switch (u.step) {
+            case 0:
+                if (u.count <= 0) return false;
+                u.count--;
+                if (haveTarget && u.los && u.inRange) {
+                    if (combat_->longestRange(u.object) <= 0) return false;
+                    post(u, 6, 0, 3.f, tp, u.target), post(u, 10, 0, 3.f, tp, u.target);
+                    u.step = 1;
+                } else {
+                    post(u, 2, 1, 3.f, u.lastKnown);
+                    u.step = 2;
+                }
+                return true;
+            case 1: if (!queued) u.step = 0; return true;
+            case 2:
+                if (!queued) return false;
+                if (u.inRange && u.los) u.orders.clear(), u.step = 0;
+                return true;
+        }
+        return false;
+    }
+    if (tac == "chickenwalkercombat1") {
+        // FUN_100aa530: in sight and reach: 50 % a move firing on the way (9) and a TURNTO (9), else TURNTO (9) +
+        // FIREWPN_V 5 s (10); otherwise MOVETO where the target was last seen firing on the way (9) until it is in
+        // sight and reach. (The move's offset comes from FUN_100b6eb0, not traced: a random point within 32 m here.)
+        if (u.step == 0) {
+            if (haveTarget && u.los && u.inRange) {
+                if (combat_->longestRange(u.object) <= 0) return false;
+                if (rand01() > 0.5f) {
+                    float rr = 32.f * rand01(), ang = rand01() * 2 * kPi;
+                    post(u, 2, 9, 3.f, me + Vec3(std::sin(ang) * rr, 0, std::cos(ang) * rr)), post(u, 6, 9, 3.f, tp, u.target);
+                } else {
+                    post(u, 6, 9, 3.f, tp, u.target), post(u, 10, 10, 5.f, tp, u.target);
+                }
+                u.step = 1;
+            } else {
+                post(u, 2, 9, 3.f, u.lastKnown);
+                u.step = 2;
+            }
+        } else if (u.step == 1) {
+            if (!queued) u.step = 0;
+        } else {
+            if (haveTarget && u.los && u.inRange) u.orders.clear();
+            if (u.orders.empty()) u.step = 0;
+        }
+        return true;
+    }
+    if (tac == "standandshoot") {
+        // FUN_100a8ba0: TURNTO, FIREWPN_V 4 s
+        if (queued) return true;
+        if (!haveTarget) return false;
+        post(u, 6, 0, 3.f, tp, u.target), post(u, 10, 0, 4.f, tp, u.target);
+        return true;
+    }
+    if (tac == "infantrycover") {
+        // FUN_100a9610: move to cover firing (0x109); the port has no cover finder and gets down where it stands
+        u.body.setPosture(0);
+        if (queued) return true;
+        if (!haveTarget) return false;
+        if (u.los) post(u, 10, 10, 2.f, tp, u.target);
+        return true;
+    }
+    if (tac == "droneattack1") {
+        // FUN_100b06e0: runs in, breaks off after a random few seconds or when close, repeats
+        if (!haveTarget) return false;
+        if ((u.tacTimer -= dt) <= 0) u.step = u.step == 1 ? 2 : 1, u.tacTimer = 3.f + rand01() * 4.f;
+        if (u.targetDist < 25.f) u.step = 2;
+        u.orders.clear();
+        float b = std::atan2(me.x - tp.x, me.z - tp.z);
+        post(u, 2, 9, 0, u.step == 1 ? tp : around(tp, 120.f, b));
+        return true;
+    }
+    if (tac == "defaultrunaway") {
+        // FUN_100ab550: drop the target, turn away from the threat, MOVETO 30 m away for at most 30 s (0x211)
+        if (queued) return true;
+        if (u.step != 0) return false;
+        Vec3 from = haveTarget ? tp : u.lastKnown;
+        float b = std::atan2(me.x - from.x, me.z - from.z);
+        post(u, 2, 0x211, 30.f, around(me, 30.f, b));
+        u.step = 1;
+        return true;
+    }
+    if (has(tac, "pursue") || tac == "chaseenemy") {
+        // FUN_100af9b0: MOVETO where the target was last seen (flags 1), STAND, wait 3 s; again while the post-combat
+        // time lasts
+        if (queued) return true;
+        if (u.step == 1 && u.postTimer < 1e-5f) return false;
+        post(u, 2, 1, 0, u.lastKnown), post(u, 1, 0, 0), post(u, 0, 0, 3.f);
+        u.step = 1;
+        return true;
+    }
+    if (tac == "defaultholdground") {
+        // FUN_100afb50: TURNTO the threat, STAND, wait
+        if (queued) return true;
+        if (u.attacker >= 0 && positionOf(u.attacker, tp)) post(u, 6, 1, 0, tp);
+        post(u, 1, 0, 0), post(u, 0, 0, 3.f);
+        return true;
+    }
+    return false;  // non-combat tactics run in the non-combat section of update()
+}
+
 void AiSystem::update(float dt) {
     if (const char* ft = getenv("HG2_FORCETAC"); ft && !forcedTac_) {  // test hook: "unit:tactic:path"
         forcedTac_ = true;
@@ -315,10 +704,14 @@ void AiSystem::update(float dt) {
             SDL_Log("forcetac %d %s %s: %d mobile %d leader %d braked %d type %x", o, tac, path, assignPath(o, path), find(o)->mobile, find(o)->leader, find(o)->braked, find(o)->type);
         }
     }
+    const bool tacDbg = getenv("HG2_TACDBG") != nullptr;
     routeBudget_ = getenv("HG2_NOROUTE") ? 0.f : 2.f;  // route plans per frame
-    for (int t = 0; t < 16; t++) {  // alerts fade: a team calms down a level at a time
-        alert_[t] = std::max(0.f, alert_[t] - dt * 0.25f);
-        if (defcon_[t] > minDefcon_[t] && alert_[t] < float(defcon_[t]) * 3.f) defcon_[t]--, alert_[t] = float(defcon_[t] + 1) * 4.5f;
+    // the team alert decays (end of the brain pass, FUN_100ba7c0): points at 0.5 a second, and the level drops a step
+    // when its time runs out
+    for (int t = 0; t < 16; t++) {
+        Team& T = teams_[t];
+        T.points = std::max(0.f, T.points - 0.5f * dt);
+        if (T.timer < 1e29f && (T.timer -= dt) < 0) setLevel(t, T.defcon - 1);
     }
     if (viewDist_ <= 0) {  // the far clip / fog limit bounds what the user can see
         FrameParams fp = scene_->frameDefaults();
@@ -330,6 +723,7 @@ void AiSystem::update(float dt) {
     for (auto& u : units_) {
         if (!combat_->alive(u.object)) {
             if (u.type == 0x48) u.body.die(), u.body.update(dt, PlayerInput{});  // fall and lie as a wreck
+            if (u.mode >= 0) alertEvent(u.team - 99, 5), u.mode = -1;  // FUN_10062980: the team loses a unit
             continue;
         }
         Vec3 me = u.body.position();
@@ -341,93 +735,146 @@ void AiSystem::update(float dt) {
                 float dist = length(Vec3(d.x, 0, d.z));
                 Vec3 fwd(-std::sin(player_->yaw()), 0, -std::cos(player_->yaw()));
                 bool inView = dist < viewDist_ && dot(Vec3(d.x, 0, d.z) * (1.f / std::max(1.f, dist)), fwd) > 0.35f;
-                const Surface* sf = scene_->surfaceAt(me.x, me.z);
-                // never doze on lava, nor while hunting the user or walking a patrol
-                const std::string& nc = u.nonCombatTactic;
-                bool roaming = nc.find("hunt") != std::string::npos || nc.find("patrol") != std::string::npos ||
-                               nc.find("freerange") != std::string::npos || nc.find("pathfollow") != std::string::npos ||
-                               (u.assigned && u.route.size() > 1);
-                u.dozing = dist > 300.f && !inView && u.attacker < 0 && !(sf && sf->damage > 0) && !roaming;
+                u.dozing = dist > 300.f && !inView;
             }
         } else {
             u.dozing = false;
         }
         if (u.dozing) continue;
         u.clock += dt;
-        int sideIdx = u.team - 99, alert = defcon(sideIdx);
-        u.body.speedScale = combat_->mobility(u.object), u.body.turnScale = combat_->manoeuvre(u.object);
+        int sideIdx = u.team - 99;
+        const Rec& R = kRec[std::clamp(defcon(sideIdx), 0, 5)];
+        u.body.speedScale = combat_->mobility(u.object), u.body.maneuverNow = combat_->maneuverNow(u.object);
+        if (int k = combat_->takeKnock(u.object)) u.body.knockDown(k);
         float sensorMul = combat_->sensorsOk(u.object) ? 1.f : 0.5f;
-        u.think -= dt;
-        if (u.think <= 0) {  // perception 4 times a second
-            u.think = 0.25f;
-            // nearest enemy / friend for the notify-range events (FUN_100b9fe0)
-            float bestE = 1e9f, bestF = 1e9f;
+        // ---- perception (FUN_100ba1c0 over the sensor's contacts, FUN_100b9980, FUN_100b95d0)
+        // Contacts: units within the sensor's reach (the record's +0x00) and the visibility range (+0x54) that show
+        // up on the sensors. The sensor signal itself (FUN_10111xxx against the target's concealment +0xc2c, halved
+        // while it fires) is the port's Combat::detectFactor approximation.
+        float contactR = std::min(u.visRange, std::clamp(R.sight, 50.f, 400.f)) * sensorMul;
+        auto exposedTo = [&](int obj, float d) { return d <= contactR * combat_->detectFactor(u.object, obj); };
+        {
+            float bestE = 1e30f, bestF = 1e30f;
             int nearE = -1, nearF = -1;
             auto look = [&](int obj, int team, const Vec3& p) {
-                if (obj == u.object || !combat_->alive(obj)) return;
+                if (obj == u.object || !combat_->alive(obj) || dozing(obj)) return;
                 float d = length(p - me);
+                if (d > u.visRange) return;
                 if (team == u.team) {
                     if (d < bestF) bestF = d, nearF = obj;
-                } else if (team >= 100 && d < bestE) {
+                } else if (team >= 100 && targetable(obj) && exposedTo(obj, d) && d < bestE) {
                     bestE = d, nearE = obj;
                 }
             };
             if (playerAlive) look(player_->object(), playerTeam, player_->position());
             for (auto& o : units_) look(o.object, o.team, o.body.position());
-            if (u.enemyRange > 0) {
-                bool in = nearE >= 0 && bestE <= u.enemyRange;
-                if (in != u.enemyIn) event(u.object, in ? EV_ENEMY_IN : EV_ENEMY_OUT);
-                u.enemyIn = in;
-                u.enemyNear = in ? nearE : -1;
-            }
-            if (u.friendRange > 0) {
-                bool in = nearF >= 0 && bestF <= u.friendRange;
-                if (in != u.friendIn) event(u.object, in ? EV_FRIEND_IN : EV_FRIEND_OUT);
-                u.friendIn = in;
-                u.friendNear = in ? nearF : -1;
-            }
-            // targets: Attack() order, else the closest visible enemy within the alert-scaled sensor range
-            u.target = -1;
-            if (u.disengage > 0) u.disengage -= 0.25f;
-            if (u.order == OrderAttack && (u.orderObj < 0 || !combat_->alive(u.orderObj))) u.order = OrderFollow, u.forced = -1;
-            if (u.order == OrderDefend && (u.orderObj < 0 || !combat_->alive(u.orderObj))) u.order = OrderFollow;
-            if (!u.asleep && u.canTarget && u.disengage <= 0 && !combatHold_) {
-                if (u.forced >= 0 && combat_->alive(u.forced) && !dozing(u.forced)) u.target = u.forced;
-                float best = u.detect * sensorMul * kAlert[std::max(0, std::min(5, alert))] * (u.awake ? 1.5f : 1.f);
-                if (u.team != playerTeam) best *= 0.85f + 0.3f * difficulty_;  // harder pilots spot you sooner
-                auto consider = [&](int obj, int team, const Vec3& p) {
-                    if (team == u.team || team < 100 || !combat_->alive(obj) || dozing(obj)) return;
-                    float d = length(p - me);
-                    // sensors against stealth: compare against the range this target can be seen at
-                    float k = combat_->detectFactor(u.object, obj);
-                    if (u.order == OrderDefend) {  // only what threatens the defended unit
-                        Vec3 dp;
-                        if (positionOf(u.orderObj, dp) && length(p - dp) > 180.f) return;
-                    }
-                    if (d < best * k && scene_->terrainRay(me + Vec3(0, 5, 0), p + Vec3(0, 4, 0)) > 1.f) best = d / k, u.target = obj;
-                };
-                if (u.target < 0 && !u.cinematic) {
-                    if (playerAlive) consider(player_->object(), playerTeam, player_->position());
-                    // HuntUser units go for the user and whoever shoots at them, nobody else
-                    bool hunter = u.nonCombatTactic.find("hunt") != std::string::npos;
-                    for (auto& o : units_)
-                        if (&o != &u && !hunter) consider(o.object, o.team, o.body.position());
+            u.nearEnemy = nearE, u.nearEnemyDist = bestE, u.nearFriend = nearF, u.nearFriendDist = bestF;
+            // notify ranges (FUN_100b9ae0 +0x68 / +0x7c bit 0, events from FUN_100b9fe0)
+            bool ein = bestE <= u.enemyRange, fin = bestF <= u.friendRange;
+            if (ein != u.enemyIn) event(u.object, ein ? EV_ENEMY_IN : EV_ENEMY_OUT);
+            if (fin != u.friendIn) event(u.object, fin ? EV_FRIEND_IN : EV_FRIEND_OUT);
+            u.enemyIn = ein, u.friendIn = fin;
+        }
+        // +0x3c: time an enemy has been in view, up to the record's +0x10; it drains at twice the rate
+        if (u.nearEnemy >= 0) u.seen = std::min(u.seen + dt, R.seenTime);
+        else u.seen = std::max(0.f, u.seen - 2.f * dt);
+        if (u.attacker >= 0) u.hitAgo += dt;
+        if (u.attacker >= 0 && !combat_->alive(u.attacker)) u.attacker = -1, u.hitAgo = 1e30f;
+        // ---- target (FUN_100b9300): a locked target is kept; otherwise the target is held for the team's 5 s
+        // (+0x23c) and chosen again: whoever hit the unit within the record's +0x1c, else the best contact by the
+        // team's targeting mode 2 (FUN_100bcaf0: -distance + 5 x the firepower of its loaded weapons + its armour
+        // points, FUN_100502d0), else the nearest contact; none: look again in 0.5 s
+        bool cinematicMode = combatHold_ || u.cinematic;
+        if (u.forced >= 0 && !combat_->alive(u.forced)) u.forced = -1;
+        if (u.order == OrderAttack && u.forced < 0) u.order = OrderFollow;
+        if (u.order == OrderDefend && (u.orderObj < 0 || !combat_->alive(u.orderObj))) u.order = OrderFollow;
+        if (u.forced >= 0) {
+            if (u.target != u.forced) positionOf(u.forced, u.lastKnown);
+            u.target = u.forced;
+        } else if (!(cinematicMode && u.cinematic)) {
+            bool keep = u.target >= 0 && combat_->alive(u.target) && (u.targetHold -= dt) > 1e-5f;
+            if (!keep) {
+                int cand = -1;
+                if (u.attacker >= 0 && u.hitAgo < R.hitMemory && teamOf(u.attacker) != u.team && targetable(u.attacker)) cand = u.attacker;
+                if (cand < 0) {
+                    float best = -1e30f;
+                    auto score = [&](int obj, int team, const Vec3& p) {
+                        if (obj == u.object || team == u.team || team < 100 || !combat_->alive(obj) || dozing(obj) || !targetable(obj)) return;
+                        float d = length(p - me);
+                        if (d > u.visRange || !exposedTo(obj, d)) return;
+                        float s = -d + 5.f * combat_->firepower(obj) + combat_->hitpoints(obj);
+                        if (s > best) best = s, cand = obj;
+                    };
+                    if (playerAlive) score(player_->object(), playerTeam, player_->position());
+                    for (auto& o : units_) score(o.object, o.team, o.body.position());
+                    if (cand < 0) cand = u.nearEnemy;
                 }
-                // an attacker is engaged even beyond the sensor range
-                if (u.target < 0 && !u.cinematic && u.attacker >= 0 && combat_->alive(u.attacker) && teamOf(u.attacker) != u.team) {
-                    Vec3 ap;
-                    if (positionOf(u.attacker, ap) && length(ap - me) < u.detect * 2.f) u.target = u.attacker;
-                }
-                if (u.target >= 0) u.awake = true;
+                u.targetHold = cand >= 0 ? 5.f : 0.5f;
+                if (cand != u.target && cand >= 0) positionOf(cand, u.lastKnown);
+                u.target = cand;
             }
-            // combat starts with a target and ends after 3 s without one
-            // a team grows alert when its units see the user or come under fire
-            if (u.target >= 0) u.calm = 0;
-            if (u.target >= 0 && (u.target == player_->object() || u.attacker >= 0)) raiseAlert(sideIdx, 0.4f);
-            else u.calm += 0.25f;
-            bool combat = u.target >= 0 || (u.inCombat && u.calm < 3.f);
-            if (combat != u.inCombat) event(u.object, combat ? EV_COMBAT_START : EV_COMBAT_END);
-            u.inCombat = combat;
+        }
+        if (u.target >= 0 && !combat_->alive(u.target)) u.target = -1;
+        // ---- what the brain knows of its target
+        Vec3 tp;
+        bool haveTarget = u.target >= 0 && positionOf(u.target, tp);
+        if (haveTarget) {
+            u.targetDist = length(tp - me);
+            u.exposed = exposedTo(u.target, u.targetDist) || (u.target == u.attacker && u.hitAgo < R.hitMemory) || u.target == u.forced;
+            if ((u.losCheck -= dt) <= 0 || u.target != u.lastTarget)
+                u.losCheck = 0.25f, u.los = scene_->terrainRay(me + Vec3(0, 5, 0), tp + Vec3(0, 4, 0)) > 0.98f;
+            if (getenv("HG2_LOSDBG") && int(u.clock) != int(u.clock - dt))
+                SDL_Log("los %d->%d me %.1f,%.1f,%.1f (g %.1f) tp %.1f,%.1f,%.1f (g %.1f) ray %.2f", u.object, u.target, me.x, me.y, me.z,
+                        scene_->groundHeight(me.x, me.z), tp.x, tp.y, tp.z, scene_->groundHeight(tp.x, tp.z), scene_->terrainRay(me + Vec3(0, 5, 0), tp + Vec3(0, 4, 0)));
+            if (u.los || u.exposed) u.lastKnown = tp;
+            Vec3 d = flat(tp - me);
+            u.facing = std::fabs(wrap(std::atan2(-d.x, -d.z) - u.body.yaw())) < kFacing;
+            float ty = u.target == player_->object() ? player_->yaw() : 0.f;
+            if (const Unit* t = find(u.target)) ty = t->body.yaw();
+            u.targetFacing = std::fabs(wrap(std::atan2(d.x, d.z) - ty)) < kFacing;
+            float reach = combat_->chooseWeapon(u.object, u.targetDist);
+            u.inRange = reach > 0 && u.targetDist <= std::max(reach, 6.f);
+        } else {
+            u.los = u.exposed = u.inRange = false;
+        }
+        // ---- engage? (the record's +0x40, FUN_100bddd0)
+        bool engage = haveTarget && u.exposed && !u.holdFire &&
+                      ((u.attacker >= 0 && u.hitAgo < R.hitMemory) || u.heardShot || u.nearEnemyDist <= R.engage ||
+                       (!u.noSeenEngage && u.seen >= R.seenTime) || u.target == u.forced);
+        u.heardShot = false;
+        if (u.asleep || !u.canTarget) engage = false;
+        // ---- the mode machine (FUN_100b9ae0, +0x44): combat lasts 6 s past the last moment it engages; then the
+        // post-combat mode for the record's +0x28 (cut to 2 s once it would engage again); a target it doesn't engage
+        // puts a non-combat unit in post mode. Entering combat is alert event 2. Cinematic mode without
+        // AllowCinematicCombat holds every brain in non-combat.
+        int oldMode = u.mode;
+        if (cinematicMode) {
+            u.mode = 0;
+        } else if (u.mode == 0) {
+            if (engage) u.mode = 1, alertEvent(sideIdx, 2);
+            else if (haveTarget) u.mode = 2, u.postTimer = R.postTime;
+        } else if (u.mode == 1) {
+            if (engage) u.combatTimer = 6.f;
+            if ((u.combatTimer -= dt) < 0) u.mode = 2, u.postTimer = R.postTime;
+        } else if (u.mode == 2) {
+            u.postTimer -= dt;
+            if (engage && u.postTimer > 2.f) u.postTimer = 2.f;
+            if (u.postTimer < 0) {
+                if (engage) u.mode = 1, u.combatTimer = 6.f, alertEvent(sideIdx, 2);
+                else u.mode = 0;
+            }
+        }
+        bool combat = u.mode == 1;
+        if (combat != u.inCombat) event(u.object, combat ? EV_COMBAT_START : EV_COMBAT_END);
+        u.inCombat = combat;
+        // ---- the tactic for the mode: a new mode starts a new one; a finished one is replaced (FUN_100b9510)
+        if (u.mode != oldMode || u.tacMode != u.mode) {
+            u.orders.clear(), u.tactic.clear(), u.tacMode = u.mode;
+        }
+        if (u.tactic.empty() && u.mode != 0 && !(u.mode == 2 && u.leader >= 0)) {
+            u.tactic = pickTactic(u, u.mode);
+            u.step = 0, u.count = has(u.tactic, "combat2") || u.tactic == "mountcombat1" ? 5 : 4, u.tacTimer = 0;
+            if (tacDbg) SDL_Log("ai %d mode %d tactic %s", u.object, u.mode, u.tactic.c_str());
         }
         // a target switches the scan off (FUN_100503c0 / FUN_10050440 clear +0xe9), losing it switches it back on
         if (u.target >= 0) u.autoScan = false;
@@ -439,12 +886,11 @@ void AiSystem::update(float dt) {
             continue;
         }
         PlayerInput in;
-        Vec3 tp;
         auto steerTo = [&](const Vec3& p, float& err) {
             u.lastSteer = p;
             Vec3 aim = p;
             if (!u.detour.empty()) {
-                if (length(flat(u.detourGoal) - flat(p)) > 12.f || u.ord.kind == 10) u.detour.clear();
+                if (length(flat(u.detourGoal) - flat(p)) > 12.f) u.detour.clear();
                 else {
                     while (u.detourIdx < u.detour.size() && length(flat(u.detour[u.detourIdx]) - flat(me)) < 6.f) ++u.detourIdx;
                     if (u.detourIdx >= u.detour.size()) u.detour.clear();
@@ -457,110 +903,42 @@ void AiSystem::update(float dt) {
             d = p - me;
             return length(Vec3(d.x, 0, d.z));
         };
-        // escorts' vehicles and unarmed units keep to their path and only shoot on the move
-        // weapons hold at the lowest alert level: only the user, an attacker, or a squad mate's fight opens fire
-        bool weaponsFree = alert >= 1 || u.attacker >= 0 || u.leader >= 0 || u.target == player_->object();
+        // the throttle orders move at: SetSpeed's for paths, else the record's for the brain mode (FUN_100b7d00)
+        float modeT = modeThrottle(u), pathT = u.speedSet >= 0 ? u.speedSet : modeT;
+        u.trigger = false;
         Vec3 leaderPos;
-        bool leash = false;  // squad mates break off a fight that drags them far from the leader
-        float leashR = u.order == OrderFireAtWill ? 600.f : u.order == OrderHold || u.order == OrderGoto ? 1e9f : 220.f;
-        if (u.leader >= 0 && positionOf(u.leader, leaderPos) && length(leaderPos - me) > leashR && u.forced < 0) leash = true;
-        if (u.order == OrderFireAtWill) weaponsFree = true;
-        if (!u.autoAim) weaponsFree = false;  // AutoAim(FALSE): the gunner doesn't track (FUN_100801e0 skips +300)
-        if (leash) u.target = -1;
         bool pathFirst = !u.path.empty() && u.pathIdx < u.path.size() && u.forced < 0 &&
                          (combat_->range(u.object) <= 0 || (u.team == playerTeam && u.type != 0x48));
-        if (pathFirst && u.target >= 0 && positionOf(u.target, tp)) {
-            Vec3 d = tp - me, fwd(-std::sin(u.body.yaw()), 0, -std::cos(u.body.yaw()));
-            float dl = length(d);
-            if (weaponsFree && dl > 1.f && dl < combat_->range(u.object) && dot(d * (1.f / dl), fwd) > 0.97f)
-                combat_->fire(u.object, me + Vec3(0, 3.f, 0) + fwd * 2.f, tp + Vec3(0, 3.5f, 0));
-        }
+        bool tacticDrives = !pathFirst && u.mode != 0 && !u.tactic.empty() && !(u.mode == 2 && u.leader >= 0);
         // PathFollow1 (FUN_100ae440): from the nearest node of the unit's path, MOVE_DIRECT to a neighbour chosen at
         // random (50/50 back or on), clamped at the ends, so the unit wanders up and down its path for good.
         // PathFollow2 (FUN_100ae910, mode 0): walk the nodes in turn, looping, each with a random offset.
         // With no non-combat tactic of its own, a unit that has an assigned path gets PathFollow1 from the tactic table
         // (FUN_100b9510 → FUN_100dd910 picks the first registered tactic that applies).
         bool ncDefault = u.nonCombatTactic.empty() || u.nonCombatTactic == "default" || u.nonCombatTactic == "none";
-        if (u.mobile && u.target < 0 && u.path.empty() && u.route.size() > 1 && u.leader < 0 && !u.braked &&
-            (u.nonCombatTactic.find("pathfollow") != std::string::npos || (ncDefault && u.assigned))) {
+        if (u.mobile && !tacticDrives && u.path.empty() && u.route.size() > 1 && u.leader < 0 && !u.braked &&
+            (has(u.nonCombatTactic, "pathfollow") || (ncDefault && u.assigned))) {
             int n = int(u.route.size());
             if (u.routeIdx < 0) {  // start at the nearest node
                 float best = 1e30f;
                 for (int i = 0; i < n; ++i)
                     if (float d = length(flat(u.route[i]) - flat(me)); d < best) best = d, u.routeIdx = i;
-            } else if (u.nonCombatTactic.find("pathfollow2") != std::string::npos) {
+            } else if (has(u.nonCombatTactic, "pathfollow2")) {
                 u.routeIdx = (u.routeIdx + 1) % n;
             } else {
-                std::uniform_real_distribution<float> R(0.f, 1.f);
-                u.routeIdx = std::clamp(u.routeIdx + (R(rng_) <= 0.5f ? -1 : 1), 0, n - 1);
+                u.routeIdx = std::clamp(u.routeIdx + (rand01() <= 0.5f ? -1 : 1), 0, n - 1);
             }
             Vec3 p = u.route[u.routeIdx];
-            if (u.nonCombatTactic.find("pathfollow2") != std::string::npos) {
-                std::uniform_real_distribution<float> R(-1.f, 1.f);
-                p = p + Vec3(R(rng_), 0, R(rng_)) * 8.f;
-            }
+            if (has(u.nonCombatTactic, "pathfollow2")) p = p + Vec3(rand01() * 2 - 1, 0, rand01() * 2 - 1) * 8.f;
             u.path = {p}, u.pathIdx = 0, u.hop = true;
-            if (getenv("HG2_TACDBG")) SDL_Log("ai %d pathfollow node %d/%d at %.0f,%.0f", u.object, u.routeIdx, n, p.x, p.z);
+            if (tacDbg) SDL_Log("ai %d pathfollow node %d/%d at %.0f,%.0f", u.object, u.routeIdx, n, p.x, p.z);
         }
-        {   // tactic switch (combat <-> non-combat) starts the new tactic from its first step
-            bool combatNow = !pathFirst && u.target >= 0;
-            if (combatNow != u.engaged) u.engaged = combatNow, u.ord = Unit::Order{}, u.step = 0;
-        }
-        if (!pathFirst && u.target >= 0 && positionOf(u.target, tp)) {
-            float err, dist = steerTo(tp, err);
-            in.turn = 0;
-            float range = std::max(40.f, combat_->chooseWeapon(u.object, dist));
-            u.visible = scene_->terrainRay(me + Vec3(0, 5, 0), tp + Vec3(0, 4, 0)) > 0.98f;
-            bool canFire = u.visible && dist < range;
-            if (u.arc) {  // a constrained turret can't bring its gun round beyond the arc
-                Vec3 d = tp - me;
-                float rel = wrap(std::atan2(-d.x, -d.z) - u.arcHome);
-                if (rel < u.arcMin || rel > u.arcMax) canFire = false;
-            }
-            if (!u.mobile) {  // the gun's pitch joint: elevation to the target, clamped to the joint's limits
-                Vec3 mz;
-                if (!combat_->muzzle(u.object, mz)) mz = me + Vec3(0, 3.f, 0);
-                Vec3 d = tp + Vec3(0, 2.f, 0) - mz;
-                float elev = std::atan2(d.y, std::sqrt(d.x * d.x + d.z * d.z));
-                if (elev < u.pitchMin || elev > u.pitchMax) canFire = false;
-                u.gunPitch = std::clamp(elev, u.pitchMin, u.pitchMax);
-            }
-            std::uniform_real_distribution<float> R(0.f, 1.f);
-            // ---- choose a combat tactic: the script's, else one of the unit class's from the tactic table
-            std::string tac = u.combatTactic;
-            if (tac.empty() || tac == "default" || tac == "none") {
-                if (u.tactic.empty()) {
-                    float r = R(rng_);
-                    bool melee = combat_->hasMelee(u.object);
-                    if (!u.mobile) u.tactic = "turretcombat1";
-                    else if (u.type == 0x4e || u.type == 0x4f) u.tactic = r < 0.5f ? "tankattack" : "jeeppursue";
-                    else if (u.type == 0x50) u.tactic = r < 0.6f ? "infantrycombat1" : "infantrycover";
-                    else if (melee && r < 0.15f) u.tactic = "gearcombathand2hand";
-                    else if (r < 0.55f) u.tactic = "gearcombat1";
-                    else if (r < 0.7f) u.tactic = "gearcombat3";
-                    else if (r < 0.85f) u.tactic = "gearflankleft";
-                    else u.tactic = "gearflankright";
-                    u.step = 0, u.count = 3, u.ord = Unit::Order{};
-                }
-                tac = u.tactic;
-            } else if (tac != u.tactic) {
-                u.tactic = tac, u.step = 0, u.count = 3, u.ord = Unit::Order{};
-            }
-            if (u.order == OrderHold || u.order == OrderGoto) tac = "gearcombat2", u.home = u.orderPos;  // hold the ground
-            auto post = [&](int kind, const Vec3& p, float speed, float timer = 0) {
-                if (u.ord.kind != kind || length(flat(u.ord.pos) - flat(p)) > 4.f) u.ord = Unit::Order{};  // a new order
-                u.ord.kind = kind, u.ord.pos = p, u.ord.speed = speed, u.ord.timer = timer;
-            };
-            bool busy = u.ord.kind != 0;
-            auto cancel = [&]() { u.ord = Unit::Order{}; busy = false; };
-            auto around = [&](const Vec3& c, float r, float ang) { return c + Vec3(std::sin(ang), 0, std::cos(ang)) * r; };
-            float bearingFromTarget = std::atan2((me - tp).x, (me - tp).z);
-            // ---- tactic think (the original's per-tactic Think state machines, paraphrased)
-            if (u.mobile && u.route.size() > 1 && tac.find("pathfollow2") != std::string::npos) {
-                // PathFollow2 in combat (FUN_100aed10): keep to the path, MOVE_DIRECT (shooting on the move) to the
-                // node nearest the target that is still at least the free-range radius from it, preferring the
-                // neighbouring nodes (×0.8, FUN_100ae820); once there, drift round that node within the radius
-                if (!busy) {
+        if (tacticDrives) {
+            // PathFollow2 in combat (FUN_100aed10): keep to the path, MOVE_DIRECT firing on the move (0x108) to the
+            // node nearest the target that is still at least the free-range radius from it, preferring the
+            // neighbouring nodes (×0.8, FUN_100ae820), one node at a time; once there, drift within the radius
+            if (u.mode == 1 && u.mobile && u.route.size() > 1 && has(u.combatTactic, "pathfollow2") && haveTarget) {
+                if (u.orders.empty()) {
                     int n = int(u.route.size()), cur = std::max(0, u.routeIdx), pick = cur;
                     float bestD = 1e30f;
                     for (int i = 0; i < n; ++i) {
@@ -569,334 +947,288 @@ void AiSystem::update(float dt) {
                         if (std::abs(i - cur) < 2) d *= 0.8f;
                         if (d < bestD) bestD = d, pick = i;
                     }
-                    if (pick != cur) pick = cur + (pick > cur ? 1 : -1);  // one node at a time along the path
+                    if (pick != cur) pick = cur + (pick > cur ? 1 : -1);
                     u.routeIdx = pick;
                     Vec3 p = u.route[pick];
-                    if (pick == cur && u.freeRadius > 0) p = around(p, u.freeRadius * R(rng_), R(rng_) * 6.2832f);
-                    if (length(flat(p) - flat(me)) > 6.f) post(2, p, 3.f);
-                    else if (canFire) post(10, tp, 0, 2.f);
-                }
-            } else if (!u.mobile || tac.find("turret") != std::string::npos) {
-                if (!busy && canFire) post(10, tp, 0, 5.f);  // TurretCombat1: 5 s volleys
-            } else if (tac == "standandshoot") {               // StandAndShoot (FUN_100a8ba0)
-                if (!busy) post(10, tp, 0, 4.f);
-            } else if (tac.find("gearcombat2") != std::string::npos || tac.find("chickenwalkercombat2") != std::string::npos ||
-                       tac.find("mountcombat1") != std::string::npos) {
-                // GearCombat2 (FUN_100a8dd0): from the home spot, turn and shoot what's in sight, else go back home
-                if (!busy) {
-                    if (canFire) post(10, tp, 0, 3.f);
-                    else if (length(u.home - me) > 8.f) post(2, u.home, 3.f), u.step = 2;
-                } else if (u.step == 2 && canFire) cancel(), u.step = 0;
-            } else if (tac.find("combat3") != std::string::npos || tac.find("circle") != std::string::npos) {
-                // GearCombat3 / HoverCircle (FUN_100a90e0): every 2 s a new spot - home without a shot, a random
-                // point within 32 m when 32 m or more out, else away from the target
-                if ((u.replan -= dt) <= 0 || !busy) {
-                    u.replan = 2.f;
-                    if (!u.visible) post(2, u.home, 3.f);
-                    else if (dist >= 32.f) post(2, around(me, 32.f, R(rng_) * 6.2832f), 3.f);
-                    else post(2, around(me, 32.f, bearingFromTarget + (R(rng_) - 0.5f) * 1.6f), 3.f);
-                }
-            } else if (tac.find("flank") != std::string::npos || tac == "frontal") {
-                // GearFlankLeft / Right (FUN_100a9770 / FUN_100a9ee0): get round to +-75 degrees off the target's
-                // bearing, then turn in and fire a 5 s volley
-                float ang = tac.find("left") != std::string::npos ? 75.f : tac.find("right") != std::string::npos ? -75.f : 0.f;
-                if (tac == "flankleft1") ang = 45.f;
-                if (tac == "flankright1") ang = -45.f;
-                if (tac == "flankleft2") ang = 90.f;
-                if (tac == "flankright2") ang = -90.f;
-                if (!busy) {
-                    if (u.step == 0) post(2, around(tp, std::min(range * 0.7f, 120.f), bearingFromTarget + ang * 0.017453f), 3.f), u.step = 1;
-                    else if (canFire) post(10, tp, 0, 5.f), u.step = 0;
-                    else u.step = 0;
-                }
-            } else if (tac.find("hand2hand") != std::string::npos) {
-                // GearCombatHand2Hand (FUN_100aacc0): close to 8 m and fight
-                if (!busy || u.ord.kind == 2) {
-                    if (dist > 8.f) post(2, tp, 3.f);
-                    else post(10, tp, 0, 2.f);
-                }
-            } else if (tac.find("tankattack") != std::string::npos) {
-                // TankAttack (FUN_100ab040): in sight 80 % stand and fire 5 s, 20 % reposition; else drive at it
-                if (!busy) {
-                    if (canFire) {
-                        if (R(rng_) > 0.8f) post(2, around(me, 40.f, R(rng_) * 6.2832f), 3.f);
-                        else post(10, tp, 0, 5.f);
-                    } else post(2, tp, 3.f), u.step = 2;
-                } else if (u.step == 2 && canFire) cancel(), u.step = 0;
-            } else if (tac.find("pursue") != std::string::npos || tac == "chaseenemy") {
-                if (!busy) post(2, tp, 3.f);  // GearPursue1 / JeepPursue (FUN_100af9b0): drive at the target
-            } else if (tac.find("droneattack") != std::string::npos) {
-                // DroneAttack1 (FUN_100b06e0): runs in, breaks off after a random few seconds or when close, repeats
-                if ((u.tacTimer -= dt) <= 0) u.step = u.step == 1 ? 2 : 1, u.tacTimer = 3.f + R(rng_) * 4.f;
-                if (u.step == 1) post(2, tp, 4.f);
-                else post(2, around(tp, 120.f, bearingFromTarget), 4.f);
-                if (dist < 25.f) u.step = 2;
-            } else if (tac.find("cover") != std::string::npos) {
-                // InfantryCover (FUN_100a9610): get down where it is and shoot
-                u.body.setPosture(0);
-                if (!busy && canFire) post(10, tp, 0, 4.f);
-            } else if (tac.find("runaway") != std::string::npos) {
-                if (!busy) post(2, around(me, 30.f, bearingFromTarget), 4.f);  // DefaultRunAway (FUN_100ab550)
-            } else {
-                // GearCombat1 / InfantryCombat1 / FrameCombat1 / HoverCombat1 (FUN_100a84d0): turn to the target;
-                // no shot: close in; in reach: under 32 m 10 % a volley, else a 64 m sidestep round it at 90
-                // degrees; from 32 m on 20 % a volley, else a run across it
-                if (!busy) {
-                    if (std::fabs(err) > 0.6f) post(6, tp, 3.f);
-                    else if (!canFire) post(2, tp, 3.f), u.step = 2;
-                    else {
-                        float r = R(rng_);
-                        if (dist >= 32.f && r < 0.2f) post(10, tp, 0, 2.f);
-                        else if (dist < 32.f && r < 0.1f) post(10, tp, 0, 2.f);
-                        else if (dist < 32.f) post(2, around(tp, 64.f, bearingFromTarget + (R(rng_) < 0.5f ? 1.5708f : -1.5708f)), 4.f);
-                        else {
-                            Vec3 side(std::cos(bearingFromTarget), 0, -std::sin(bearingFromTarget));
-                            post(2, tp + (me - tp) * 0.5f + side * (R(rng_) < 0.5f ? 64.f : -64.f), 4.f);
-                        }
-                        u.step = 0;
+                    if (pick == cur && u.freeRadius > 0) {
+                        float a2 = rand01() * 2 * kPi, rr = u.freeRadius * rand01();
+                        p = p + Vec3(std::sin(a2), 0, std::cos(a2)) * rr;
                     }
-                } else if (u.step == 2 && canFire) cancel(), u.step = 0;
+                    post(u, 4, 0x108, 0, p);
+                }
+            } else if (!think(u, dt)) {
+                if (tacDbg) SDL_Log("ai %d tactic %s done", u.object, u.tactic.c_str());
+                u.tactic.clear(), u.orders.clear();
             }
-            // retreat when badly hurt (gears)
-            if (combat_->health(u.object) < 0.25f && u.type == 0x48 && tac != "standandshoot" && u.mobile && u.order != OrderHold &&
-                (u.ord.kind != 2 || length(u.ord.pos - tp) < length(me - tp)))
-                post(2, around(me, 60.f, bearingFromTarget), 4.f);
-            // no line of fire for a while: move to find one
-            if (u.blocked > 1.5f && u.mobile && u.order != OrderHold && u.ord.kind == 10)
-                post(2, around(me, 25.f, bearingFromTarget + (R(rng_) < 0.5f ? 1.2f : -1.2f) + 3.1416f), 3.f), u.blocked = 0;
-            // ---- execute the order
-            float aimErr = err;
-            switch (u.ord.kind) {
-                case 2: {  // MOVETO: speed 3 walking pace, 4 and up running
-                    float e2, d2 = steerTo(u.ord.pos, e2);
-                    if (d2 < 6.f) { u.ord = Unit::Order{}; break; }
-                    if (std::fabs(e2) < 1.2f) in.throttle = 1, in.run = u.ord.speed >= 4.f || d2 > 60.f;
+        }
+        // ---- the order executor (FUN_10039f40)
+        if (!u.orders.empty()) {
+            Order& o = u.orders.front();
+            bool done = false;
+            Vec3 goal = o.pos, op;
+            if ((o.flags & 2 || o.kind == 6 || o.kind == 10) && o.obj >= 0 && positionOf(o.obj, op)) goal = op;
+            switch (o.kind) {
+                case 0:  // NOP: wait
+                    if ((o.param -= dt) <= 0) done = true;
+                    break;
+                case 1:  // STAND (FUN_10036ea0): stop
+                    done = true;
+                    break;
+                case 2:
+                case 4: {  // MOVETO / MOVE_DIRECT (FUN_100373c0)
+                    if (!u.mobile) { done = true; break; }
+                    if ((o.flags & 8) && u.mode == 1) u.trigger = true;
+                    if ((o.flags & 0x10) && (o.param -= dt) <= 0) done = true;
+                    if (o.flags & 0x100) {  // the target behind (beyond 135 degrees): drive the other way round
+                        float off = haveTarget ? std::fabs(wrap(std::atan2(-(tp - me).x, -(tp - me).z) - u.body.yaw())) : 0.f;
+                        if (off <= 2.3561945f) o.revLatch = false;
+                        else if (!o.revLatch) o.revLatch = true, o.flags ^= 0x20;
+                    }
+                    bool back = (o.flags & 0x20) != 0;
+                    if (!o.started) {  // the MOVETO asks the pathfinder for its waypoints when it starts (FUN_100bf690)
+                        o.started = true;
+                        if (length(flat(goal - me)) > 12.f && lineBlocked(me, goal, u.object)) u.wantRoute = true, u.lastSteer = goal;
+                    }
+                    float e2, d2 = steerTo(goal, e2);
+                    if (back) {
+                        e2 = wrap(e2 + kPi);
+                        in.turn = std::max(-1.f, std::min(1.f, e2 * 2.f));
+                    }
+                    if (d2 < 6.f) { done = true; break; }
+                    // FUN_100373c0: drives on once the heading is (nearly) right, else turns on the spot
+                    if (std::fabs(e2) < 0.15f) setThrottle(u, in, back ? -modeT : modeT);
                     break;
                 }
-                case 6: {  // TURNTO
+                case 6: {  // TURNTO (FUN_10038490)
+                    if ((o.flags & 8) && u.mode == 1) u.trigger = true;
                     float e2;
-                    steerTo(u.ord.pos, e2);
-                    if (std::fabs(e2) < 0.1f) u.ord = Unit::Order{};
+                    steerTo(goal, e2);
+                    if (!u.mobile || std::fabs(e2) < 0.05f) done = true;
                     break;
                 }
-                case 10:   // FIREWPN volley: stand, face it, shoot for the order's time
-                    steerTo(tp, aimErr);
-                    if ((u.ord.timer -= dt) <= 0) u.ord = Unit::Order{};
+                case 10: {  // FIREWPN_V (FUN_100371d0): stand, hold the trigger on the target for the order's time
+                    if (o.obj < 0 || !combat_->alive(o.obj)) { done = true; break; }
+                    u.trigger = true;
+                    if ((o.param -= dt) <= 0) done = true;
                     break;
-                default: steerTo(tp, aimErr); break;
-            }
-            // the gunner: the torso twists toward the target so moving gears shoot too
-            u.body.twist = std::clamp(err, -1.2f, 1.2f);
-            float gunErr = err - u.body.twist;
-            if (weaponsFree && std::fabs(gunErr) < 0.2f && canFire) {
-                Vec3 fwd(-std::sin(u.body.yaw() + u.body.twist), 0, -std::cos(u.body.yaw() + u.body.twist)), mz;
-                if (!combat_->muzzle(u.object, mz)) mz = me + Vec3(0, 5.f, 0) + fwd * 2.f;
-                // lead a moving target, scattered by the gunner's fire control
-                Vec3 vel = (tp - u.lastTargetPos) * (1.f / std::max(0.016f, dt));
-                if (u.lastTarget != u.target || length(vel) > 60.f) vel = Vec3();
-                float flight = dist / 200.f;
-                std::uniform_real_distribution<float> U(-1.f, 1.f);
-                float spread = std::max(0.3f, 2.5f - 0.5f * float(u.body.def().fireControl)) * dist / 150.f *
-                               combat_->aimSpread(u.object, u.target) * (u.team != playerTeam ? 1.4f - 0.8f * difficulty_ : 1.f);
-                if (u.ord.kind == 2 && in.throttle > 0) spread *= 1.5f;  // firing on the move
-                Vec3 aim = tp + Vec3(0, 3.5f, 0) + vel * flight + Vec3(U(rng_), U(rng_) * 0.5f, U(rng_)) * spread;
-                // hold fire into a hill or a friend in the way
-                float tt = 2.f;
-                Vec3 clear = tp + Vec3(0, 3.5f, 0);
-                int hit = scene_->raycast(mz, clear, u.object, tt);
-                bool terrain = scene_->terrainRay(mz, clear) < 0.97f;
-                bool friendInWay = hit >= 0 && hit != u.target && tt < 0.97f && teamOf(hit) == u.team;
-                if (terrain || friendInWay) u.blocked += dt;
-                else {
-                    u.blocked = 0, combat_->setAimTarget(u.object, u.target);
-                    bool f = combat_->fire(u.object, mz, aim);
-                    if (f && getenv("HG2_TACDBG")) SDL_Log("tac %d fires at %d (%.0f m)", u.object, u.target, dist);
                 }
-            } else {
-                u.blocked = std::max(0.f, u.blocked - dt * 0.5f);
+                default: done = true; break;
             }
-            (void)aimErr;
-            if (getenv("HG2_TACDBG") && int(u.clock * 2) != int((u.clock - dt) * 2))
-                SDL_Log("tac %d %s step %d ord %d dist %.0f range %.0f vis %d err %.2f free %d", u.object, tac.c_str(), u.step, u.ord.kind, dist,
-                        range, int(u.visible), err, int(weaponsFree));
-            u.lastTargetPos = tp, u.lastTarget = u.target;
-        } else if (u.drive != 0) {  // Forward / Backward
-            in.throttle = float(u.drive);
-        } else if (u.mobile && !u.path.empty() && u.pathIdx < u.path.size()) {  // follow waypoints
-            if (!u.pathPaused) {
-                // advance past waypoints that are reached, passed, or farther than the one after them
-                while (u.pathIdx + 1 < u.path.size()) {
-                    Vec3 a0 = flat(u.path[u.pathIdx]), a1 = flat(u.path[u.pathIdx + 1]), p = flat(me);
-                    bool passed = dot(a1 - a0, p - a0) > 0.f && dot(a1 - a0, a1 - a0) > 1e-3f;
-                    if (passed || length(p - a1) < length(p - a0)) u.pathIdx++;
-                    else break;
-                }
-                float err, dist = steerTo(u.path[u.pathIdx], err);
-                float reach = std::max(8.f, std::fabs(u.body.speed()) * 0.8f);
-                if (dist < reach) {
-                    if (++u.pathIdx >= u.path.size()) {
-                        u.path.clear(), u.pathIdx = 0;
-                        if (!u.hop) event(u.object, EV_PATH_END);
-                        u.hop = false;
+            if (done && !u.orders.empty()) u.orders.erase(u.orders.begin());
+        } else if (pathFirst || u.mode == 0 || (u.mode == 2 && u.leader >= 0) || u.tactic.empty()) {
+            // ---- non-combat behaviour: scripted moves, paths and the non-combat tactics
+            if (u.drive != 0) {  // Forward / Backward
+                in.throttle = float(u.drive);
+            } else if (u.mobile && !u.path.empty() && u.pathIdx < u.path.size()) {  // follow waypoints
+                if (!u.pathPaused) {
+                    // advance past waypoints that are reached, passed, or farther than the one after them
+                    while (u.pathIdx + 1 < u.path.size()) {
+                        Vec3 a0 = flat(u.path[u.pathIdx]), a1 = flat(u.path[u.pathIdx + 1]), p = flat(me);
+                        bool passed = dot(a1 - a0, p - a0) > 0.f && dot(a1 - a0, a1 - a0) > 1e-3f;
+                        if (passed || length(p - a1) < length(p - a0)) u.pathIdx++;
+                        else break;
                     }
-                } else if (std::fabs(err) < 1.2f) {
-                    in.throttle = 1, in.run = u.speedFrac > 0.5f && dist > 40.f;
-                }
-            }
-        } else if (u.mobile && u.leader >= 0 && (u.order == OrderHold || u.order == OrderGoto)) {
-            // SquadMateGuard (FUN_100ae0e0): MOVETO the guard point while that brings it nearer; STAND once it
-            // stops gaining (blocked, or there). A new order resets the best distance.
-            float err, dist = steerTo(u.orderPos, err);
-            if (length(flat(u.orderPos) - flat(u.goal)) > 1.f) u.goal = u.orderPos, u.guardBest = 1e30f, u.step = 0;
-            if ((u.tacTimer -= dt) <= 0) {  // judged every second
-                u.tacTimer = 1.f;
-                if (dist < u.guardBest - 0.5f) u.guardBest = dist, u.step = 1;
-                else u.step = 2;
-            }
-            if (u.step != 2 && dist > 6.f) {
-                if (std::fabs(err) < 1.2f) in.throttle = 1, in.run = dist > 40.f;
-            } else {
-                in.turn = 0;
-                if (dist > 12.f && u.step == 2 && u.tacTimer > 0.95f) u.guardBest = dist + 20.f;  // try again later
-            }
-        } else if (u.mobile && u.leader >= 0 && u.order == OrderDefend && positionOf(u.orderObj, tp)) {
-            // SquadMateDefend (FUN_100adc20): radius r (32 m). Far (≥0.6 r): MOVETO the charge at speed 5 until inside
-            // 0.4 r. Close and the charge standing still: wander to a random point within r of it, STAND, wait 3 s.
-            const float r = 32.f;
-            float dist = length(flat(tp) - flat(me));
-            Vec3 tv = (tp - u.leaderLast) * (1.f / std::max(0.016f, dt));
-            u.leaderLast = tp;
-            if (u.ord.kind == 2 && u.step == 3 && dist < 0.4f * r) u.ord = Unit::Order{};
-            if (u.ord.kind == 0) {
-                std::uniform_real_distribution<float> R(0.f, 1.f);
-                if (dist >= 0.6f * r) u.ord.kind = 2, u.ord.pos = tp, u.ord.speed = 5.f, u.step = 3;
-                else if (dist <= r - 10.f && length(tv) <= 0.1f) {
-                    if (u.step == 4) u.ord.kind = 99, u.ord.timer = 3.f, u.step = 0;  // STAND + wait
-                    else {
-                        float a2 = R(rng_) * 6.2832f, rr = r * R(rng_);
-                        u.ord.kind = 2, u.ord.pos = tp + Vec3(std::sin(a2), 0, std::cos(a2)) * rr, u.ord.speed = 3.f, u.step = 4;
+                    float err, dist = steerTo(u.path[u.pathIdx], err);
+                    float reach = std::max(8.f, std::fabs(u.body.speed()) * 0.8f);
+                    if (dist < reach) {
+                        if (++u.pathIdx >= u.path.size()) {
+                            u.path.clear(), u.pathIdx = 0;
+                            if (!u.hop) event(u.object, EV_PATH_END);
+                            u.hop = false;
+                        }
+                    } else if (std::fabs(err) < 1.2f) {
+                        setThrottle(u, in, pathT);
                     }
                 }
-            }
-            if (u.ord.kind == 2) {
-                if (u.step == 3) u.ord.pos = tp;
-                float e2, d2 = steerTo(u.ord.pos, e2);
-                if (d2 < 4.f) u.ord = Unit::Order{};
-                else if (std::fabs(e2) < 1.2f) in.throttle = 1, in.run = u.ord.speed >= 4.f && d2 > 25.f;
-            } else if (u.ord.kind == 99) {
-                float e2;
-                steerTo(tp, e2), in.turn = 0;
-                if ((u.ord.timer -= dt) <= 0) u.ord = Unit::Order{};
-            }
-        } else if (u.mobile && u.leader >= 0 && positionOf(u.leader, leaderPos) && combat_->alive(u.leader)) {
-            // formation slot behind the leader, rotated by the leader's heading (models face -Z)
-            float ly = u.leader == player_->object() ? player_->yaw() : u.body.yaw();
-            if (const Unit* l = find(u.leader)) ly = l->body.yaw();
-            Vec3 right(-std::cos(ly), 0, std::sin(ly)), back(std::sin(ly), 0, std::cos(ly));
-            Vec3 want = leaderPos + right * u.slot.x + back * u.slot.z;
-            if (const Surface* s = scene_->surfaceAt(want.x, want.z); s && s->damage > 0) {
-                // the slot is on lava: the nearest safe point between it and the leader
-                for (float f = 0.25f; f <= 1.f; f += 0.25f) {
-                    Vec3 q = want + (leaderPos - want) * f;
-                    const Surface* s2 = scene_->surfaceAt(q.x, q.z);
-                    if (!s2 || s2->damage <= 0) { want = q; break; }
+            } else if (u.mobile && u.leader >= 0 && (u.order == OrderHold || u.order == OrderGoto)) {
+                // SquadMateGuard (FUN_100ae0e0): MOVETO the guard point while that brings it nearer; STAND once it
+                // stops gaining (blocked, or there). A new order resets the best distance.
+                float err, dist = steerTo(u.orderPos, err);
+                if (length(flat(u.orderPos) - flat(u.point)) > 1.f) u.point = u.orderPos, u.guardBest = 1e30f, u.step = 0;
+                if ((u.tacTimer -= dt) <= 0) {  // judged every second
+                    u.tacTimer = 1.f;
+                    if (dist < u.guardBest - 0.5f) u.guardBest = dist, u.step = 1;
+                    else u.step = 2;
                 }
-            }
-            // SquadMateFollow (FUN_100ad160, parameters 32 / 4 / 16 m): set off for the slot once it is more than 16 m
-            // away (or 4 m with the leader on the move), settle inside 4 m, run to catch up past 32 m
-            float lspeed = length(flat(leaderPos) - flat(u.leaderLast)) / std::max(0.016f, dt);
-            u.leaderLast = leaderPos;
-            float err, dist = steerTo(want, err);
-            if (!u.following && (dist > 16.f || (lspeed > 1.f && dist > 4.f))) u.following = true;
-            if (u.following && dist < 4.f) u.following = false;
-            if (u.following) {
-                if (std::fabs(err) < 1.2f) in.throttle = 1, in.run = dist >= 32.f || (lspeed > 8.f && dist > 8.f);
-            } else {  // in place: face the way the leader faces
-                float e2 = wrap(ly - u.body.yaw());
-                in.turn = std::fabs(e2) > 0.1f ? std::max(-1.f, std::min(1.f, e2 * 2.f)) : 0.f;
-            }
-        } else if (u.mobile && playerAlive && teamOf(player_->object()) != u.team &&
-                   (u.nonCombatTactic.find("hunt") != std::string::npos || alert >= 5)) {
-            // HuntUser (FUN_100ab880) / full alert: MOVETO where the user is, re-planned only once the user has moved
-            // more than 128 m from that spot; HuntTarget (FUN_100aba50) aims 16 m to a random side, re-plans past 64 m
-            Vec3 pp = player_->position();
-            bool huntTarget = u.nonCombatTactic.find("hunttarget") != std::string::npos;
-            float limit = huntTarget ? 64.f : 128.f;
-            if (u.ord.kind != 2 || length(u.goal - pp) > limit) {
-                std::uniform_real_distribution<float> R(-1.f, 1.f);
-                u.goal = pp;
-                u.ord = Unit::Order{}, u.ord.kind = 2, u.ord.pos = pp + (huntTarget ? Vec3(R(rng_), 0, R(rng_)) * 16.f : Vec3());
-            }
-            float err, dist = steerTo(u.ord.pos, err);
-            if (dist < 20.f) u.ord.kind = 0;  // there: look again from here
-            else if (std::fabs(err) < 1.2f && length(pp - me) > 60.f) in.throttle = 1, in.run = dist > 200.f;
-        } else if (u.mobile && u.leader < 0 && u.target < 0 &&
-                   (u.nonCombatTactic.find("patrol") != std::string::npos || u.nonCombatTactic.find("freerange") != std::string::npos)) {
-            // GearPatrol1 / DefaultPatrol / VehiclePatrol1 / FreeRange1 (FUN_100abee0, FUN_100af590, FUN_100af2f0):
-            // walk to a random spot round home (64 m; vehicles further), stand, wait a few seconds, again
-            std::uniform_real_distribution<float> R(0.f, 1.f);
-            bool vehicle = u.type == 0x4e || u.type == 0x4f;
-            if (u.ord.kind == 0) {
-                if (u.step == 1) u.ord.kind = 99, u.ord.timer = 2.f + R(rng_) * 4.f, u.step = 0;
-                else {
-                    float span = u.freeRadius > 0 && u.nonCombatTactic.find("freerange") != std::string::npos ? u.freeRadius
-                               : vehicle ? 160.f : 64.f;
-                    float r = span * (0.3f + 0.7f * R(rng_)), a2 = R(rng_) * 6.2832f;
-                    u.ord.kind = 2, u.ord.pos = u.home + Vec3(std::sin(a2), 0, std::cos(a2)) * r, u.ord.speed = 3.f, u.step = 1;
+                if (u.step != 2 && dist > 6.f) {
+                    if (std::fabs(err) < 1.2f) setThrottle(u, in, modeT);
+                } else {
+                    in.turn = 0;
+                    if (dist > 12.f && u.step == 2 && u.tacTimer > 0.95f) u.guardBest = dist + 20.f;  // try again later
                 }
+            } else if (u.mobile && u.leader >= 0 && u.order == OrderDefend && positionOf(u.orderObj, tp)) {
+                // SquadMateDefend (FUN_100adc20): radius r (32 m). Far (≥0.6 r): MOVETO the charge until inside 0.4 r.
+                // Close and the charge standing still: wander to a random point within r of it, STAND, wait 3 s.
+                const float r = 32.f;
+                float dist = length(flat(tp) - flat(me));
+                Vec3 tv = (tp - u.leaderLast) * (1.f / std::max(0.016f, dt));
+                u.leaderLast = tp;
+                if (u.step == 3 && dist < 0.4f * r) u.step = 0, u.tacTimer = 0;
+                if (u.step == 0 || u.step == 4) {
+                    if (dist >= 0.6f * r) u.step = 3;
+                    else if (u.step == 0 && dist <= r - 10.f && length(tv) <= 0.1f) {
+                        float a2 = rand01() * 2 * kPi, rr = r * rand01();
+                        u.point = tp + Vec3(std::sin(a2), 0, std::cos(a2)) * rr, u.step = 4;
+                    }
+                }
+                if (u.step == 3 || u.step == 4) {
+                    Vec3 g = u.step == 3 ? tp : u.point;
+                    float e2, d2 = steerTo(g, e2);
+                    if (d2 < 4.f) u.step = u.step == 4 ? 5 : 0, u.tacTimer = 3.f;
+                    else if (std::fabs(e2) < 1.2f) setThrottle(u, in, modeT);
+                } else if (u.step == 5) {  // STAND + wait 3 s
+                    float e2;
+                    steerTo(tp, e2), in.turn = 0;
+                    if ((u.tacTimer -= dt) <= 0) u.step = 0;
+                }
+            } else if (u.mobile && u.leader >= 0 && positionOf(u.leader, leaderPos) && combat_->alive(u.leader)) {
+                // formation slot behind the leader, rotated by the leader's heading (models face -Z)
+                float ly = u.leader == player_->object() ? player_->yaw() : u.body.yaw();
+                if (const Unit* l = find(u.leader)) ly = l->body.yaw();
+                Vec3 right(-std::cos(ly), 0, std::sin(ly)), back(std::sin(ly), 0, std::cos(ly));
+                Vec3 want = leaderPos + right * u.slot.x + back * u.slot.z;
+                // SquadMateFollow (FUN_100ad160, parameters 32 / 4 / 16 m): set off for the slot once it is more than 16 m
+                // away (or 4 m with the leader on the move), settle inside 4 m, full throttle to catch up past 32 m
+                float lspeed = length(flat(leaderPos) - flat(u.leaderLast)) / std::max(0.016f, dt);
+                u.leaderLast = leaderPos;
+                float err, dist = steerTo(want, err);
+                if (!u.following && (dist > 16.f || (lspeed > 1.f && dist > 4.f))) u.following = true;
+                if (u.following && dist < 4.f) u.following = false;
+                if (u.following) {
+                    if (std::fabs(err) < 1.2f) setThrottle(u, in, dist >= 32.f ? 1.f : modeT);
+                } else {  // in place: face the way the leader faces
+                    float e2 = wrap(ly - u.body.yaw());
+                    in.turn = std::fabs(e2) > 0.1f ? std::max(-1.f, std::min(1.f, e2 * 2.f)) : 0.f;
+                }
+            } else if (u.mobile && playerAlive && teamOf(player_->object()) != u.team && has(u.nonCombatTactic, "hunt")) {
+                // HuntUser (FUN_100ab880): MOVETO where the user is, re-planned only once the user has moved more
+                // than 128 m from that spot; HuntTarget (FUN_100aba50) aims 16 m to a random side, re-plans past 64 m
+                bool huntTarget = has(u.nonCombatTactic, "hunttarget");
+                Vec3 pp = player_->position();
+                if (huntTarget && u.forced >= 0) positionOf(u.forced, pp);
+                float limit = huntTarget ? 64.f : 128.f;
+                if (u.step != 7 || length(u.point - pp) > limit) {
+                    u.point = pp;
+                    u.goalPos = pp + (huntTarget ? Vec3(rand01() * 2 - 1, 0, rand01() * 2 - 1) * 16.f : Vec3());
+                    u.step = 7;
+                }
+                float err, dist = steerTo(u.goalPos, err);
+                if (dist < 6.f) u.step = 0;  // there: look again from here
+                else if (std::fabs(err) < 1.2f) setThrottle(u, in, modeT);
+            } else if (u.mobile && u.leader < 0 && (has(u.nonCombatTactic, "patrol") || has(u.nonCombatTactic, "freerange"))) {
+                // GearPatrol1 / VehiclePatrol1 / FreeRange1 (FUN_100abee0, FUN_100af590, FUN_100af2f0): MOVETO a random
+                // spot round home, STAND, wait 3 s, again
+                bool vehicle = u.type == 0x4e || u.type == 0x4f;
+                if (u.step == 0) {
+                    float span = u.freeRadius > 0 && has(u.nonCombatTactic, "freerange") ? u.freeRadius : vehicle ? 160.f : 64.f;
+                    float r = span * rand01(), a2 = rand01() * 2 * kPi;
+                    u.point = u.home + Vec3(std::sin(a2), 0, std::cos(a2)) * r, u.step = 8;
+                }
+                if (u.step == 8) {
+                    float e2, d2 = steerTo(u.point, e2);
+                    if (d2 < 6.f) u.step = 9, u.tacTimer = 3.f;
+                    else if (std::fabs(e2) < 1.2f) setThrottle(u, in, modeT);
+                } else if (u.step == 9 && (u.tacTimer -= dt) <= 0) {
+                    u.step = 0;
+                }
+            } else if (u.lookAt >= 0 && positionOf(u.lookAt, tp)) {
+                float err;
+                steerTo(tp, err);
+                if (std::fabs(err) < 0.05f) in.turn = 0;
             }
-            if (u.ord.kind == 2) {
-                float e2, d2 = steerTo(u.ord.pos, e2);
-                if (d2 < 6.f) u.ord = Unit::Order{};
-                else if (std::fabs(e2) < 1.2f) in.throttle = 1;
-            } else if (u.ord.kind == 99 && (u.ord.timer -= dt) <= 0) {
-                u.ord = Unit::Order{};
-            }
-        } else if (u.target < 0 && u.attacker >= 0 && u.nonCombatTactic.find("holdground") != std::string::npos &&
-                   positionOf(u.attacker, tp)) {
-            float err;  // DefaultHoldGround (FUN_100afb50): stand and face where the fire came from
-            steerTo(tp, err);
-        } else if (u.lookAt >= 0 && positionOf(u.lookAt, tp)) {
-            float err;
-            steerTo(tp, err);
-            if (std::fabs(err) < 0.05f) in.turn = 0;
         }
-        // standing on damaging ground (lava): walk to the nearest safe spot first
-        if (u.mobile && u.type == 0x48) {
-            auto hot = [&](const Vec3& p) { const Surface* s = scene_->surfaceAt(p.x, p.z); return s && s->damage > 0; };
-            if (hot(me)) {
-                Vec3 best;
-                float bd = 1e9f;
-                for (float r : {12.f, 25.f, 40.f, 60.f, 90.f}) {
-                    for (int k = 0; k < 12; k++) {
-                        float a2 = float(k) * 0.5236f;
-                        Vec3 p = me + Vec3(std::sin(a2), 0, std::cos(a2)) * r;
-                        if (!hot(p) && r < bd) bd = r, best = p;
-                    }
-                    if (bd < 1e8f) break;
+        // ---- the gunner (FUN_1002ef10 -> FUN_10036f10, while AutoAim): the weapons track the target's lead point —
+        // its position plus its velocity over the round's flight time x 1.25 (FUN_100b6960; no lead for weapons whose
+        // rounds don't fly, velocity under 1e-5) — through the torso twist; the trigger (gear +0xbc9) is held by
+        // FIREWPN orders and by moves flagged to fire in combat mode, and the weapon's own cadence (Next_Round_Time,
+        // Burst rounds then a NextBurst pause) decides when rounds leave. Rounds go where the gun points.
+        if (haveTarget && u.autoAim && !cinematicMode) {
+            Vec3 vel = (tp - u.lastTargetPos) * (1.f / std::max(0.016f, dt));
+            if (u.lastTarget != u.target || length(vel) > 60.f) vel = Vec3();
+            Vec3 mz;
+            if (!combat_->muzzle(u.object, mz)) mz = me + Vec3(0, 5.f, 0);
+            float vb = combat_->muzzleVelocity(u.object);
+            Vec3 aim = tp + Vec3(0, 3.5f, 0);
+            if (vb > 1e-5f) aim = aim + vel * (length(aim - mz) / vb * 1.25f);
+            Vec3 d = aim - mz;
+            float want = std::atan2(-d.x, -d.z);
+            float gunYaw;
+            if (u.mobile) {
+                u.body.twist = std::clamp(wrap(want - u.body.yaw()), -1.2f, 1.2f);
+                gunYaw = u.body.yaw() + u.body.twist;
+            } else {  // a turret's yaw joint follows the target (the arc limits apply below)
+                float e = wrap(want - u.body.yaw());
+                in.turn = std::max(-1.f, std::min(1.f, e * 2.f));
+                gunYaw = u.body.yaw();
+            }
+            float horiz = std::sqrt(d.x * d.x + d.z * d.z), elev = std::atan2(d.y, std::max(0.01f, horiz));
+            if (!u.mobile) {  // the gun's pitch joint, clamped to its limits
+                u.gunPitch = std::clamp(elev, u.pitchMin, u.pitchMax);
+                elev = u.gunPitch;
+            }
+            // FUN_10050500 (gear vtable +0x180), whether the held trigger lets rounds go: never with hold fire (+0xe6);
+            // after Auto_Burst rounds (at most the rounds left) the gunner rests for the record's +0x18 +- 0.5 s
+            // (FUN_100b7cd0); a round goes only with a line of sight (+0xa0 bit 2) when the weapon (+0x118,
+            // FUN_100efaf0: melee always; else the lead point within Max_Range and within the target's bounding radius of
+            // the gun's line, FUN_100b63f0) is on and no friend or neutral nearer than the target + 5 m is in the line
+            // of fire (FUN_100b7e00 -> FUN_100bab20 / FUN_100b64a0)
+            if (u.trigger && !u.holdFire) {
+                if (u.resting && (u.restTimer -= dt) <= 1e-5f) {
+                    u.resting = false, u.burstFired = 0;
+                    int ammo = combat_->ammoLeft(u.object);
+                    u.burstLimit = combat_->autoBurst(u.object);
+                    if (ammo >= 0) u.burstLimit = std::min(u.burstLimit, ammo);
                 }
-                if (getenv("HG2_DEBUG") && int(u.clock * 2) != int((u.clock - dt) * 2))
-                    SDL_Log("ai %d on lava at %.0f,%.0f: escape %s %.0f m", u.object, me.x, me.z, bd < 1e8f ? "to" : "none", bd);
-                if (bd < 1e8f) {
-                    float e3;
-                    steerTo(best, e3);
-                    in.throttle = std::fabs(e3) < 1.4f ? 1.f : 0.3f, in.run = true, in.strafe = 0;
+                if (u.burstLimit < 0) u.burstLimit = combat_->autoBurst(u.object);
+                if (!u.resting) {
+                    Vec3 gun(-std::sin(gunYaw) * std::cos(elev), std::sin(elev), -std::cos(gunYaw) * std::cos(elev));
+                    Vec3 rel = aim - mz;
+                    float along = dot(rel, gun), off = std::sqrt(std::max(0.f, dot(rel, rel) - along * along));
+                    bool melee = combat_->muzzleVelocity(u.object) <= 0;
+                    bool onTarget = melee || (along > 0 && length(rel) <= combat_->range(u.object) &&
+                                              off < std::max(1.f, scene_->objectRadius(u.target)));
+                    bool clear = true;
+                    if (onTarget && !melee) {
+                        float tt = 2.f;
+                        int hit = scene_->raycast(mz, aim, u.object, tt);
+                        if (hit >= 0 && hit != u.target && tt < 1.f && length(rel) * tt < u.targetDist + 5.f) {
+                            int ht = teamOf(hit);
+                            clear = !(ht == u.team || (ht < 100 && find(hit)));
+                        }
+                    }
+                    if ((u.los || melee) && onTarget && clear) {
+                        Vec3 shot = mz + gun * std::max(1.f, along);
+                        combat_->setAimTarget(u.object, u.target);
+                        if (combat_->fire(u.object, mz, shot)) {
+                            u.burstFired++;
+                            if (tacDbg) SDL_Log("tac %d fires at %d (%.0f m)", u.object, u.target, u.targetDist);
+                        }
+                    }
+                    if (u.burstLimit <= u.burstFired) u.resting = true, u.restTimer = kRec[std::clamp(defcon(sideIdx), 0, 5)].react + rand01() - 0.5f;
                 }
             }
         }
+        if (tacDbg && int(u.clock * 2) != int((u.clock - dt) * 2) && (u.target >= 0 || u.mode != 0))
+            SDL_Log("tac %d mode %d %s step %d ord %d/%zu tgt %d dist %.0f los %d exp %d rng %d trig %d defcon %d", u.object, u.mode,
+                    u.tactic.c_str(), u.step, u.orders.empty() ? -1 : u.orders.front().kind, u.orders.size(), u.target,
+                    u.targetDist, int(u.los), int(u.exposed), int(u.inRange), int(u.trigger), defcon(sideIdx));
+        u.lastTargetPos = tp, u.lastTarget = u.target;
         // MOVETO progress watchdog (FUN_100bf300): the follower keeps the nearest it has been to its goal and a 5 s
         // timer, reset whenever it gets nearer; when the timer runs out the move fails (state 7) and the tactic picks
         // again. The port first tries a planned route, then gives the order up.
-        if (u.ord.kind == 2 && !u.braked && u.mobile) {
-            float d = length(flat(u.ord.pos) - flat(me));
-            if (d < u.ord.best - 0.5f) u.ord.best = d, u.ord.patience = 5.f;
-            else if ((u.ord.patience -= dt) <= 0) {
-                if (!u.ord.rerouted) u.ord.rerouted = true, u.ord.patience = 5.f, u.wantRoute = true, u.lastSteer = u.ord.pos;
-                else u.ord = Unit::Order{}, u.detour.clear();
+        if (!u.orders.empty() && (u.orders.front().kind == 2 || u.orders.front().kind == 4) && !u.braked && u.mobile) {
+            Order& o = u.orders.front();
+            Vec3 goal = o.pos, op;
+            if ((o.flags & 2) && o.obj >= 0 && positionOf(o.obj, op)) goal = op;
+            float d = length(flat(goal) - flat(me));
+            if (d < o.best - 0.5f) o.best = d, o.patience = 5.f;
+            else if ((o.patience -= dt) <= 0) {
+                if (!o.rerouted) o.rerouted = true, o.patience = 5.f, u.wantRoute = true, u.lastSteer = goal;
+                else u.orders.erase(u.orders.begin()), u.detour.clear();
             }
         }
         // route round what's in the way: when stuck, or (every 1.5 s) when the straight line ahead is blocked
-        if (u.mobile && !u.braked && in.throttle > 0.5f && u.detour.empty() && length(flat(u.lastSteer) - flat(me)) > 20.f) {
+        if (u.mobile && !u.braked && std::fabs(in.throttle) > 0.2f && u.detour.empty() && length(flat(u.lastSteer) - flat(me)) > 20.f) {
             if ((u.detourCheck -= dt) <= 0) {
                 u.detourCheck = 1.5f + float(u.object % 7) * 0.05f;
                 Vec3 ahead = me + (flat(u.lastSteer) - flat(me)) * std::min(1.f, 48.f / length(flat(u.lastSteer) - flat(me)));
@@ -907,35 +1239,8 @@ void AiSystem::update(float dt) {
         if (u.wantRoute && routeBudget_ > 0) {
             u.wantRoute = false, routeBudget_ -= 1;
             if (planRoute(me, u.lastSteer, u.object, u.detour)) u.detourGoal = u.lastSteer, u.detourIdx = 0;
-            if (getenv("HG2_TACDBG"))
-                SDL_Log("ai %d route to %.0f,%.0f: %zu waypoints", u.object, u.lastSteer.x, u.lastSteer.z, u.detour.size());
+            if (tacDbg) SDL_Log("ai %d route to %.0f,%.0f: %zu waypoints", u.object, u.lastSteer.x, u.lastSteer.z, u.detour.size());
         }
-        // stuck against something while trying to drive: back off and turn for a moment
-        if (u.mobile && u.type == 0x48) {
-            if (u.unstick > 0) {
-                u.unstick -= dt;
-                in.throttle = -0.7f, in.turn = (u.object & 1) ? 1.f : -1.f, in.strafe = 0, in.run = false;
-            } else if (std::fabs(in.throttle) > 0.5f && !u.braked) {
-                if ((u.stuckClock += dt) > 2.f) {
-                    Vec3 dd = me - u.stuckFrom;
-                    if (length(Vec3(dd.x, 0, dd.z)) < 1.f) u.unstick = 1.2f, u.wantRoute = true;
-                    u.stuckClock = 0, u.stuckFrom = me;
-                }
-            } else {
-                u.stuckClock = 0, u.stuckFrom = me;
-            }
-        }
-        // gears skate on long runs out of a fight (the original's SMS travel) and kneel to shoot when holding
-        // ground; scripted stances are left alone
-        if (u.type == 0x48 && u.mobile && !u.scriptStance && u.body.canWalk()) {
-            // (not on scripted paths: escorts and patrols keep the pace their scripts expect)
-            bool travelling = !getenv("HG2_NOSKATE") && u.target < 0 && u.path.empty() && u.drive == 0 && in.throttle > 0.5f && in.run && std::fabs(in.turn) < 0.5f;
-            if (travelling != u.autoSkates) u.autoSkates = travelling, u.body.setSkates(travelling);
-            bool hold = u.target >= 0 && std::fabs(in.throttle) < 0.1f && std::fabs(in.strafe) < 0.1f &&
-                        (u.order == OrderHold || u.combatTactic.find("holdground") != std::string::npos || u.combatTactic == "standandshoot");
-            if (hold != u.autoKneel) u.autoKneel = hold, u.body.setPosture(hold ? 2 : 1);
-        }
-        in.throttle *= std::min(1.f, u.speedFrac * 2.f);
         if (u.braked) in.throttle = 0, in.strafe = 0, in.run = false;
         if (!u.mobile) {  // turrets only rotate
             float y = u.body.yaw() + in.turn * 1.2f * dt;
@@ -948,8 +1253,8 @@ void AiSystem::update(float dt) {
             in = PlayerInput{};
         }
         if (getenv("HG2_UNITDBG") && u.object == atoi(getenv("HG2_UNITDBG")) && int(u.clock * 2) != int((u.clock - dt) * 2))
-            SDL_Log("unit %d thr %.2f run %d turn %.2f braked %d speedFrac %.2f bodySpeed %.2f walk %d ord %d drive %d",
-                    u.object, in.throttle, in.run, in.turn, u.braked, u.speedFrac, u.body.speed(), u.body.canWalk(), u.ord.kind, u.drive);
+            SDL_Log("unit %d thr %.2f run %d turn %.2f braked %d bodySpeed %.2f walk %d mode %d ord %zu drive %d",
+                    u.object, in.throttle, in.run, in.turn, u.braked, u.body.speed(), u.body.canWalk(), u.mode, u.orders.size(), u.drive);
         u.body.update(dt, in);
         combat_->setPosture(u.object, u.body.postureCode());
     }
@@ -1004,8 +1309,6 @@ bool AiSystem::lineBlocked(const Vec3& from, const Vec3& to, int self) const {
         if (!walkable(p.x, p.z, rules)) return true;
         Vec3 q(p.x, scene_->groundHeight(p.x, p.z), p.z);
         if (scene_->collide(q, 2.5f, 8.f, self)) return true;
-        const Surface* s = scene_->surfaceAt(p.x, p.z);
-        if (s && s->damage > 0) return true;
     }
     return false;
 }
@@ -1019,7 +1322,7 @@ bool AiSystem::planRoute(const Vec3& from, const Vec3& to, int self, std::vector
     };
     int sx, sz, gx, gz;
     cellOf(from, sx, sz), cellOf(to, gx, gz);
-    std::vector<signed char> kind(size_t(W) * H, -1);  // -1 unknown, 0 free, 1 blocked, 2 lava
+    std::vector<signed char> kind(size_t(W) * H, -1);  // -1 unknown, 0 free, 1 blocked
     std::vector<float> hgt(size_t(W) * H, 0.f);
     float water = scene_->mission().hasWater ? scene_->waterLevel() : -1e9f;
     MoveRules rules = moveRules(self);
@@ -1033,8 +1336,7 @@ bool AiSystem::planRoute(const Vec3& from, const Vec3& to, int self, std::vector
             hgt[i] = rules.onSurface ? std::max(h, water) : h;  // request flag 0x20 (+0x3b): nodes on the water surface
             depth[i] = std::max(0.f, water - h);
             Vec3 q(c.x, h, c.z);
-            const Surface* s = scene_->surfaceAt(c.x, c.z);
-            kind[i] = !walkable(c.x, c.z, rules) || scene_->collide(q, 2.5f, 8.f, self) ? 1 : (s && s->damage > 0) ? 2 : 0;
+            kind[i] = !walkable(c.x, c.z, rules) || scene_->collide(q, 2.5f, 8.f, self) ? 1 : 0;  // no surface test
         }
         return kind[i];
     };
@@ -1079,7 +1381,6 @@ bool AiSystem::planRoute(const Vec3& from, const Vec3& to, int self, std::vector
                 float dh = hgt[ni] - hgt[cur];
                 float c = g[cur] + step + dh * dh;
                 if (rules.waterCost && depth[ni] > 0) c += (depth[ni] + 1.f) * step;
-                if (k == 2) c += 12.f * step;  // lava: the port's addition (the original has no lava test here)
                 if (c < g[ni]) g[ni] = c, parent[ni] = cur, open.push({c + hcost(nx, nz, hgt[ni]), ni});
             }
     }
