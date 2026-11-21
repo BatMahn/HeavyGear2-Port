@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -44,6 +45,10 @@ public:
     const SoundInfo* info(const std::string& wav) const;
     // Music: ripped CD tracks (.mp3 / .wav) in a folder, played in shuffled order. False if none were found.
     bool startMusic(const std::string& folder);
+    // Red Book music: the original played CD audio tracks (mission RedBook_Track, script cues "redbkNNN.wav").
+    // Files in the music folder named with a track number (track02.mp3, 02 - Title.mp3, Track 2.wav) stand in for
+    // the disc's tracks; playTrack loops that one. Without numbered files the folder plays shuffled.
+    bool playTrack(int n);
     void stopMusic();
 
 private:
@@ -53,6 +58,8 @@ private:
     void loadSoundList();
     std::vector<std::string> tracks_;
     size_t trackIdx_ = 0;
+    std::map<int, std::string> numbered_;  // CD track number -> file
+    std::string pinned_;                   // the cued track, looped
     std::shared_ptr<Clip> nextTrack_;
     std::atomic<bool> loadingTrack_{false};
     bool musicOn_ = false;

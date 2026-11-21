@@ -5,6 +5,14 @@ Heavy Gear II native port - https://github.com/BatMahn/HeavyGear2-Port
 Each release's source and the macOS / Linux / Windows builds are on the GitHub releases page. No game data is ever
 included: you need your own copy of Heavy Gear II (see the README's "Setting up the game folder").
 
+## 0.27.1 - 2026-11-20
+
+- Music follows the original's CD audio cues: mission scripts cue CD tracks 2-19 (`redbkNNN`) at mission start, in
+  combat and at mission end; files in `music/` named with the CD track number play when cued and loop. A folder
+  without numbered files still plays shuffled.
+- The menu pointer's black box is gone (the pointer art is colour-keyed, as the original drew it).
+- Application icons: the macOS app (`.icns`), the Windows `.exe` (`.ico`) and the window icon while running.
+
 ## 0.27.0 - 2026-11-20
 
 ### Weapons

@@ -398,6 +398,8 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
         if (g.hasSystems) combat.setSystems(mates[i], g.sensors, g.maneuver, g.perks, g.flaws);
     }
     Audio* audio = app.audioOk && !offscreen ? &app.audio : nullptr;
+    if (audio && getenv("HG2_DEBUG")) SDL_Log("mission RedBook_Track %d", scene.mission().musicTrack);
+    if (audio && scene.mission().musicTrack > 0) audio->playTrack(scene.mission().musicTrack);  // RedBook_Track
     if (audio) {
         world.audio = audio;
         combat.audio = audio;

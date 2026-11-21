@@ -8,6 +8,7 @@
 #include <string>
 
 #include "app.h"
+#include "icon_rgba.h"
 #include "game/session.h"
 #include "net/net.h"
 #include "shell/gamedata.h"
@@ -175,6 +176,10 @@ int main(int argc, char** argv) {
         SDL_WindowFlags fl = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | (app.settings.fullscreen ? SDL_WINDOW_FULLSCREEN : 0);
         app.win = SDL_CreateWindow("Heavy Gear II", app.width, app.height, fl);
         SDL_HideCursor();  // the shell and the pause menu draw the game's own pointer
+        if (SDL_Surface* icon = SDL_CreateSurfaceFrom(kIconW, kIconH, SDL_PIXELFORMAT_RGBA32, const_cast<uint8_t*>(kIconRgba), kIconW * 4)) {
+            SDL_SetWindowIcon(app.win, icon);  // title bar / taskbar / dock while running (Linux has no bundle icon)
+            SDL_DestroySurface(icon);
+        }
         if (!app.win) {
             fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
             return 1;

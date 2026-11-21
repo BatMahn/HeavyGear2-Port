@@ -10,7 +10,7 @@ installation needed).
 
 See [CHANGELOG.md](CHANGELOG.md) for what each release changed.
 
-## Status (v0.27.0) — the whole single-player game
+## Status (v0.27.1) — the whole single-player game
 
 The game now starts in the original shell, drawn from the game's own layouts and artwork:
 
@@ -312,13 +312,20 @@ from it the same way.
 
 ### The music
 
-The port plays your own rip of the soundtrack: put the tracks (`.mp3` or `.wav`, 16-bit PCM) in a `music` folder
-inside the game folder, or pass `--music <folder>`. They play in a shuffled order through missions; `M` toggles the
-music. Without them the missions play with their sound effects only.
+Heavy Gear II's soundtrack is CD audio: tracks 2-19 on the game CD, after the data track. The mission scripts cue
+them by number (`redbk002` ... `redbk019`: mission start, combat, mission over). A disc image made as `.iso` holds only
+the data, so rip the audio tracks from the CD (Music app with the MP3 encoder, XLD, Exact Audio Copy,
+`cdparanoia -B 2-19`) and put them in a `music` folder inside the game folder, keeping the CD's track numbers in the
+names:
 
-    HeavyGear2/music/01.mp3
-    HeavyGear2/music/02.mp3
+    HeavyGear2/music/track02.mp3
+    HeavyGear2/music/track03.mp3
     ...
+    HeavyGear2/music/track19.mp3
+
+Any name with the track number works (`02 - Title.mp3`, `Track 2.wav`). `.mp3` and `.wav` (16-bit PCM) are read;
+`--music <folder>` points elsewhere. The cued track loops until the script cues another. A folder of files without
+numbers plays shuffled instead. `M` toggles the music.
 
 ### The movies
 

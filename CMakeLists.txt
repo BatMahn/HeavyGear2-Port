@@ -3,7 +3,7 @@
 # SDL3 and zlib are taken from the system when found, otherwise downloaded and built
 # (HG2_FETCH_DEPS=ON forces the download, which is what the release workflow does).
 cmake_minimum_required(VERSION 3.21)
-project(hg2port VERSION 0.27.0 LANGUAGES C CXX)
+project(hg2port VERSION 0.27.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -56,15 +56,18 @@ target_include_directories(hg2core PUBLIC src)
 target_link_libraries(hg2core PUBLIC SDL3::SDL3 ZLIB::ZLIB)
 
 if(APPLE)
-  add_executable(hg2 MACOSX_BUNDLE ${GAME_SRC})
+  set(HG2_ICNS ${CMAKE_CURRENT_SOURCE_DIR}/res/hg2.icns)
+  set_source_files_properties(${HG2_ICNS} PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+  add_executable(hg2 MACOSX_BUNDLE ${GAME_SRC} ${HG2_ICNS})
   set_target_properties(hg2 PROPERTIES
+    MACOSX_BUNDLE_ICON_FILE hg2.icns
     OUTPUT_NAME "Heavy Gear II"
     MACOSX_BUNDLE_BUNDLE_NAME "Heavy Gear II"
     MACOSX_BUNDLE_GUI_IDENTIFIER "com.batmahn.hg2port"
     MACOSX_BUNDLE_BUNDLE_VERSION ${PROJECT_VERSION}
     MACOSX_BUNDLE_SHORT_VERSION_STRING ${PROJECT_VERSION})
 elseif(WIN32)
-  add_executable(hg2 WIN32 ${GAME_SRC})
+  add_executable(hg2 WIN32 ${GAME_SRC} res/hg2.rc)  # the .exe's icon
 else()
   add_executable(hg2 ${GAME_SRC})
 endif()

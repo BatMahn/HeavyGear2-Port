@@ -121,18 +121,38 @@ std::shared_ptr<Audio::Clip> Audio::decodeTrack(const std::string& path) {
 
 bool Audio::startMusic(const std::string& folder) {
     if (!stream_) return false;
-    tracks_.clear();
+    tracks_.clear(), numbered_.clear(), pinned_.clear();
     int n = 0;
     char** list = SDL_GlobDirectory(folder.c_str(), nullptr, SDL_GLOB_CASEINSENSITIVE, &n);
     for (int i = 0; list && i < n; i++) {
         std::string f = list[i], ext = lower(extension(f));
-        if (ext == "mp3" || ext == "wav") tracks_.push_back(folder + "/" + f);
+        if (ext != "mp3" && ext != "wav") continue;
+        tracks_.push_back(folder + "/" + f);
+        // a track number: the first run of digits in the name ("track02", "02 - Title", "Track 2")
+        std::string stem = f.substr(0, f.size() - ext.size() - 1);
+        size_t d = stem.find_first_of("0123456789");
+        if (d != std::string::npos) {
+            int num = atoi(stem.c_str() + d);
+            if (num > 0 && num < 100 && !numbered_.count(num)) numbered_[num] = folder + "/" + f;
+        }
     }
     SDL_free(list);
     if (tracks_.empty()) return false;
     for (size_t i = tracks_.size(); i > 1; i--) std::swap(tracks_[i - 1], tracks_[size_t(rand()) % i]);
     musicOn_ = true, trackIdx_ = 0;
     SDL_Log("music: %zu tracks in %s", tracks_.size(), folder.c_str());
+    return true;
+}
+
+bool Audio::playTrack(int n) {
+    auto it = numbered_.find(n);
+    if (!musicOn_ || it == numbered_.end()) return false;
+    std::lock_guard<std::mutex> g(mutex_);
+    if (pinned_ == it->second) return true;  // already playing it
+    pinned_ = it->second;
+    voices_.erase(std::remove_if(voices_.begin(), voices_.end(), [](const Voice& v) { return v.music; }), voices_.end());
+    nextTrack_.reset();
+    SDL_Log("music: CD track %d -> %s", n, pinned_.c_str());
     return true;
 }
 
@@ -184,6 +204,7 @@ void Audio::gains(float volume, const Vec3* at, float range, float& l, float& r)
 }
 
 bool Audio::play(const std::string& wav, float volume, const Vec3* at, float range) {
+    if (lower(wav).rfind("redbk", 0) == 0) return playTrack(atoi(lower(wav).c_str() + 5));  // music cue (CD track)
     if (wav.empty()) return false;
     if (!stream_) return fs_ && clip(wav), false;  // no device: still resolve the name (reports missing files)
     auto c = clip(wav);
@@ -261,6 +282,13 @@ void Audio::flushDialog() {
 }
 
 void Audio::queueDialog(const std::string& wav) {
+    // "redbkNNN.wav" is a music cue (CD audio track NNN), not a file
+    std::string l = lower(wav);
+    if (getenv("HG2_DEBUG")) SDL_Log("dialog queued: %s", wav.c_str());
+    if (l.rfind("redbk", 0) == 0) {
+        playTrack(atoi(l.c_str() + 5));
+        return;
+    }
     std::lock_guard<std::mutex> g(mutex_);
     dialog_.push_back(wav);
 }
@@ -282,7 +310,7 @@ void Audio::update() {
                 nextTrack_.reset();
             } else {
                 loadingTrack_ = true;
-                std::string path = tracks_[trackIdx_++ % tracks_.size()];
+                std::string path = !pinned_.empty() ? pinned_ : tracks_[trackIdx_++ % tracks_.size()];
                 std::thread([this, path]() {
                     auto c = decodeTrack(path);
                     std::lock_guard<std::mutex> lk(mutex_);

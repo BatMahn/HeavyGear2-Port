@@ -111,10 +111,18 @@ int Ui::texture(const std::string& name, int* w, int* h) {
     if (it == textures_.end()) {
         Tex t;
         Image img;
-        bool ok = art_.image(k, img);
+        // "name#key": black is see-through (the pointer art has no alpha; the original drew it colour-keyed)
+        bool keyed = k.size() > 4 && k.compare(k.size() - 4, 4, "#key") == 0;
+        std::string file = keyed ? k.substr(0, k.size() - 4) : k;
+        bool ok = art_.image(file, img);
         if (!ok) {
             Bytes b;
-            ok = fs_->read(k, b) && decodeImage(b, k, img);
+            ok = fs_->read(file, b) && decodeImage(b, file, img);
+        }
+        if (ok && keyed) {
+            for (size_t i = 0; i + 3 < img.rgba.size(); i += 4)
+                if (img.rgba[i] < 12 && img.rgba[i + 1] < 12 && img.rgba[i + 2] < 12) img.rgba[i + 3] = 0;
+            img.hasAlpha = true;
         }
         if (ok && r_) t.id = r_->createTexture(img, false), t.w = img.w, t.h = img.h;
         it = textures_.emplace(k, t).first;
@@ -164,7 +172,7 @@ void Ui::frame(float x, float y, float w, float h, uint32_t c) {
 
 void Ui::cursor() {
     if (mx_ < 0 || my_ < 0) return;
-    if (!image("Scursor1.TGA", mx_ - 1, my_ - 1)) {
+    if (!image("Scursor1.TGA#key", mx_ - 1, my_ - 1)) {
         rect(mx_, my_, 2, 10, 0xffffffffu), rect(mx_, my_, 8, 2, 0xffffffffu);
     }
 }
