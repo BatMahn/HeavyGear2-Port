@@ -489,12 +489,29 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             const Audio::SoundInfo* si = audio->info(g.soundMotor);
             if (si && si->loop) ambients.push_back({int(i), g.soundMotor, si->range > 0 ? si->range : 200.f});
         }
+        if (getenv("HG2_DEBUG")) {
+            std::map<std::string, int> n;
+            for (auto& a : ambients) n[a.wav]++;
+            for (auto& [w, k] : n) SDL_Log("ambient %s x%d", w.c_str(), k);
+        }
     }
     auto updateAmbient = [&]() {
         Vec3 lp = player.position();
+        // A sound plays once, from its nearest source: the marshes place the same loop on dozens of props (S2J has 31
+        // envswmpa crickets), and played together they added up to many times the sound's volume. EAR's channels
+        // and priorities (Sounds.lst channel / EAR_PERF_PRIORITIZE) likewise keep one voice per sound.
+        std::map<std::string, std::pair<float, const Ambient*>> nearest;
         for (auto& a : ambients) {
             Vec3 p;
-            bool on = !scene.objectHidden(a.object) && scene.objectPosition(a.object, p) && length(p - lp) < a.range;
+            if (scene.objectHidden(a.object) || !scene.objectPosition(a.object, p)) continue;
+            float d = length(p - lp);
+            auto it = nearest.find(a.wav);
+            if (d < a.range && (it == nearest.end() || d < it->second.first)) nearest[a.wav] = {d, &a};
+        }
+        for (auto& a : ambients) {
+            Vec3 p;
+            auto it = nearest.find(a.wav);
+            bool on = it != nearest.end() && it->second.second == &a && scene.objectPosition(a.object, p);
             if (on && a.handle < 0) a.handle = audio->startLoop(a.wav, 0.f);
             if (!on && a.handle >= 0) audio->stopLoop(a.handle), a.handle = -1;
             if (a.handle >= 0) audio->setLoop(a.handle, 0.6f * (audio->info(a.wav) ? audio->info(a.wav)->volume : 1.f), &p, a.range);

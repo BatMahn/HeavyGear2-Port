@@ -10,7 +10,7 @@ installation needed).
 
 See [CHANGELOG.md](CHANGELOG.md) for what each release changed.
 
-## Status (v0.27.1) — the whole single-player game
+## Status (v0.27.2) — the whole single-player game
 
 The game now starts in the original shell, drawn from the game's own layouts and artwork:
 

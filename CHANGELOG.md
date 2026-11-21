@@ -5,6 +5,11 @@ Heavy Gear II native port - https://github.com/BatMahn/HeavyGear2-Port
 Each release's source and the macOS / Linux / Windows builds are on the GitHub releases page. No game data is ever
 included: you need your own copy of Heavy Gear II (see the README's "Setting up the game folder").
 
+## 0.27.2 - 2026-11-21
+
+- Ambient loops play once, from their nearest source: the marsh maps put the same cricket loop on dozens of props
+  (31 in S2J) and they all played together, many times too loud.
+
 ## 0.27.1 - 2026-11-20
 
 - Music follows the original's CD audio cues: mission scripts cue CD tracks 2-19 (`redbkNNN`) at mission start, in
