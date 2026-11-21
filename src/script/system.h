@@ -21,6 +21,9 @@ public:
     virtual int teamOf(int unit);
     virtual bool isAlive(int unit) { return unit >= 0; }
     virtual bool userAlive() { return true; }
+    // Campaign roster status of a named squad pilot (FUN_100842e0): 1 ejected (+0xc11), -1 gear lost, 0 otherwise
+    // or not a squad pilot.
+    virtual int pilotStatus(const std::string& name) { (void)name; return 0; }
     // MissionOver(code[, delay]): 1 success, 0 failure, 2 alternate outcome (MSN's third mission id).
     virtual void missionOver(int result, float delay) { (void)result, (void)delay; }
     virtual void objectiveStatus(int objective, int status) { (void)objective, (void)status; }
@@ -81,6 +84,7 @@ public:
     bool load(const Mission& m, std::string* err);
     void update(float dt);                  // timers, signals, run pending handlers
     void attachScript(const std::string& file, int unit);  // a unit created at run time (fountains); runs its start-up handler
+    void detachScripts(int unit);  // drop a unit's scripts and their timers (a pooled fountain unit coming back)
     void unitSignal(int unit, int sig);
     void teamSignal(int team, int sig);
     void missionSignal(int sig);

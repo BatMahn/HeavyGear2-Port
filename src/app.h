@@ -7,6 +7,7 @@
 
 #include "audio/audio.h"
 #include "core/fs.h"
+#include "game/bindings.h"
 #include "render/renderer.h"
 
 namespace hg2 {
@@ -14,8 +15,8 @@ namespace hg2 {
 struct Settings {
     float effects = 0.8f, dialog = 1.0f, music = 0.5f, shell = 0.8f;  // 0..1
     bool externalView = false;   // start missions in the chase view
-    bool invertMouse = false;
-    float mouseSpeed = 1.0f;     // 0.25 .. 3
+    bool invertMouse = false;    // the controls screen's Invert Mouse Y (binding flag +0x54 on Target ReticleY)
+    Bindings bindings;           // the controls screen's bindings (Defaults.dft until changed)
     int particles = 2;           // the original's particle detail: 0 low, 1 medium, 2 high
     bool fullscreen = false;
     int msaa = 4;                // anti-aliasing samples: 1 (off), 2, 4, 8

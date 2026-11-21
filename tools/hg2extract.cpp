@@ -2,8 +2,8 @@
 //   hg2extract <datadir> list                  list archive entries
 //   hg2extract <datadir> get <name> <out>      extract one file (archives, loose, or ~-compressed)
 //   hg2extract <datadir> check                 parse every model / terrain / mission and report
-//   hg2extract <datadir> collaudit [MISSION|all] [-v]   static collision volumes, old vs new, suspicious ones listed
-//   hg2extract <datadir> collboxes <model.m>   a model's collision boxes; meshes / materials <model.m> its parts
+//   hg2extract <datadir> collaudit [MISSION|all]   collision polygons: stored planes against winding / corners
+//   hg2extract <datadir> meshes / materials <model.m>   a model's parts
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -107,12 +107,13 @@ int main(int argc, char** argv) {
         Mission m;
         std::string err;
         if (!fs.read("mission/" + std::string(argv[3]) + ".ann", b) || !loadMission(b, m, &err)) return 1;
+        if (!m.fountains.empty()) printf("system %s pool %d cap %d\n", m.fountainsOn ? "on" : "off", m.fountainPool, m.fountainCap);
         for (size_t i = 0; i < m.fountainTemplates.size(); i++)
             printf("template %zu def %d type %x %s\n", i, m.fountainTemplates[i].defIndex, m.fountainTemplates[i].type,
                    m.fountainTemplates[i].script.c_str());
         for (auto& f : m.fountains) {
-            printf("fountain '%s' team %d %s mode %d total %d alive %d wave %d flags %x at %.0f,%.0f,%.0f range %.0f/%.0f/%.0f script %s tpl",
-                   f.name.c_str(), f.team, f.active ? "on" : "off", f.mode, f.total, f.maxAlive, f.wave, f.flags, f.pos[0], f.pos[1],
+            printf("fountain '%s' team %d %s mode %d total %d alive %d wave %d minrange %d at %.0f,%.0f,%.0f range %.0f/%.0f/%.0f script %s tpl",
+                   f.name.c_str(), f.team, f.active ? "on" : "off", f.mode, f.total, f.maxAlive, f.wave, int(f.minRange), f.pos[0], f.pos[1],
                    f.pos[2], f.range[0], f.range[1], f.range[2], f.script.c_str());
             for (int t : f.templates) printf(" %d", t);
             printf("\n");
@@ -131,6 +132,25 @@ int main(int argc, char** argv) {
             if (!unit && argc < 5 && !o.userHeader) continue;
             printf("%3zu %s type %x def %d (%s) team %d at %.0f,%.0f,%.0f script %s\n", i, o.userHeader ? "USER" : "    ", o.type, o.defIndex,
                    o.defIndex >= 0 ? m.defs[size_t(o.defIndex)].firstModel.c_str() : "-", o.team, o.pos[0], o.pos[1], o.pos[2], o.script.c_str());
+        }
+        return 0;
+    }
+    if (cmd == "walkgraphs") {  // objects carrying a WalkableGraph (0x14f) in every mission
+        std::vector<std::string> files;
+        for (auto& n : fs.sim().names())
+            if (extension(n) == "ann") files.push_back(n);
+        std::error_code ec;
+        for (auto& e : std::filesystem::directory_iterator(std::string(argv[1]) + "/Mission", ec))
+            if (extension(e.path().filename().string()) == "ann") files.push_back("mission/" + e.path().filename().string());
+        for (auto& n : files) {
+            Bytes b;
+            Mission m;
+            if (!fs.read(n, b) || !loadMission(b, m)) continue;
+            for (size_t i = 0; i < m.objects.size(); i++)
+                if (!m.objects[i].walkGraph.empty())
+                    printf("%s %zu type %x %s graph %s\n", n.c_str(), i, m.objects[i].type,
+                           m.objects[i].defIndex >= 0 ? m.defs[size_t(m.objects[i].defIndex)].firstModel.c_str() : "-",
+                           m.objects[i].walkGraph.c_str());
         }
         return 0;
     }
@@ -160,6 +180,8 @@ int main(int argc, char** argv) {
                             if (p.corners[k + 1].v < wv.size())
                                 area += 0.5 * length(cross(wv[p.corners[k].v] - wv[p.corners[0].v], wv[p.corners[k + 1].v] - wv[p.corners[0].v]));
                     printf("%-24s %4zu polys (%.0f %.0f %.0f)-(%.0f %.0f %.0f) area %.0f\n", f.name.c_str(), me.polys.size(), lo.x, lo.y, lo.z, hi.x, hi.y, hi.z, area);
+                } else {
+                    printf("%-24s  frame at (%.1f %.1f %.1f) z axis (%.2f %.2f %.2f)\n", f.name.c_str(), w.m[3][0], w.m[3][1], w.m[3][2], w.m[2][0], w.m[2][1], w.m[2][2]);
                 }
                 if (f.child >= 0) walk(f.child, w);
                 fi = f.sibling;
@@ -175,26 +197,10 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < mdl.materials.size(); i++) printf("%zu %s tex %s flags %x\n", i, mdl.materials[i].name.c_str(), mdl.materials[i].texture.c_str(), mdl.materials[i].flags);
         return 0;
     }
-    if (cmd == "collboxes" && argc >= 4) {  // a model's collision boxes, old and new
-        Bytes b;
-        Model mdl;
-        if (!fs.read(argv[3], b) || !loadModel(b, mdl)) return 1;
-        TextureAlpha alpha(fs);
-        CollModel o, n;
-        legacyCollision(mdl, o);
-        buildCollision(mdl, alpha.forModel(mdl), n);
-        printf("mesh (%.1f %.1f %.1f)-(%.1f %.1f %.1f) cell %.2f samples %d transparent %d\n", n.meshLo.x, n.meshLo.y, n.meshLo.z, n.meshHi.x,
-               n.meshHi.y, n.meshHi.z, n.cell, n.samples, n.transparentSamples);
-        for (auto& x : o.full.boxes) printf("old (%.1f %.1f %.1f)-(%.1f %.1f %.1f)\n", x.lo.x, x.lo.y, x.lo.z, x.hi.x, x.hi.y, x.hi.z);
-        for (auto& x : n.trunk.boxes) printf("trunk (%.1f %.1f %.1f)-(%.1f %.1f %.1f)\n", x.lo.x, x.lo.y, x.lo.z, x.hi.x, x.hi.y, x.hi.z);
-        for (auto& x : n.full.boxes) printf("new (%.1f %.1f %.1f)-(%.1f %.1f %.1f)\n", x.lo.x, x.lo.y, x.lo.z, x.hi.x, x.hi.y, x.hi.z);
-        return 0;
-    }
-    if (cmd == "collaudit") {  // collision audit: hgextract <data> collaudit [MISSION|all] [-v]
-        // For every placed static object: the old one-box-per-mesh volumes against the column volumes, flagging boxes
-        // much bigger than the solid geometry near the ground, markers that are never drawn, alpha cut-outs, wires.
+    if (cmd == "collaudit") {  // polygon collision audit: hg2extract <data> collaudit [MISSION|all]
+        // Every model a mission places: polygon count and how many stored planes disagree with the winding or do not
+        // pass through their own corners (the original's BSP test FUN_1000d690 uses the stored plane as it is).
         std::string want = argc >= 4 ? upper(argv[3]) : "ALL";
-        bool verbose = argc >= 5;
         std::vector<std::string> missions;
         for (auto& n : fs.sim().names())
             if (extension(n) == "ann") {
@@ -210,76 +216,32 @@ int main(int argc, char** argv) {
             }
         std::sort(missions.begin(), missions.end());
         missions.erase(std::unique(missions.begin(), missions.end()), missions.end());
-        TextureAlpha alpha(fs);
-        struct Shapes { CollModel oldS, newS; bool ok = false; };
-        std::map<std::string, std::unique_ptr<Shapes>> cache;
-        auto shapes = [&](std::string key) -> Shapes* {
-            key = upper(key);
-            while (!key.empty() && key[0] == '@') key.erase(0, 1);
-            auto& p = cache[key];
-            if (!p) {
-                p = std::make_unique<Shapes>();
+        std::map<std::string, int> seen;
+        long tris = 0, flipped = 0, offPlane = 0, models = 0;
+        for (auto& mn : missions) {
+            Bytes mb;
+            Mission ms;
+            if ((!fs.read("mission/" + mn + ".ann", mb) && !fs.read(mn + ".ann", mb)) || !loadMission(mb, ms)) continue;
+            for (auto& def : ms.defs) {
+                std::string key = upper(def.firstModel);
+                while (!key.empty() && key[0] == '@') key.erase(0, 1);
+                if (key.empty() || seen.count(key)) continue;
+                seen[key] = 1;
                 Bytes b;
                 Model mdl;
-                if (fs.read(key, b) && loadModel(b, mdl)) {
-                    legacyCollision(mdl, p->oldS);
-                    buildCollision(mdl, alpha.forModel(mdl), p->newS);
-                    p->ok = true;
+                if (!fs.read(key, b) || !loadModel(b, mdl)) continue;
+                CollMesh cm;
+                buildCollMesh(mdl, cm);
+                int fl = 0, off = 0;
+                for (auto& t : cm.tris) {
+                    if (dot(cross(t.b - t.a, t.c - t.a), t.n) < 0) fl++;
+                    if (std::fabs(dot(t.n, t.b) + t.d) > 0.05f || std::fabs(dot(t.n, t.c) + t.d) > 0.05f) off++;
                 }
+                models++, tris += long(cm.tris.size()), flipped += fl, offPlane += off;
+                if (fl || off) printf("%-14s %6zu tris, %5d plane against the winding, %5d corners off the plane\n", key.c_str(), cm.tris.size(), fl, off);
             }
-            return p->ok ? p.get() : nullptr;
-        };
-        auto footprint = [](const CollShape& s, float minY, float maxY) {  // summed box footprint in a height band
-            float a = 0;
-            for (auto& b : s.boxes)
-                if (b.hi.y > minY && b.lo.y < maxY) a += (b.hi.x - b.lo.x) * (b.hi.z - b.lo.z);
-            return a;
-        };
-        int total = 0, flagged = 0, oldBoxes = 0, newBoxes = 0;
-        double oldArea = 0, newArea = 0;
-        for (auto& mn : missions) {
-            Bytes b;
-            Mission m;
-            std::string err;
-            if (!fs.read("mission/" + mn + ".ann", b) || !loadMission(b, m, &err)) continue;
-            std::map<std::string, int> seen;  // one line per model and reason per mission
-            for (size_t i = 0; i < m.objects.size(); i++) {
-                const auto& o = m.objects[i];
-                if (o.defIndex < 0 || size_t(o.defIndex) >= m.defs.size()) continue;
-                const MissionDef& d = m.defs[size_t(o.defIndex)];
-                if (d.firstModel.empty() || !d.animScript.empty()) continue;  // rigged units carry no boxes
-                Shapes* s = shapes(d.firstModel);
-                if (!s) continue;
-                total++;
-                bool marker = o.type == 0x162 || o.type == 0x61 || (o.type >= 0x56 && o.type <= 0x59) || o.type == 0x5c || o.isLight;
-                const CollShape& oldC = s->oldS.full;
-                static const CollShape none;
-                const CollShape& newC = marker ? none : o.type == 0x47 ? s->newS.trunk : s->newS.full;
-                oldBoxes += int(oldC.boxes.size()), newBoxes += int(newC.boxes.size());
-                float base = s->oldS.meshLo.y;
-                float oldFoot = footprint(oldC, base + 1.2f, base + 7.f), newFoot = footprint(newC, base + 1.2f, base + 7.f);
-                oldArea += oldFoot, newArea += newFoot;
-                std::string why;
-                if (marker && !oldC.boxes.empty()) why += o.type == 0x162 || o.type == 0x61 ? " no-collision-class" : " marker";
-                if (oldFoot > 40.f && oldFoot > 3.f * std::max(1.f, newFoot)) why += " oversized";
-                if (!oldC.boxes.empty() && newC.boxes.empty() && !marker) why += " no-solid";
-                if (s->newS.samples > 0 && s->newS.transparentSamples > s->newS.samples / 4) why += " alpha-cutout";
-                if (verbose && s->newS.sliverTris > 0) why += " degenerate-tris";
-                if (verbose && s->newS.decalMeshes > 0) why += " decal-meshes";
-                if (why.empty()) continue;
-                flagged++;
-                std::string k = d.firstModel + why;
-                if (seen[k]++ && !verbose) continue;
-                Vec3 sz = s->oldS.meshHi - s->oldS.meshLo;
-                printf("%-4s obj %4zu type %3x %-14s%-28s mesh %3.0fx%2.0fx%3.0f  old %2zu boxes, %5.0f m2 at gear height -> new %3zu boxes, %5.0f m2 (alpha %d%%)\n",
-                       mn.c_str(), i, o.type, d.firstModel.c_str(), why.c_str(), sz.x, sz.y, sz.z, oldC.boxes.size(), oldFoot, newC.boxes.size(),
-                       newFoot, s->newS.samples ? 100 * s->newS.transparentSamples / s->newS.samples : 0);
-            }
-            for (auto& [k, n] : seen)
-                if (n > 1 && !verbose) printf("%-4s      (x%d) %s\n", mn.c_str(), n, k.c_str());
         }
-        printf("%zu missions, %d static objects, %d flagged; boxes per object %.1f -> %.1f; blocking footprint at gear height %.0f -> %.0f m2\n",
-               missions.size(), total, flagged, total ? double(oldBoxes) / total : 0., total ? double(newBoxes) / total : 0., oldArea, newArea);
+        printf("%ld models, %ld triangles, %ld planes against the winding, %ld off the plane\n", models, tris, flipped, offPlane);
         return 0;
     }
     if (cmd == "paths" && argc >= 4) {  // list a mission's paths

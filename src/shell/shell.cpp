@@ -66,6 +66,7 @@ bool Settings::load(const std::string& path) {
     std::ifstream f(path);
     if (!f) return false;
     std::string line;
+    bindings.setDefaults();
     while (std::getline(f, line)) {
         size_t eq = line.find('=');
         if (eq == std::string::npos) continue;
@@ -77,7 +78,10 @@ bool Settings::load(const std::string& path) {
         else if (k == "shell") shell = v;
         else if (k == "external") externalView = v != 0;
         else if (k == "invert") invertMouse = v != 0;
-        else if (k == "mouse") mouseSpeed = std::clamp(v, 0.25f, 3.f);
+        else if (k == "bind") {
+            if (!bindings.loaded()) bindings.beginLoad();
+            bindings.loadLine(line.substr(eq + 1));
+        }
         else if (k == "particles") particles = std::clamp(int(v), 0, 2);
         else if (k == "fullscreen") fullscreen = v != 0;
         else if (k == "msaa") msaa = int(v) >= 8 ? 8 : int(v) >= 4 ? 4 : int(v) >= 2 ? 2 : 1;
@@ -92,9 +96,10 @@ bool Settings::save(const std::string& path) const {
     std::ofstream f(path);
     if (!f) return false;
     f << "effects=" << effects << "\ndialog=" << dialog << "\nmusic=" << music << "\nshell=" << shell << "\nexternal=" << externalView
-      << "\ninvert=" << invertMouse << "\nmouse=" << mouseSpeed << "\nparticles=" << particles << "\nfullscreen=" << fullscreen
+      << "\ninvert=" << invertMouse << "\nparticles=" << particles << "\nfullscreen=" << fullscreen
       << "\nmsaa=" << msaa << "\nmoviefilter=" << movieFilter << "\nmovie43=" << movie43 << "\n";
     if (!dataDir.empty()) f << "data=" << dataDir << "\n";
+    for (const std::string& b : bindings.serialize()) f << "bind=" << b << "\n";
     return true;
 }
 
@@ -224,6 +229,7 @@ void Shell::run() {
         }
         frameNo++;
         while (SDL_PollEvent(&ev)) {
+            if (bindCapture_ && captureBinding(ev)) continue;  // the controls screen waits for a key or button
             switch (ev.type) {
                 case SDL_EVENT_QUIT: quit_ = true; break;
                 case SDL_EVENT_MOUSE_MOTION: ui_.mouseMove(ev.motion.x * density, ev.motion.y * density); break;
@@ -279,7 +285,7 @@ bool Shell::screenshot(const std::string& screen, const std::string& png, float 
     else if (s == "options") go(Scr::Options);
     else if (s == "sound") go(Scr::Sound);
     else if (s == "graphics") go(Scr::Graphics);
-    else if (s == "controls") go(Scr::Controls);
+    else if (s == "controls") bindCat_ = std::clamp(atoi(arg.c_str()), 0, 3), go(Scr::Controls);  // controls:<category>
     else if (s == "credits") go(Scr::Credits), creditScroll_ = 0;
     else if (s == "pilots") {
         if (roster_.empty()) roster_.push_back({"Grey Hawk", "Dark Cheetah"}), cur_ = 0;
@@ -529,43 +535,147 @@ void Shell::graphicsOptions() {
 }
 
 void Shell::controls() {
-    ui_.image("Sbakescp.tga", 0, 0, 640, 480);
-    title("CONTROLS", 52);
-    static const char* rows[][2] = {
-        {"Walk forward / back", "W / S  (keypad 8 / 2)"}, {"Turn", "A / D  (keypad 4 / 6)"}, {"Sidestep", "Q / E  (keypad 7 / 9)"},
-        {"Run", "Left Shift"}, {"Aim / torso twist", "Mouse"}, {"Fire", "Left button / Left Ctrl"},
-        {"Select weapon", "1 - 8, Tab: next"}, {"Crouch / prone", "Z  (keypad /)"}, {"Stand up", "X  (keypad *)"},
-        {"Jump", "Space  (keypad Enter)"}, {"Skates (SMS)", "R  (keypad 0 / Ins)"}, {"Cockpit / chase view", "C"},
-        {"Camera orbit / tilt", "Arrow keys"}, {"Chase camera zoom", "Wheel, Home / End"}, {"Next / previous nav point", "N / B"},
-        {"Skip cut scene", "Space"}, {"Music on / off", "M"}, {"Pause menu", "Esc"},
-    };
-    TextStyle a, k;
-    a.size = k.size = 8, a.color = k.color = 0x4c8ef8ffu;
-    k.color = 0x8cc8ffffu;
-    float y = 84;
-    for (auto& r : rows) {
-        ui_.textBox(r[0], {110, y, 220, 16}, a, a.color);
-        ui_.textBox(r[1], {330, y, 220, 16}, k, k.color);
-        y += 16;
+    // bindings_config_window (BINDINGS.LDL; shell.dll string table at 0x101f952c): the four categories, the command /
+    // keystroke list, Bind (the next key or mouse button, with Ctrl / Alt / Shift held as its LINK), Undo, Clear
+    // Conflict / Selected / All, Reset Default (Shell\Bindings\Defaults.dft), Invert Mouse Y, the sensitivity of the
+    // selected axis command, Main Menu (drop the changes) and Accept (keep them; the port saves them in settings.cfg)
+    const std::string b = "bindings_config_window.bkgnd.";
+    Bindings& bs = app_.settings.bindings;
+    if (!bindEditing_) bindSaved_ = bs, invertSaved_ = app_.settings.invertMouse, bindEditing_ = true, bindCapture_ = false;
+    std::vector<Cmd> cmds;
+    for (int i = 0; i < int(Cmd::Count); i++)
+        if (Bindings::info(Cmd(i)).category == bindCat_) cmds.push_back(Cmd(i));
+    bindSel_ = std::clamp(bindSel_, 0, int(cmds.size()) - 1);
+    Cmd sel = cmds[size_t(bindSel_)];
+    const bool axis = Bindings::info(sel).axis;
+    // the selected command's conflicts: another command on the same control and link
+    std::string conflictWith;
+    for (const Binding& x : bs.list)
+        if (x.cmd == sel)
+            for (const Binding& o : bs.list)
+                if (o.cmd != sel && o.kind == x.kind && o.code == x.code && o.link == x.link) conflictWith = Bindings::info(o.cmd).name;
+    static const char* cats[] = {"movement", "targeting_hud", "squad_network", "misc"};
+    for (int i = 0; i < 4; i++) ui_.selected[b + cats[i]] = i == bindCat_;
+    ui_.selected[b + "bind_switch.bind"] = bindCapture_;
+    ui_.selected[b + "invert_mouse_y"] = app_.settings.invertMouse;
+    ui_.hidden[b + "conflict_alert"] = ui_.hidden[b + "conflict_text"] = conflictWith.empty();
+    if (!conflictWith.empty()) ui_.text[b + "conflict_text"] = conflictWith;  // the command sharing the key
+    ui_.disabled[b + "clear_conflict"] = conflictWith.empty();
+    ui_.disabled[b + "clear_selected"] = bs.first(sel) == nullptr;
+    // not in the port: the control-set files (Load / Save), the key picker dialog and the axis invert switch
+    ui_.disabled[b + "load"] = ui_.disabled[b + "save"] = ui_.disabled[b + "bindings_keys"] = true;
+    // Invert Mouse Y (Target ReticleY), and the Reversed switch of the selected axis command
+    ui_.text[b + "invert_mouse_y"] = app_.settings.invertMouse ? "Invert On" : "Invert Off";
+    bool reversed = false;
+    for (const Binding& x : bs.list)
+        if (x.cmd == sel && x.reverse) reversed = true;
+    ui_.hidden[b + "invert_switch"] = !axis;
+    ui_.text[b + "invert_switch.invert"] = reversed ? "Reversed" : "Not Reversed";
+    ui_.selected[b + "invert_switch.invert"] = reversed;
+    // the list header: COMMANDS and KEYSTROKE side by side (each 137 wide)
+    const std::string hdr = b + "bindingslb.header.";
+    ui_.hidden[hdr + "switch0"] = ui_.hidden[hdr + "switch1"] = true;
+    for (const char* k : {"sensitivity_command_text", "sensitivity_title", "sensitivity_ranger", "sensitivity_low", "sensitivity_high", "sensitivity_value"})
+        ui_.hidden[b + k] = !axis;
+    float sens = 0.5f;
+    if (const Binding* f = bs.first(sel)) sens = f->sens;
+    if (axis) {
+        ui_.text[b + "sensitivity_command_text"] = Bindings::info(sel).name;
+        ui_.text[b + "sensitivity_value"] = std::to_string(int(std::lround(sens * 100)));
     }
-    // mouse settings
-    TextStyle h;
-    h.font = "s017016d.ttf", h.size = 9, h.color = 0x4c8ef8ffu;
-    ui_.textBox("MOUSE SPEED", {110, y + 10, 200, 16}, h, h.color);
-    float v = (app_.settings.mouseSpeed - 0.25f) / 2.75f;
-    if (slider({330, y + 12, 180, 12}, v)) app_.settings.mouseSpeed = 0.25f + v * 2.75f;
-    ui_.textBox(app_.settings.invertMouse ? "INVERT MOUSE Y: ON" : "INVERT MOUSE Y: OFF", {110, y + 32, 300, 16}, h, h.color);
-    UiRect inv{110, y + 32, 200, 16};
-    if (ui_.mouseReleased() && inv.contains(ui_.mouseX(), ui_.mouseY())) app_.settings.invertMouse = !app_.settings.invertMouse, ui_.playSound("general.wav");
-    ui_.textBox(app_.settings.externalView ? "START IN CHASE VIEW: ON" : "START IN CHASE VIEW: OFF", {110, y + 50, 300, 16}, h, h.color);
-    UiRect ext{110, y + 50, 220, 16};
-    if (ui_.mouseReleased() && ext.contains(ui_.mouseX(), ui_.mouseY())) app_.settings.externalView = !app_.settings.externalView, ui_.playSound("general.wav");
-    ui_.window("low_accept_sound");
-    ui_.text["low_accept_sound.btn"] = "ACCEPT";
-    if (ui_.clicked("low_accept_sound.btn") || ui_.keyPressed(SDLK_ESCAPE)) {
+    ui_.window("bindings_config_window");
+    if (axis) {
+        UiRect sr = ui_.rectOf(b + "sensitivity_ranger");
+        if (sr.w < 20) sr = {288, 377, 200, 12};
+        sr.h = 12;
+        if (slider(sr, sens))
+            for (Binding& x : bs.list)
+                if (x.cmd == sel) x.sens = sens;
+    }
+    std::vector<std::string> names, keys;
+    for (Cmd c : cmds) {
+        names.push_back(Bindings::info(c).name);
+        keys.push_back(bindCapture_ && c == sel ? "PRESS A KEY" : bs.describe(c));
+    }
+    {
+        UiRect lr = ui_.rectOf(b + "bindingslb");
+        const LdlNode* h0 = ui_.ldl().find(hdr + "switch0");
+        TextStyle hs = ui_.style(h0);
+        float hx = lr.x + 5, hy = lr.y - 5 + 4;  // headeroffsetx / headeroffsety, inside the frame's top
+        ui_.textBox("COMMANDS", {hx, hy, 137, 17}, hs, hs.color);
+        ui_.textBox("KEYSTROKE", {hx + 137, hy, 137, 17}, hs, hs.color);
+    }
+    int c = ui_.listbox(b + "bindingslb", names, bindSel_, bindScroll_, "bindings_config_listbox_text", &keys, 137.f);
+    if (c >= 0) bindSel_ = c, bindCapture_ = false;
+    for (int i = 0; i < 4; i++)
+        if (ui_.clicked(b + cats[i])) bindCat_ = i, bindSel_ = 0, bindScroll_ = 0, bindCapture_ = false;
+    if (ui_.clicked(b + "bind_switch.bind")) bindCapture_ = !bindCapture_;
+    else if (ui_.clicked(b + "invert_mouse_y")) app_.settings.invertMouse = !app_.settings.invertMouse;
+    else if (axis && ui_.clicked(b + "invert_switch.invert")) {
+        for (Binding& x : bs.list)
+            if (x.cmd == sel) x.reverse = !reversed;
+    }
+    else if (ui_.clicked(b + "undo")) bs = bindSaved_, app_.settings.invertMouse = invertSaved_;
+    else if (ui_.clicked(b + "clear_conflict") && !conflictWith.empty()) {
+        std::vector<Binding> keep;
+        for (const Binding& o : bs.list) {
+            bool clash = false;
+            for (const Binding& x : bs.list)
+                if (x.cmd == sel && o.cmd != sel && o.kind == x.kind && o.code == x.code && o.link == x.link) clash = true;
+            if (!clash) keep.push_back(o);
+        }
+        bs.list = keep;
+    } else if (ui_.clicked(b + "clear_selected")) bs.clear(sel);
+    else if (ui_.clicked(b + "clear_all")) bs.list.clear();
+    else if (ui_.clicked(b + "reset_default")) bs.setDefaults();
+    else if (ui_.clicked(b + "accept")) {
+        bindEditing_ = bindCapture_ = false;
         app_.settings.save(app_.prefDir + "settings.cfg");
         go(Scr::Options);
+    } else if (ui_.clicked(b + "main_menu") || (!bindCapture_ && ui_.keyPressed(SDLK_ESCAPE))) {
+        bindEditing_ = bindCapture_ = false;
+        bs = bindSaved_, app_.settings.invertMouse = invertSaved_;
+        go(Scr::Options);
     }
+}
+
+bool Shell::captureBinding(const SDL_Event& ev) {
+    // the next key or mouse button becomes the selected command's binding (Esc cancels); Ctrl / Alt / Shift alone wait
+    // for the key they link
+    Binding nb;
+    if (ev.type == SDL_EVENT_KEY_DOWN) {
+        if (ev.key.repeat) return true;
+        SDL_Scancode sc = ev.key.scancode;
+        if (sc == SDL_SCANCODE_ESCAPE) return bindCapture_ = false, true;
+        if (sc == SDL_SCANCODE_LCTRL || sc == SDL_SCANCODE_RCTRL || sc == SDL_SCANCODE_LALT || sc == SDL_SCANCODE_RALT ||
+            sc == SDL_SCANCODE_LSHIFT)
+            return true;
+        nb.kind = Binding::Key, nb.code = int(sc);
+        nb.link = (ev.key.mod & SDL_KMOD_CTRL) ? 1 : (ev.key.mod & SDL_KMOD_ALT) ? 2 : (ev.key.mod & SDL_KMOD_LSHIFT) ? 3 : 0;
+    } else if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN && ev.button.button != SDL_BUTTON_LEFT) {
+        // the left button picks the screen's buttons; the others bind (1 right, 2 middle, 3 / 4 extra)
+        int bt = ev.button.button;
+        nb.kind = Binding::MouseButton, nb.code = bt == SDL_BUTTON_RIGHT ? 1 : bt == SDL_BUTTON_MIDDLE ? 2 : bt == SDL_BUTTON_X1 ? 3 : 4;
+    } else {
+        return false;
+    }
+    std::vector<Cmd> cmds;
+    for (int i = 0; i < int(Cmd::Count); i++)
+        if (Bindings::info(Cmd(i)).category == bindCat_) cmds.push_back(Cmd(i));
+    if (bindSel_ < 0 || bindSel_ >= int(cmds.size())) return bindCapture_ = false, true;
+    Bindings& bs = app_.settings.bindings;
+    Cmd sel = cmds[size_t(bindSel_)];
+    nb.cmd = sel;
+    if (const Binding* f = bs.first(sel)) nb.sens = f->sens;
+    // a key or button replaces the command's keys and buttons (a mouse axis stays)
+    std::vector<Binding> keep;
+    for (const Binding& o : bs.list)
+        if (o.cmd != sel || o.kind == Binding::MouseAxis) keep.push_back(o);
+    keep.push_back(nb);
+    bs.list = keep;
+    bindCapture_ = false;
+    ui_.playSound("general.wav");
+    return true;
 }
 
 void Shell::credits() {

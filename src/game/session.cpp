@@ -71,11 +71,6 @@ struct Camera {
     Vec3 forward() const { return {std::sin(yaw) * std::cos(pitch), std::sin(pitch), std::cos(yaw) * std::cos(pitch)}; }
 };
 
-// formation slots behind the user (x right, z behind)
-Vec3 formationSlot(size_t i) {
-    float row = float(i / 2 + 1);
-    return Vec3((i % 2 ? 1.f : -1.f) * 11.f * row, 0, 13.f * row);
-}
 }  // namespace
 
 bool writePngFile(const std::string& path, const std::vector<uint8_t>& rgba, int w, int h) { return writePNG_(path, rgba, w, h); }
@@ -128,7 +123,10 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
     Scene scene(fs, r);
     // shell choices go into the mission before anything is built
     std::vector<int> mates;            // squad mate objects
-    std::vector<Vec3> mateSlots;
+    // instant action (the sim's launch type 4 -> config +0x2a, FUN_100455b0): the enemies, which come back at the
+    // arena's spawn points until each has been destroyed `setup.waves` times (config +0x80, the shell's fire teams)
+    const bool instant = !setup.enemies.empty() && setup.waves > 0;
+    std::vector<int> iaUnits;
     int userTeam = 100;
     auto prepare = [&](Mission& m) {
         int user = -1;
@@ -142,8 +140,8 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
         if (setup.player.chassis >= 0 && masterGear(fs, setup.player.chassis, g)) m.objects[size_t(user)].defIndex = m.addDef(g.data(), g.size());
         const MissionObject base = m.objects[size_t(user)];
         userTeam = base.team;
-        float ly = float(base.rot[0]) * kDeg;
-        Vec3 right(-std::cos(ly), 0, std::sin(ly)), back(std::sin(ly), 0, std::cos(ly));
+        Vec3 ax0, ax2, at(float(base.pos[0]), float(base.pos[1]), float(base.pos[2]));
+        AiSystem::yawAxes(float(base.rot[0]) * kDeg, ax0, ax2);
         for (size_t i = 0; i < setup.squad.size(); i++) {
             MissionObject o;
             o.type = 0x48;
@@ -153,11 +151,25 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             o.defIndex = base.defIndex;
             Bytes mg;
             if (setup.squad[i].gear.chassis >= 0 && masterGear(fs, setup.squad[i].gear.chassis, mg)) o.defIndex = m.addDef(mg.data(), mg.size());
-            Vec3 slot = formationSlot(i), p = right * slot.x + back * slot.z;
-            o.pos[0] = base.pos[0] + p.x, o.pos[1] = base.pos[1], o.pos[2] = base.pos[2] + p.z;
+            // FUN_100cc8f0 (ForceUserSquadFormation, also run as the mission starts): member c of each group straight
+            // onto its formation slot; mates join groups A and B in turn
+            Vec3 p = AiSystem::formationPoint(int(i % 2), int(i / 2), at, ax0, ax2);
+            o.pos[0] = p.x, o.pos[1] = base.pos[1], o.pos[2] = p.z;
             m.objects.push_back(o);
             mates.push_back(int(m.objects.size()) - 1);
-            mateSlots.push_back(slot);
+        }
+        // instant-action enemies: on the team after the user's; placed at the spawn points once the world is built
+        for (size_t i = 0; instant && i < setup.enemies.size(); i++) {
+            Bytes g;
+            if (!masterGear(fs, setup.enemies[i].gear.chassis, g)) continue;
+            MissionObject o;
+            o.type = 0x48;
+            o.team = base.team + 1;
+            o.name = "enemy" + std::to_string(i + 1);
+            o.defIndex = m.addDef(g.data(), g.size());
+            for (int k = 0; k < 3; k++) o.pos[k] = base.pos[k], o.rot[k] = base.rot[k];
+            m.objects.push_back(o);
+            iaUnits.push_back(int(m.objects.size()) - 1);
         }
     };
     if (!scene.load(setup.mission, &err, prepare)) {
@@ -186,6 +198,16 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
         Combat* combat = nullptr;
         int player = -1;
         bool control = true;
+        std::vector<std::pair<std::string, int>> squadPilots;  // name, gear object (the campaign roster's squad list)
+        bool rosterOff = false;  // network play or instant action (+0x1b / +0x2a): FUN_100842e0 keeps no status
+        int pilotStatus(const std::string& name) override {
+            // FUN_100842e0: per squad pilot, the gear's alive flag (+8) false or going down (+0xc10) -> -1, ejected
+            // (+0xc11) -> 1, else 0; FUN_10084170 then finds the pilot by (lower-case) name
+            if (rosterOff || !combat) return 0;
+            for (auto& [n, obj] : squadPilots)
+                if (lower(n) == lower(name)) return combat->ejected(obj) ? 1 : !combat->alive(obj) ? -1 : 0;
+            return 0;
+        }
         bool isAlive(int unit) override {
             if (unit < 0 || (scene && scene->objectHidden(unit))) return false;
             return !combat || combat->alive(unit);
@@ -352,7 +374,7 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
         Particles* particles = nullptr;
         void weather(int type, int level) override {  // SetWeatherType / SetWeather
             if (getenv("HG2_DEBUG")) SDL_Log("weather type %d level %d", type, level);
-            if (!particles) return;
+            if (!particles || getenv("HG2_WEATHER")) return;  // the test weather holds
             if (type >= 0) particles->setWeatherType(type);
             if (level >= 0) particles->setWeatherLevel(level);
         }
@@ -374,8 +396,20 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
     scripts.load(scene.mission(), &err);
     Player player;
     bool chase = player.init(fs, scene) && !camSet;
+    scene.setPlayerObject(player.object());
     player.pilot = true;
-    float camPitch = 0.25f, camOrbit = 0;
+    // external camera (FUN_1007c580, the view object's +0x38): orbit +0x20, pitch +0x28 (0 level .. -30 / +80 deg),
+    // zoom +0x30 in bounding radii (2 .. 8); all start at 0 / 0 / 2. The death camera (FUN_10092ff0 case 8) saves the
+    // pitch and zoom and takes 45 deg at 20 radii.
+    float camPitch = 0.f, camOrbit = 0;
+    float camZoom = 2.f, savedPitch = 0, savedZoom = 2.f;
+    bool deathCam = false;
+    const float kPitchMin = -0.5235987f, kPitchMax = 1.3962632f, kCamStep = 0.043633225f;  // -30, 80, 2.5 deg
+    // the targeting reticle (FUN_10117fb0, fire-control +0x23c / +0x240): -1 .. 1 on each axis, 30 deg right and
+    // 20 deg up at full deflection from the torso's facing; the mouse moves it (Target ReticleX / Y), Center Torso
+    // centres it. The gear's torso does not follow it: for the user's gear the torso joint only holds the sidestep's
+    // opposite angle (FUN_1003c270), and the cameras do not move with it.
+    float reticleX = 0.f, reticleY = 0.f;
     if (player.active() && T.startX >= 0) {
         player.teleport(Vec3(T.startX, 0, T.startZ));
         player.setYaw(T.startYaw * kDeg);
@@ -390,11 +424,30 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
         combat.setSystems(player.object(), setup.player.sensors, setup.player.maneuver, setup.player.perks, setup.player.flaws);
     AiSystem ai;
     if (player.active()) ai.init(fs, scene, combat, player);
-    combat.setSpace(setup.space);
-    if (setup.space) player.gravityScale = 0.35f, ai.setGravity(0.35f);
+    // the space world (DAT_1026667c + 0x14d): FUN_1008dba0 creates the world with FUN_100a3ff0(1) when the first
+    // object header (0x3a / 0x3b) comes before any terrain, i.e. a mission without terrain; instant action and
+    // missions started without the shell get it the same way (the briefing's space flag says the same)
+    const bool space = setup.space || scene.mission().terrain.empty();
+    combat.setSpace(space);
+    if (space) player.space = true, ai.setSpace(true);
+    if (getenv("HG2_NOZEROG") && player.active()) combat.testClearFlaws(player.object(), 1u << 14);  // test: vacuum damage
+    if (space && player.active() && getenv("HG2_DEBUG"))
+        SDL_Log("space: the user's gear %s Zero-G Movement (flaw word bit 14)", combat.zeroG(player.object()) ? "has" : "lacks");
     world.ai = &ai;
+    // FUN_100d1e20 (the user squad's add-member, vtable 0x10148650 +0x14 over the base FUN_100cce30): gears added
+    // to the user's squad get the 0.8 ejection chance (+0xd88); everything else keeps -1. The user's own gear is the
+    // squad's leader (+0x470, stored by the base constructor FUN_100cbcd0 without an add), so it is never in a slot
+    // and its pilot never ejects in single player.
+    // the user's squad (FUN_100d2cd0 -> FUN_100d1930 for the user): its team's automatic sensor switching (+0x235)
+    // goes off (FUN_100b88f0(0), the only caller of that setter; no script command reaches it)
+    if (player.active()) ai.setAutoSensors(userTeam - 99, false);
+    // AddToUserSquad (FUN_100d1e20 -> FUN_100cce30) puts each new member in the first empty slot scanning A0, B0, A1,
+    // B1, ... (group A +0x4a4, group B +0xad4, 0x140 apart; the slot goes to brain +0x1c0, B as 4 + index), and in
+    // single player nothing takes a member out (FUN_100cd040 is only called by the network code): member i is in
+    // group i mod 2 at index i / 2, in the order they join - the launch record's squad order
     for (size_t i = 0; i < mates.size(); i++) {
-        ai.follow(mates[i], player.object(), mateSlots[i]);
+        combat.setEjectChance(mates[i], 0.8f);
+        ai.follow(mates[i], player.object(), int(i % 2), int(i / 2));
         if (!setup.squad[i].gear.weapons.empty()) combat.setLoadout(mates[i], setup.squad[i].gear.weapons);
         if (setup.squad[i].gear.armor > 0) combat.setStats(mates[i], setup.squad[i].gear.armor, setup.squad[i].gear.fireControl);
         const GearChoice& g = setup.squad[i].gear;
@@ -409,74 +462,242 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
     }
     world.combat = &combat;
     world.player = player.object();
+    world.rosterOff = instant || setup.net;
+    for (size_t i = 0; i < mates.size() && i < setup.squad.size(); i++) world.squadPilots.push_back({setup.squad[i].name, mates[i]});
     world.pl = &player;
     FountainSystem fountains;
     fountains.init(scene.mission());
     world.fountains = &fountains;
-    // reinforcements from the mission's unit generators
-    auto spawnUnit = [&](const FountainTemplate& t, const Fountain& f, int n) -> int {
-        MissionObject o;
-        o.type = t.type, o.defIndex = t.defIndex, o.team = f.team;
-        float ang = float(n) * 2.1f, rr = n ? 12.f : 0.f;
-        o.pos[0] = f.pos[0] + std::cos(ang) * rr, o.pos[2] = f.pos[2] + std::sin(ang) * rr;
-        o.pos[1] = scene.groundHeight(float(o.pos[0]), float(o.pos[2]));
-        o.rot[0] = f.rot[0] * 180.0 / kPi;
-        o.name = "fount" + std::to_string(scene.mission().objects.size());
-        o.script = t.script.empty() ? f.script : t.script;
-        int idx = scene.addObject(o);
-        combat.grow(scene.mission().objects.size());
-        world.unitNames.push_back(o.name), world.unitTeams.push_back(o.team);
-        ai.addUnit(idx);
-        if (!o.script.empty()) scripts.attachScript(o.script, idx);
+    // reinforcements from the mission's unit generators: a pool unit comes in at the generator, offset by its bounding
+    // radius in a random direction (FUN_1005c4e0), with its template's script restarted or the generator's
+    auto placeAt = [&](int idx, const Vec3& p, float yaw) {
+        MissionObject& mo = scene.missionRW().objects[size_t(idx)];
+        mo.pos[0] = p.x, mo.pos[1] = scene.groundHeight(p.x, p.z), mo.pos[2] = p.z, mo.rot[0] = yaw / kDeg;
+    };
+    FountainSystem::Host fhost;
+    fhost.spawn = [&](int tpl, const Fountain& f, int reuse) -> int {
+        const FountainTemplate& t = scene.mission().fountainTemplates[size_t(tpl)];
+        Vec3 at(f.pos[0], f.pos[1], f.pos[2]);
+        float yaw = f.rot[0];  // radians in the block
+        std::string script = t.script.empty() ? f.script : t.script;
+        int idx = reuse;
+        if (idx < 0) {
+            MissionObject o;
+            o.type = t.type, o.defIndex = t.defIndex, o.team = f.team;
+            o.pos[0] = at.x, o.pos[1] = at.y, o.pos[2] = at.z;
+            o.rot[0] = yaw / kDeg;
+            o.name = "fount" + std::to_string(scene.mission().objects.size());
+            idx = scene.addObject(o);
+            combat.grow(scene.mission().objects.size());
+            world.unitNames.push_back(o.name), world.unitTeams.push_back(o.team);
+            Vec3 p = at + FountainSystem::spawnOffset(scene.objectRadius(idx));
+            placeAt(idx, p, yaw);
+            ai.addUnit(idx);
+        } else {
+            scripts.detachScripts(idx);
+            Vec3 p = at + FountainSystem::spawnOffset(scene.objectRadius(idx));
+            placeAt(idx, p, yaw);
+            scene.showObject(idx), scene.clearDamage(idx);
+            ai.respawn(idx);
+        }
+        ai.teleport(idx, Vec3(scene.mission().objects[size_t(idx)].pos[0], 0, scene.mission().objects[size_t(idx)].pos[2]));
+        if (!script.empty()) scripts.attachScript(script, idx);
+        if (getenv("HG2_FOUNTDBG")) SDL_Log("fountain: unit %d (template %d) at %.0f,%.0f", idx, tpl, at.x, at.z);
         return idx;
     };
-    auto unitAlive = [&](int o) { return combat.alive(o) && !scene.objectHidden(o); };
-    // instant action: waves of hunters
-    std::mt19937 rng{uint32_t(SDL_GetTicks())};
-    int wave = 0;
-    std::vector<int> waveUnits;
-    float waveTimer = setup.waves > 0 ? 3.f : 0.f;
+    fhost.recycle = [&](int o) {
+        if (getenv("HG2_FOUNTDBG")) SDL_Log("fountain: unit %d recycled", o);
+        scene.hideObject(o), ai.sleep(o, true);
+    };
+    fhost.alive = [&](int o) { return combat.alive(o) && !scene.objectHidden(o); };
+    fhost.position = [&](int o, Vec3& p) { return ai.position(o, p) || scene.objectPosition(o, p); };
+    fhost.inCombat = [&](int o) { return ai.mode(o) == 1; };
+    fhost.findNode = [&](const Vec3& p, int& graph, int& node) { return scene.graphNodeAt(p, graph, node); };
+    fhost.takeNode = [&](int graph, int node) {
+        if (auto* g = const_cast<Scene::GenGraph*>(scene.walkGraph(graph)))
+            if (node >= 0 && size_t(node) < g->taken.size()) g->taken[size_t(node)] = true;
+    };
+    fhost.onGraph = [&](int o, int graph, int node) {
+        // FUN_1005c110: with links, ORDER_MOVETONODE (3, flags 0x200, 4.0) to the node's first link, brain +0x1b2 set
+        const Scene::GenGraph* g = scene.walkGraph(graph);
+        ai.setGraph(o, graph, node);
+        if (!g || node < 0 || size_t(node) >= g->links.size() || g->links[size_t(node)].empty()) return;
+        int to = g->links[size_t(node)][0];
+        if (to < 0 || size_t(to) >= g->nodes.size()) return;
+        ai.moveToNode(o, g->nodes[size_t(to)], to);
+        if (getenv("HG2_FOUNTDBG")) SDL_Log("fountain: unit %d to graph %d node %d at %.0f,%.0f,%.0f", o, graph, to, g->nodes[size_t(to)].x,
+                                            g->nodes[size_t(to)].y, g->nodes[size_t(to)].z);
+    };
+    Mat4 viewProj;
+    bool haveView = false;
+    fhost.inView = [&](const Vec3& p, float r) {
+        if (!haveView) return false;
+        const Mat4& vp = viewProj;
+        float x = p.x * vp.m[0][0] + p.y * vp.m[1][0] + p.z * vp.m[2][0] + vp.m[3][0];
+        float y = p.x * vp.m[0][1] + p.y * vp.m[1][1] + p.z * vp.m[2][1] + vp.m[3][1];
+        float w = p.x * vp.m[0][3] + p.y * vp.m[1][3] + p.z * vp.m[2][3] + vp.m[3][3];
+        float k = 2.f * r;
+        return w > -r && std::fabs(x) <= w + k && std::fabs(y) <= w + k;
+    };
+    auto fountainStep = [&](float dt) {
+        Vec3 back(0, 0, 1);
+        if (!scene.objectAxis(player.object(), 2, back)) {
+            Vec3 a0;
+            AiSystem::yawAxes(player.yaw(), a0, back);
+        }
+        std::vector<Vec3> squad;
+        for (int mo : mates) {
+            Vec3 q;
+            if (combat.alive(mo) && ai.position(mo, q)) squad.push_back(q);
+        }
+        fountains.update(dt, player.position(), back, squad, fhost);
+    };
     std::string banner;
     float bannerUntil = 0;
-    auto spawnWave = [&]() {
-        waveUnits.clear();
-        Mission& m = scene.missionRW();
-        Vec3 c = player.position();
-        float base = std::uniform_real_distribution<float>(0, 2 * kPi)(rng);
-        for (size_t i = 0; i < setup.enemies.size(); i++) {
-            MissionObject o;
-            o.type = 0x48;
-            o.team = userTeam + 1;
-            o.name = "enemy" + std::to_string(wave) + "_" + std::to_string(i + 1);
-            Bytes g;
-            if (!masterGear(fs, setup.enemies[i].gear.chassis, g)) continue;
-            o.defIndex = m.addDef(g.data(), g.size());
-            // a group 250-400 m away; closer if that would be off the map
-            float ang = base + float(i) * 0.12f, dist = 380.f;
-            Vec3 p;
-            for (int tries = 0; tries < 24; tries++, dist *= tries % 4 == 3 ? 0.8f : 1.f, ang += 0.4f) {
-                p = c + Vec3(std::sin(ang), 0, std::cos(ang)) * dist + Vec3(float(i % 3) * 14.f, 0, float(i / 3) * 14.f);
-                const Surface* sf = scene.surfaceAt(p.x, p.z);
-                if (p.x > 64 && p.z > 64 && p.x < 4032 && p.z < 4032 && !(sf && sf->damage > 0)) break;  // not into lava
+    // instant action (FUN_10092230 for the start, FUN_10094fd0 every frame): the user goes to a random clear team-1
+    // spawn point, the enemies to team-2 points (the spawn point's team is the unit's team - 99), each avoiding the
+    // point the one before took (FUN_10093d10); they get a fresh brain hunting the user (FUN_100bbf40: HuntUser, no
+    // dozing). A destroyed enemy comes back 2 to 3 s later (time() + 2, whole seconds) at another point of its team
+    // until it has been destroyed `waves` times; all of them out: success; the user destroyed: failure (both after
+    // 4 s). The list (world +0x2884) holds only the enemy fire team (FUN_10084970: launch record +0xb20 pilots, the
+    // first at +0xb38, then +0xd70 + k x 0x238, team 2); the user's squad (record +0, +0x250 + k x 0x238) joins the
+    // user's squad and is not on it, so mates that go down stay down.
+    struct SpawnPt { int object; int team; };
+    std::vector<SpawnPt> spawnPts;  // the world's spawn list (+0x2860), mission order
+    for (size_t i = 0; i < scene.mission().objects.size(); i++) {
+        int t = scene.mission().objects[i].type;
+        if (t >= 0x56 && t <= 0x59) spawnPts.push_back({int(i), t - 0x55});
+    }
+    // FUN_100938b0: the n-th (1-based) point of a team, clear when no unit is inside 3 x its bounding radius
+    auto spawnClear = [&](int team, int nth, int& obj) -> bool {
+        obj = -1;
+        for (auto& sp : spawnPts)
+            if ((team == 0 || sp.team == team) && --nth == 0) {
+                obj = sp.object;
+                break;
             }
-            o.pos[0] = p.x, o.pos[2] = p.z, o.pos[1] = scene.groundHeight(p.x, p.z);
-            Vec3 d = c - p;
-            o.rot[0] = std::atan2(-d.x, -d.z) / kDeg;
-            int idx = scene.addObject(o);
-            combat.grow(m.objects.size());
-            world.unitNames.push_back(o.name), world.unitTeams.push_back(o.team);
-            if (!ai.addUnit(idx)) continue;
-            if (!setup.enemies[i].gear.weapons.empty()) combat.setLoadout(idx, setup.enemies[i].gear.weapons);
-            if (setup.enemies[i].gear.armor > 0) combat.setStats(idx, setup.enemies[i].gear.armor, setup.enemies[i].gear.fireControl);
-            const GearChoice& eg = setup.enemies[i].gear;
-            if (eg.hasSystems) combat.setSystems(idx, eg.sensors, eg.maneuver, eg.perks, eg.flaws);
-            ai.command(idx, "nonCombatTactic", 0, 0, 0, "hunt");
-            ai.setAutoSleep(idx, false);  // the waves come at the user from out of view
-            waveUnits.push_back(idx);
+        if (obj < 0) return false;
+        Vec3 c;
+        scene.objectPosition(obj, c);
+        float r = scene.objectRadius(obj), h = 3.f * (r > 0 ? r : 2.f);
+        auto inside = [&](const Vec3& q) { return std::fabs(q.x - c.x) < h && std::fabs(q.z - c.z) < h && std::fabs(q.y - c.y) < h; };
+        if (player.active() && inside(player.position())) return false;
+        bool hit = false;
+        ai.forEach([&](int o, int, const Vec3& q, bool alive) { (void)o; if (alive && inside(q)) hit = true; });
+        return !hit;
+    };
+    // FUN_10093d10: a random point of the team (not `avoid` when there are others), else the next clear one round
+    auto pickSpawn = [&](int team, int avoid, int& obj) -> int {
+        int n = 0;
+        for (auto& sp : spawnPts) n += team == 0 || sp.team == team;
+        obj = -1;
+        if (n == 0) return 0;
+        int k = int(double(rand()) / (double(RAND_MAX) + 1.0) * n) + 1;
+        if (k == avoid && n > 1 && ++k > n) k = 1;
+        if (spawnClear(team, k, obj)) return k;
+        for (int j = k;;) {
+            if (++j == avoid) ++j;
+            if (j > n) j = 1;
+            if (j == k) break;
+            if (spawnClear(team, j, obj)) return j;
         }
-        ai.setDefcon(userTeam + 1 - 99, 5, 0);
-        wave++;
-        banner = "WAVE " + std::to_string(wave) + " OF " + std::to_string(setup.waves), bannerUntil = scripts.time() + 4.f;
+        obj = -1;
+        return 0;
+    };
+    struct IaState { int deaths = 0, lastSpawn = 0xffff; bool wasAlive = true; double respawnAt = -1; };
+    // FUN_10094fd0 times the comeback on the C library's time() - whole seconds: the first frame it sees the unit
+    // destroyed sets +0x1a0 = time() + 2 (fild / fsubs -2.0, exact), and the unit returns on the first frame
+    // time() > +0x1a0, i.e. 2 to 3 s later depending on where in the second it fell. The port keeps that clock
+    // as whole seconds of the session time, offset by the wall clock's fraction of a second at the start.
+    double iaPhase = 0;
+    {
+        SDL_Time now = 0;
+        if (SDL_GetCurrentTime(&now)) iaPhase = double(now % 1000000000) * 1e-9;
+    }
+    auto iaClock = [&]() { return std::floor(double(scripts.time()) + iaPhase); };
+    std::vector<IaState> ia(iaUnits.size());
+    auto iaReset = [&](size_t i) {  // FUN_100bbf40 plus the shell's gear choices
+        int idx = iaUnits[i];
+        const GearChoice& eg = setup.enemies[i].gear;
+        if (!eg.weapons.empty()) combat.setLoadout(idx, eg.weapons);
+        if (eg.armor > 0) combat.setStats(idx, eg.armor, eg.fireControl);
+        if (eg.hasSystems) combat.setSystems(idx, eg.sensors, eg.maneuver, eg.perks, eg.flaws);
+        ai.command(idx, "nonCombatTactic", 0, 0, 0, "HuntUser");
+        ai.setAutoSleep(idx, false);
+    };
+    auto iaPlace = [&](size_t i) -> bool {
+        int idx = iaUnits[i], obj = -1;
+        int k = pickSpawn(scene.mission().objects[size_t(idx)].team - 99, ia[i].lastSpawn, obj);
+        ia[i].lastSpawn = k;
+        if (!k || obj < 0) return false;
+        Vec3 p;
+        scene.objectPosition(obj, p);
+        placeAt(idx, p, float(scene.mission().objects[size_t(obj)].rot[0]) * kDeg);
+        return true;
+    };
+    if (instant) {
+        int obj = -1;
+        if (player.active() && pickSpawn(userTeam - 99, 0xffff, obj) && obj >= 0) {
+            Vec3 p;
+            scene.objectPosition(obj, p);
+            float yaw = float(scene.mission().objects[size_t(obj)].rot[0]) * kDeg;
+            player.teleport(Vec3(p.x, 0, p.z)), player.setYaw(yaw);
+            Vec3 a0, a2;
+            AiSystem::yawAxes(yaw, a0, a2);
+            for (size_t i = 0; i < mates.size(); i++) {  // the squad formed round the user (FUN_100cc8f0)
+                Vec3 q = AiSystem::formationPoint(int(i % 2), int(i / 2), player.position(), a0, a2);
+                ai.teleport(mates[i], q), ai.face(mates[i], q - a2 * 10.f);
+            }
+        }
+        int prev = 0xffff;
+        for (size_t i = 0; i < iaUnits.size(); i++) {
+            ia[i].lastSpawn = prev;
+            if (iaPlace(i)) {
+                const MissionObject& mo = scene.mission().objects[size_t(iaUnits[i])];
+                Vec3 q(float(mo.pos[0]), 0, float(mo.pos[2])), a0, a2;
+                AiSystem::yawAxes(float(mo.rot[0]) * kDeg, a0, a2);
+                ai.teleport(iaUnits[i], q), ai.face(iaUnits[i], q - a2 * 10.f);
+            }
+            prev = ia[i].lastSpawn;
+            iaReset(i);
+        }
+        SDL_Log("instant action: %zu enemies, %d lives each, %zu spawn points", iaUnits.size(), setup.waves, spawnPts.size());
+    }
+    auto iaStep = [&]() {
+        if (!instant || world.endCode >= 0) return;
+        if (player.active() && !combat.alive(player.object())) {
+            world.missionOver(0, 4.f);
+            return;
+        }
+        bool done = true;
+        for (size_t i = 0; i < iaUnits.size(); i++) {
+            int idx = iaUnits[i];
+            bool alive = combat.alive(idx);
+            if (!alive && ia[i].wasAlive) ia[i].deaths++;  // FUN_100f95d0: +0x199
+            ia[i].wasAlive = alive;
+            if (alive) {
+                done = false;
+                continue;
+            }
+            if (ia[i].deaths >= setup.waves) continue;
+            done = false;
+            if (ia[i].respawnAt < 0) {
+                ia[i].respawnAt = iaClock() + 2.0;
+            } else if (iaClock() > ia[i].respawnAt) {
+                ia[i].respawnAt = -1;
+                iaPlace(i);  // no clear point: it comes back where it fell
+                scene.clearDamage(idx);
+                ai.respawn(idx);
+                const MissionObject& mo = scene.mission().objects[size_t(idx)];
+                Vec3 q(float(mo.pos[0]), 0, float(mo.pos[2])), a0, a2;
+                AiSystem::yawAxes(float(mo.rot[0]) * kDeg, a0, a2);
+                ai.teleport(idx, q), ai.face(idx, q - a2 * 10.f);
+                iaReset(i);
+                ia[i].wasAlive = true;
+                if (getenv("HG2_DEBUG")) SDL_Log("instant action: enemy %d back (%d/%d) at spawn %d", idx, ia[i].deaths, setup.waves, ia[i].lastSpawn);
+            }
+        }
+        if (done) world.missionOver(1, 4.f);
     };
     // ambient sound objects: buildings / props whose definition names a looping sound (Sounds.lst EAR_PERF_LOOP).
     // Every object plays its own instance (FUN_1012f608 makes one EAR event per object), at EAR's level for its
@@ -569,6 +790,8 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
     // engine events from combat: hits (11, 12 while the user shoots), damaged (2), destroyed (5)
     std::map<int, float> lastHitEvent;
     auto drainCombatEvents = [&]() {
+        for (auto& n : combat.nearShots) ai.nearMiss(n.victim, n.shooter);
+        combat.nearShots.clear();
         for (auto& h : combat.hits) {
             ai.hitBy(h.victim, h.shooter);
             if (h.level >= 2) {  // flinch (light hits only now and then)
@@ -588,7 +811,7 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             scripts.unitSignal(obj, EV_DESTROYED);
             for (size_t i = 0; i < mates.size(); i++)
                 if (mates[i] == obj) {
-                    if (combat.ejection(obj)) {  // Ejection System: the pilot gets out and lives to fight again
+                    if (combat.ejected(obj)) {  // FUN_10062980: the pilot got out (squad slots: 0.8 chance)
                         banner = setup.squad[i].name + " EJECTED", bannerUntil = scripts.time() + 3.f;
                     } else {
                         res.squadLost.push_back(setup.squad[i].name);
@@ -597,37 +820,57 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
                 }
         }
         combat.destroyed.clear();
+        combat.ejectedList.clear();
     };
     world.externalView = &external;
     if (audio) {
         player.audio = audio, player.engineLoop = true;
         ai.setAudio(audio);
     }
-    float camDist = 16.f;
-    // player-attached camera: cockpit (internal) or chase (external)
+    // player-attached camera: cockpit (internal) or external
     auto viewCamera = [&](Vec3& eye, Vec3& at) {
         if (external) {
-            player.chaseCamera(eye, at, camPitch, camOrbit, camDist);
-            // keep the chase camera out of walls and hills: pull it in front of the first obstacle
-            float t1 = 2.f, t2 = scene.terrainRay(at, eye);
-            scene.raycast(at, eye, player.object(), t1);
-            float t = std::min(t1, t2);
-            if (t < 1.f) eye = at + (eye - at) * std::max(0.08f, t - 0.06f);
+            player.chaseCamera(eye, at, camPitch, camOrbit, camZoom);
+            // FUN_1007c070: 16 samples from the sphere centre to the eye, each wanting the ground below it by a
+            // clearance growing 0.1375 x the view's near half-height (taken as 0.75) a sample; the eye is raised by the
+            // worst shortfall, looks back at the centre, and the pitch becomes the new tilt (it stays raised)
+            Vec3 step = (eye - at) * 0.0625f;
+            float worst = 0, clear = 0;
+            Vec3 p = at;
+            for (int i = 0; i < 16; i++, p = p + step, clear += 0.75f * 0.1375f) {
+                float m = p.y - scene.groundHeight(p.x, p.z) - clear;
+                if (m < worst) worst = m;
+            }
+            if (worst < 0) {
+                eye.y -= worst;
+                Vec3 d = eye - at;
+                float len = length(d);
+                if (len > 1e-3f) camPitch = std::acos(std::min(1.f, std::sqrt(d.x * d.x + d.z * d.z) / len));
+            }
         } else {
-            player.cockpitCamera(eye, at, camPitch - 0.25f, camOrbit);
+            // the cockpit view is the model's pov frame (FUN_10083d30 attaches the internal camera to "POV" / "pov"),
+            // which turns with the torso; the cockpit camera takes no keys (its key slot is a no-op)
+            player.cockpitCamera(eye, at, 0.f, player.twist - player.legAngle());
             Vec3 pov;  // the model's pilot eye frame follows posture and walk bob
             if (scene.frameWorld(player.object(), "pov", pov)) at += pov - eye, eye = pov;
         }
     };
     auto aimPoint = [&](Vec3& muzzle, Vec3& aim) {
+        // the reticle's direction (FUN_10117fb0: yaw = 30 x reticle X, pitch = 20 x reticle Y degrees, stored on the
+        // weapon at +0x1e8 / +0x1ec) from the pilot's eye (the model's pov frame), whatever the view
         Vec3 eye, at;
-        viewCamera(eye, at);
-        Vec3 d = normalize(at - eye);
+        float facing = player.yaw() + player.twist - player.legAngle();
+        player.cockpitCamera(eye, at, 0.f, player.twist - player.legAngle());
+        Vec3 pov;
+        if (scene.frameWorld(player.object(), "pov", pov)) eye = pov;
+        float yaw = facing - std::clamp(reticleX, -1.f, 1.f) * 30.f * kDeg, pitch = std::clamp(reticleY, -1.f, 1.f) * 20.f * kDeg;
+        Vec3 dir(-std::sin(yaw) * std::cos(pitch), std::sin(pitch), -std::cos(yaw) * std::cos(pitch));
         if (!combat.muzzle(player.object(), muzzle))
             muzzle = player.position() + Vec3(0, 5.f, 0) + Vec3(-std::sin(player.yaw()), 0, -std::cos(player.yaw())) * 2.f;
-        // aim along the camera's heading; mouse pitch above/below the default tilts the shot
-        Vec3 h = normalize(Vec3(d.x, 0, d.z));
-        aim = muzzle + h * 300.f - Vec3(0, (camPitch - 0.25f) * 300.f, 0);
+        // shots converge where the reticle's line meets the ground, else 300 m out (the port's convergence range)
+        const float reach = 300.f;
+        float f = scene.terrainRay(eye, eye + dir * reach);
+        aim = eye + dir * (reach * std::clamp(f, 0.05f, 1.f));
     };
     if (!camSet) {
         cam.pos = scene.startPosition() + Vec3(0, 12, 0);
@@ -669,22 +912,43 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
         float s = std::max(1.f, float(H) / 720.f);
         w = 320 * s, h = 40 * s, x = W * 0.5f - w * 0.5f, y = H * 0.42f + float(i) * 52 * s;
     };
-    // the user's target: the hostile unit nearest the crosshair (within 10 degrees and 800 m, in sight); squad
-    // commands (Attack / Defend My Target) use it, the HUD brackets it
-    int userTarget = -1;
-    auto pickTarget = [&]() {
-        userTarget = -1;
+    // the user's target (fire-control +0x1d0): kept until changed by the targeting keys (FUN_10114210): Target At
+    // Reticle (the hostile under the reticle; here the nearest within 10 degrees of its line, 800 m, in sight), Target
+    // Cycle / Previous Target (through the detected hostiles), Nearest Enemy, Target Friendly. Squad commands (Attack
+    // / Defend My Target) use it, the HUD brackets it. It is dropped while the radar is jammed and when the unit is
+    // destroyed or no longer detected.
+    int userTarget = -1, targetIdx = -1;
+    auto targetable = [&](int i, bool friendly) {
+        const auto& objs = scene.mission().objects;
+        if (i == player.object() || i < 0 || size_t(i) >= objs.size()) return false;
+        const auto& o = objs[size_t(i)];
+        int ptm = objs[size_t(player.object())].team;
+        if (!isUnitObjectType(o.type) || !combat.alive(i) || scene.objectHidden(i) || o.team < 100) return false;
+        if (friendly) return o.team == ptm;
+        // only contacts on the user's radar (the targeting FUN_10114210 cycles the radar's contact lists)
+        return o.team != ptm && combat.detectedBy(i, ptm);
+    };
+    auto contacts = [&](bool friendly) {
+        std::vector<std::pair<float, int>> l;
+        const auto& objs = scene.mission().objects;
+        for (size_t i = 0; i < objs.size(); i++) {
+            Vec3 p;
+            if (!targetable(int(i), friendly) || !scene.objectPosition(int(i), p)) continue;
+            l.push_back({length(p - player.position()), int(i)});
+        }
+        std::sort(l.begin(), l.end());
+        return l;
+    };
+    auto pickTarget = [&]() {  // Target At Reticle
         if (!player.active() || !combat.alive(player.object())) return;
+        if (combat.radarJammed(player.object())) return;
         Vec3 mz, aim;
         aimPoint(mz, aim);
         Vec3 eye = player.position() + Vec3(0, 5, 0), dir = normalize(aim - eye);
-        int ptm = scene.mission().objects[size_t(player.object())].team;
         float best = std::cos(10.f * kDeg);
         const auto& objs = scene.mission().objects;
         for (size_t i = 0; i < objs.size(); i++) {
-            const auto& o = objs[i];
-            if (int(i) == player.object() || !isUnitObjectType(o.type) || o.team == ptm || o.team < 100 || !combat.alive(int(i)) || scene.objectHidden(int(i)))
-                continue;
+            if (!targetable(int(i), false)) continue;
             Vec3 p;
             if (!scene.objectPosition(int(i), p)) continue;
             p.y += 3.f;
@@ -695,8 +959,24 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             if (c > best && scene.terrainRay(eye, p) > 0.98f) best = c, userTarget = int(i);
         }
     };
-    // squad commands: F5 attack my target, F6 defend my target, F7 hold ground, F8 regroup, F9 fire at will,
-    // F10 go to the nav point
+    auto cycleTarget = [&](int step, bool friendly) {  // Target Cycle (+1) / Previous Target (-1); 0: the first (nearest)
+        if (!player.active() || combat.radarJammed(player.object())) return;
+        auto l = contacts(friendly);
+        if (l.empty()) return;
+        int n = int(l.size());
+        if (step == 0) targetIdx = 0;
+        else if (targetIdx < 0) targetIdx = step > 0 ? 0 : n - 1;
+        else targetIdx = ((targetIdx + step) % n + n) % n;
+        userTarget = l[size_t(targetIdx)].second;
+    };
+    auto validateTarget = [&]() {
+        if (userTarget < 0) return;
+        bool friendly = scene.mission().objects[size_t(userTarget)].team == scene.mission().objects[size_t(player.object())].team;
+        if (!player.active() || !combat.alive(player.object()) || combat.radarJammed(player.object()) || !targetable(userTarget, friendly))
+            userTarget = -1, targetIdx = -1;
+    };
+    // squad commands (Defaults.dft: Ctrl+T attack my target, Ctrl+D defend my target, Ctrl+S hold ground, Ctrl+R
+    // regroup, Ctrl+A fire at will, Ctrl+G go to the selected nav point)
     auto issueOrder = [&](int k) {
         if (getenv("HG2_TACDBG")) SDL_Log("issueOrder %d squad %d", k, ai.squadSize(player.object()));
         if (ai.squadSize(player.object()) <= 0 || k < 0 || k > 5) return;
@@ -704,8 +984,6 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             banner = "COMMS DOWN", bannerUntil = scripts.time() + 1.5f;
             return;
         }
-        // squad commands: F5 attack my target, F6 defend my target, F7 hold ground, F8 regroup,
-        // F9 fire at will, F10 go to the nav point
         static const char* names[] = {"ATTACK MY TARGET", "DEFEND MY TARGET", "HOLD GROUND", "REGROUP", "FIRE AT WILL", "GO TO NAV POINT"};
         int order = k == 0 ? AiSystem::OrderAttack : k == 1 ? AiSystem::OrderDefend : k == 2 ? AiSystem::OrderHold
                   : k == 3 ? AiSystem::OrderRegroup : k == 4 ? AiSystem::OrderFireAtWill : AiSystem::OrderGoto;
@@ -861,25 +1139,37 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             snprintf(buf, sizeof buf, "%3.0f km/h  %-5s  %s", std::fabs(player.speed()) * 3.6f, posture[player.postureCode() & 3],
                      external ? "EXT" : "INT");
             hud.text(px, py + 48 * s, buf, green, s);
-            // radar: 300 m
+            // radar (FUN_101117f0 / FUN_10111c50): the contacts the user's team has detected within the radar's
+            // 300 m (+0x730); static when jammed, nothing once the radar is knocked out
             float R = 70 * s, rx = W - R - 16 * s, ry = R + 16 * s;
-            float range = 300.f * std::max(0.5f, 1.f + 0.1f * float(combat.sensorRating(player.object())));  // sensors rating
-            if (combat.uplink(player.object())) range *= 1.6f;  // Satellite Uplink
-            bool sensors = combat.sensorsOk(player.object());
+            const float range = 300.f;
+            bool sensors = combat.sensorsOk(player.object()), jam = combat.radarJammed(player.object());
             hud.rect(rx - R, ry - R, 2 * R, 2 * R, dim);
-            hud.frame(rx - R, ry - R, 2 * R, 2 * R, green, s);
+            bool blink = combat.sensorsDamaged(player.object()) && std::fmod(missionClock, 1.f) < 0.5f;
+            hud.frame(rx - R, ry - R, 2 * R, 2 * R, blink ? red : green, s);
             hud.rect(rx - 2 * s, ry - 2 * s, 4 * s, 4 * s, green);
             int ptm = scene.mission().objects[size_t(player.object())].team;
             float yw = player.yaw(), cy = std::cos(yw), sy2 = std::sin(yw);
-            if (!sensors) hud.text(rx - R + 8 * s, ry - 8 * s, "SENSORS DOWN", red, s);
+            if (!sensors) hud.text(rx - R + 8 * s, ry - 8 * s, "RADAR DOWN", red, s);
+            else if (jam) {
+                for (int n = 0; n < 40; n++)
+                    hud.rect(rx - R + float(rand() % int(2 * R - 4 * s)), ry - R + float(rand() % int(2 * R - 4 * s)), 3 * s, 2 * s, green);
+                hud.text(rx - R + 8 * s, ry - 8 * s, "JAMMED", amber, s);
+            }
+            // sensor mode, ECM and how visible the user is (+0x76c: the user's signal)
+            snprintf(buf, sizeof buf, "%s%s", combat.activeSensors(player.object()) ? "ACTIVE" : "PASSIVE",
+                     combat.ecmOn(player.object()) ? "  ECM" : "");
+            hud.text(rx - R + 4 * s, ry - R + 4 * s, buf, combat.ecmOn(player.object()) ? amber : green, 0.7f * s);
+            hud.frame(rx + R - 44 * s, ry - R + 5 * s, 40 * s, 8 * s, green, s);
+            hud.rect(rx + R - 43 * s, ry - R + 6 * s, 38 * s * std::min(1.f, float(combat.signal(player.object()))), 6 * s, amber);
             int hostiles = 0;
-            ai.forEach([&](int, int team, const Vec3& p, bool alive) {
+            ai.forEach([&](int o, int team, const Vec3& p, bool alive) {
                 if (alive && team != ptm) hostiles++;
-                if (!alive || !sensors) return;
+                if (!alive || !sensors || jam || !combat.detectedBy(o, ptm)) return;
                 Vec3 d = p - player.position();
                 float fx = -d.x * sy2 - d.z * cy, rxl = d.z * sy2 - d.x * cy;  // screen right = (-cos, 0, sin)
                 float u = rxl / range * R, v = -fx / range * R;
-                if (std::fabs(u) > R - 3 * s || std::fabs(v) > R - 3 * s) return;
+                if (u * u + v * v > (R - 3 * s) * (R - 3 * s) || std::fabs(u) > R - 3 * s || std::fabs(v) > R - 3 * s) return;
                 hud.rect(rx + u - 2 * s, ry + v - 2 * s, 4 * s, 4 * s, team == ptm ? green : red);
             });
             snprintf(buf, sizeof buf, "HOSTILES %d", hostiles);
@@ -1164,6 +1454,7 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
         if (!alive && deathSent && (respawnT -= dt) <= 0) {
             deathSent = false;
             player.revive();
+            if (deathCam) deathCam = false, camPitch = savedPitch, camZoom = savedZoom, external = app.settings.externalView;
             scene.clearDamage(player.object());
             combat.revive(player.object(), player.def());
             player.teleport(spawnPoint(net->myId()));
@@ -1239,8 +1530,29 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
                 else if (act == "flinch") player.hitReaction(3);
                 else if (act.rfind("order", 0) == 0) pickTarget(), issueOrder(atoi(act.c_str() + 5));
             }
+            if (const char* st = getenv("HG2_STRAFE")) pin.strafe = float(atof(st));  // test: hold a sidestep key
+            if (getenv("HG2_IDLE")) pin = PlayerInput{};  // test: the user leaves the controls alone (as a windowed autoend run)
+            if (const char* th = getenv("HG2_THRUST")) {  // test: the space thruster command, and the body's track
+                pin.thrust = float(atof(th));
+                if (f % 15 == 0)
+                    printf("frame %d: pos %.1f %.1f %.1f speed %.2f\n", f, player.position().x, player.position().y,
+                           player.position().z, player.speed());
+            }
+            if (const char* kt = getenv("HG2_KILLMATE"))  // test: destroy squad mate 0 outright (0x100000) at frame n
+                if (f == atoi(kt) && !mates.empty()) {
+                    Vec3 mp;
+                    scene.objectPosition(mates[0], mp);
+                    combat.testHit(mates[0], 1e7f, mp);
+                    printf("killmate: ejected %d, weapons on the ground %zu, at %.1f %.1f %.1f\n", int(combat.ejected(mates[0])), combat.droppedWeapons(), mp.x, mp.y, mp.z);
+                }
+            if (const char* ct = getenv("HG2_CRIPPLE"))  // test: Movement critical 0x40000 on the user's gear at frame n
+                if (f == atoi(ct)) combat.testCritical(player.object(), 0x40000);
             if (!world.control) pin = PlayerInput{};
             userAutopilot(pin, false);
+            if (getenv("HG2_BOLT") && f == std::max(0, T.driveFrames - 3)) {  // test: a lightning bolt 60 m ahead
+                Vec3 eye = frameParams().eye, d = normalize(player.position() - eye);
+                particles.testStrike(Vec3(eye.x + d.x * 60.f, eye.y, eye.z + d.z * 60.f));
+            }
             if (const char* fxn = getenv("HG2_FX"))  // test: an effect 25 m ahead, a few frames before the shot
                 if (f == std::max(0, T.driveFrames - atoi(getenv("HG2_FX_AGE") ? getenv("HG2_FX_AGE") : "10"))) {
                     Vec3 eye = frameParams().eye, at = player.position() + (eye - player.position()) * 0.5f;  // between camera and gear
@@ -1250,8 +1562,12 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             player.speedScale = combat.mobility(player.object()), player.maneuverNow = combat.maneuverNow(player.object());
             player.jumpJets = combat.jumpJets(player.object());
             if (int kd = combat.takeKnock(player.object())) player.knockDown(kd);
+            if (combat.takeCripple(player.object())) player.cripple();
             if (player.active() && !combat.alive(player.object())) player.die();
             player.update(1.f / 30.f, pin);
+            if (float v = player.takeImpact()) combat.hardLanding(player.object(), v);
+            combat.setSpeed(player.object(), player.speed());
+            for (int o : player.takeRams()) combat.ram(o, player.object());
             ai.setCombatHold(scripts.combatHold());
             updateStrikes(1.f / 30.f);
             ai.update(1.f / 30.f);
@@ -1260,22 +1576,26 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             particles.setWind(world.windV, world.gust);
             particles.setViewer(frameParams().eye);
             particles.update(1.f / 30.f);
-            fountains.update(1.f / 30.f, player.position(), spawnUnit, unitAlive);
-            if (setup.waves > 0) {
-                bool cleared = std::none_of(waveUnits.begin(), waveUnits.end(), [&](int o) { return combat.alive(o); });
-                if (cleared && wave < setup.waves && (waveTimer -= 1.f / 30.f) <= 0) spawnWave(), waveTimer = 5.f;
+            {
+                FrameParams vf = frameParams();
+                viewProj = vf.view * vf.proj, haveView = true;
             }
+            fountainStep(1.f / 30.f);
+            iaStep();
             drainCombatEvents();
             scripts.update(1.f / 30.f);
             if (f % 600 == 0 && getenv("HG2_AIDBG")) ai.dump();
             if (f % (driveTo ? 30 : 300) == 0 && (T.navDrive || driveTo || !T.inputScript.empty()))
-                printf("t=%5.1f pos %.0f,%.0f v %.1f ctl %d posture %d nav %d %s | %s\n", scripts.time(), player.position().x,
-                       player.position().z, player.speed(), int(world.control) + 10 * int(player.forwardLocked()), player.postureCode(),
+                printf("t=%5.1f pos %.0f,%.0f y %.1f v %.1f ctl %d posture %d nav %d %s | %s\n", scripts.time(), player.position().x,
+                       player.position().z, player.position().y, player.speed(), int(world.control) + 10 * int(player.forwardLocked()), player.postureCode(),
                        scripts.selectedCheckpoint,
                        scripts.selectedCheckpoint >= 0 ? scripts.checkpoints[size_t(scripts.selectedCheckpoint)].label.c_str() : "-",
                        scripts.screenText.c_str());
         }
         if (T.driveFrames == 0) player.update(0.f, PlayerInput{});
+        if (getenv("HG2_PROF") && T.driveFrames > 0)
+            printf("prof: collision %.3f ms a frame (%.0f queries a frame)\n", scene.profNs * 1e-6 / T.driveFrames,
+                   double(scene.profCalls) / T.driveFrames);
         if (getenv("HG2_OBJY")) {
             double e1 = 0, e2 = 0;
             int n = 0;
@@ -1298,9 +1618,18 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             cam.yaw = std::atan2(d.x, d.z), cam.pitch = std::asin(d.y);
             chase = false;
         }
+        if (const char* la = getenv("HG2_LOOKAT")) {  // test: a camera 12 m off a point, looking at it
+            Vec3 at;
+            if (sscanf(la, "%f,%f,%f", &at.x, &at.y, &at.z) == 3) {
+                cam.pos = at + Vec3(9.f, 6.f, -9.f);
+                Vec3 d = normalize(at + Vec3(0, 2, 0) - cam.pos);
+                cam.yaw = std::atan2(d.x, d.z), cam.pitch = std::asin(d.y);
+                chase = false;
+            }
+        }
         scene.setObjectDrawn(player.object(), external || !chase || scripts.cinematic.active);
-        if (T.driveFrames) printf("after %d frames: %s, hostiles alive %d/%d, squad %zu, wave %d, end %d\n", T.driveFrames, combat.status().c_str(),
-                                  ai.alive(), ai.count(), mates.size(), wave, world.endCode);
+        if (T.driveFrames) printf("after %d frames: %s, hostiles alive %d/%d, squad %zu, fountain units %d, end %d\n", T.driveFrames, combat.status().c_str(),
+                                  ai.alive(), ai.count(), mates.size(), fountains.spawned(), world.endCode);
         if (const char* wn = getenv("HG2_WEAPON"); wn && T.fireFrames && !combat.testWeapon(wn)) fprintf(stderr, "no weapon %s\n", wn);
         for (int f = 0; f < T.fireFrames; f++) {
             Vec3 mz, aim;
@@ -1341,7 +1670,19 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
     bool throttleForward = true;
     Uint64 last = SDL_GetTicksNS();
     float deadTime = 0;
-    float sens = 0.003f * app.settings.mouseSpeed, inv = app.settings.invertMouse ? -1.f : 1.f;
+    const Bindings& keys = app.settings.bindings;
+    // the free camera is a port viewing tool with no counterpart in the original (its views are cockpit, external,
+    // the scripted cameras and the tactical map): HG2_FREECAM=1 starts the mission in it and lets F1 toggle it
+    const bool freecam = getenv("HG2_FREECAM") && atoi(getenv("HG2_FREECAM")) != 0;
+    auto enterFreecam = [&]() {  // the free camera starts where the view was
+        Vec3 eye, at;
+        viewCamera(eye, at);
+        cam.pos = eye;
+        Vec3 d = normalize(at - eye);
+        cam.yaw = std::atan2(d.x, d.z);
+        cam.pitch = std::asin(d.y);
+    };
+    if (freecam && chase) enterFreecam(), chase = false;
     auto setPaused = [&](bool on) {
         paused = on;
         SDL_SetWindowRelativeMouseMode(win, !on);
@@ -1382,59 +1723,87 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
                 }
                 continue;
             }
-            if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_ESCAPE) setPaused(true);
+            // the commands by the user's bindings (the controls screen; the shell's Defaults.dft until changed). The
+            // port adds only keys the original left unbound: Space (jump, or skip a camera flight), 1-8 (select a
+            // weapon), M (music), V (Sniper Systems zoom) and the mouse wheel (zoom); a binding on them wins.
+            auto extra = [&](SDL_Scancode sc) { return ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat && ev.key.scancode == sc && !keys.usesKey(sc); };
+            auto cmd = [&](Cmd c) { return keys.pressed(c, ev); };
+            if (cmd(Cmd::Abort)) setPaused(true);
             else if (ev.type == SDL_EVENT_WINDOW_FOCUS_LOST && !net) setPaused(true);
-            else if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key >= SDLK_1 && ev.key.key <= SDLK_8)
-                combat.selectWeapon(int(ev.key.key - SDLK_1));
-            else if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_TAB) combat.nextWeapon();
-            else if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_F1 && player.active()) {
+            else if (freecam && ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat && ev.key.scancode == SDL_SCANCODE_F1 && player.active()) {
                 chase = !chase;
-                if (!chase) {  // free camera starts where the chase camera was
-                    Vec3 eye, at;
-                    viewCamera(eye, at);
-                    cam.pos = eye;
-                    Vec3 d = normalize(at - eye);
-                    cam.yaw = std::atan2(d.x, d.z);
-                    cam.pitch = std::asin(d.y);
+                if (!chase) enterFreecam();
+            } else if (ev.type == SDL_EVENT_MOUSE_WHEEL) {
+                // wheel: Zoom In / Zoom Out steps (0.25 radius, 2 .. 8)
+                if (!deathCam) camZoom = std::max(2.f, std::min(8.f, camZoom - ev.wheel.y * 0.25f));
+            } else if (ev.type == SDL_EVENT_MOUSE_MOTION) {
+                if (chase) {
+                    // Target ReticleX / Y on the mouse axes (type 3, FUN_10136b40): -mickeys x 0.005 x the binding's
+                    // sensitivity a poll, added to the reticle and held to -1 .. 1 (FUN_10117fb0); Invert Mouse Y flips Y
+                    reticleX = std::clamp(reticleX + ev.motion.xrel * 0.005f * keys.axisScale(Cmd::ReticleX, 0), -1.f, 1.f);
+                    float inv = app.settings.invertMouse ? -1.f : 1.f;
+                    reticleY = std::clamp(reticleY - ev.motion.yrel * 0.005f * keys.axisScale(Cmd::ReticleY, 1) * inv, -1.f, 1.f);
+                } else {
+                    const float sens = 0.003f;
+                    cam.yaw += ev.motion.xrel * sens;
+                    cam.pitch = std::max(-1.5f, std::min(1.5f, cam.pitch - ev.motion.yrel * sens));
                 }
-            } else if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat) {
-                // original numeric-pad layout plus letter keys: / or Z down, * or X up, Enter or Space jump,
-                // Ins (pad 0) or R skates, C internal / external view, N / B next / previous nav point
-                SDL_Keycode kc = ev.key.key;
-                if (kc == SDLK_KP_DIVIDE || kc == SDLK_Z) edge.down = true;
-                else if (kc == SDLK_KP_MULTIPLY || kc == SDLK_X) edge.up = true;
-                else if ((kc == SDLK_KP_ENTER || kc == SDLK_SPACE) && scripts.cinematic.active) scripts.skipCinematic();
-                else if (kc == SDLK_KP_ENTER || kc == SDLK_SPACE) edge.jump = chase;
-                else if (kc == SDLK_J) edge.jumpJets = chase;
-                else if (kc == SDLK_COMMA) throttleSet = 0.333f;      // 1/3 Throttle (0x3eaaa64c)
-                else if (kc == SDLK_PERIOD) throttleSet = 0.6666f;    // 2/3 Throttle (0x3f2aa64c)
-                else if (kc == SDLK_SLASH) throttleSet = 1.f;         // Full Throttle
-                else if (kc == SDLK_0) throttleSet = 0.f, throttleForward = true;  // Full Stop
-                else if (kc == SDLK_BACKSPACE) throttleForward = !throttleForward;  // Reverse Direction
-                else if (kc == SDLK_KP_0 || kc == SDLK_INSERT || kc == SDLK_R) edge.toggleSkates = true;
-                else if (kc == SDLK_C) {  // view toggle (FUN_10093490 -> FUN_10092ff0(0/1)): also leaves a scripted camera
+            } else if ((ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat) || ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+                if (extra(SDL_SCANCODE_SPACE) && (scripts.cinematic.active || scripts.cinematicMode)) scripts.skipCinematic();
+                else if (cmd(Cmd::Jump) && scripts.cinematic.active) scripts.skipCinematic();
+                else if (cmd(Cmd::Jump) || extra(SDL_SCANCODE_SPACE)) edge.jump = chase;
+                for (int i = 0; i < 8; i++)
+                    if (extra(SDL_Scancode(SDL_SCANCODE_1 + i))) combat.selectWeapon(i);
+                if (cmd(Cmd::WeaponCycle)) combat.nextWeapon();
+                if (cmd(Cmd::Crouch)) edge.down = true;
+                if (cmd(Cmd::StandUp)) edge.up = true;
+                if (cmd(Cmd::JumpJets)) edge.jumpJets = chase;
+                if (cmd(Cmd::Wheels)) edge.toggleSkates = true;
+                // throttle setting (FUN_10063a10): 1/3 (0x3eaaa64c), 2/3 (0x3f2aa64c), full, Full Stop (forward mode),
+                // Reverse Direction
+                if (cmd(Cmd::Throttle13)) throttleSet = 0.333f;
+                if (cmd(Cmd::Throttle23)) throttleSet = 0.6666f;
+                if (cmd(Cmd::FullThrottle)) throttleSet = 1.f;
+                if (cmd(Cmd::FullStop)) throttleSet = 0.f, throttleForward = true;
+                if (cmd(Cmd::ReverseDirection)) throttleForward = !throttleForward;
+                if (cmd(Cmd::ExternalTracking)) {  // FUN_10093490 -> FUN_10092ff0(0/1); also leaves a scripted camera
                     external = !external, app.settings.externalView = external;
                     if (scripts.cinematic.active || scripts.cinematicMode) scripts.releaseCamera();
                 }
-                else if (kc == SDLK_N) scripts.stepCheckpoint(1);
-                else if (kc == SDLK_M && audio) audio->musicVolume = audio->musicVolume > 0 ? 0.f : app.settings.music;
-                else if (kc == SDLK_B) scripts.stepCheckpoint(-1);
-                else if (kc >= SDLK_F5 && kc <= SDLK_F10) issueOrder(int(kc - SDLK_F5));
-                else if (kc == SDLK_V && combat.sniper(player.object())) sniperZoom = !sniperZoom;  // Sniper Systems zoom
-            } else if (ev.type == SDL_EVENT_MOUSE_WHEEL) {
-                camDist = std::max(8.f, std::min(60.f, camDist - ev.wheel.y * 2.f));
-            } else if (ev.type == SDL_EVENT_MOUSE_MOTION) {
-                if (chase) {
-                    camOrbit += ev.motion.xrel * sens;
-                    camPitch = std::max(-0.2f, std::min(1.3f, camPitch + ev.motion.yrel * sens * inv));
-                } else {
-                    cam.yaw += ev.motion.xrel * sens;
-                    cam.pitch = std::max(-1.5f, std::min(1.5f, cam.pitch - ev.motion.yrel * sens * inv));
-                }
+                if (cmd(Cmd::SelectNavPoint)) scripts.stepCheckpoint(1);
+                if (extra(SDL_SCANCODE_M) && audio) audio->musicVolume = audio->musicVolume > 0 ? 0.f : app.settings.music;
+                if (extra(SDL_SCANCODE_V) && combat.sniper(player.object())) sniperZoom = !sniperZoom;  // Sniper Systems zoom
+                // squad commands (FUN_100d1bc0)
+                if (cmd(Cmd::SquadAttackMyTarget)) issueOrder(0);
+                if (cmd(Cmd::SquadDefendMyTarget)) issueOrder(1);
+                if (cmd(Cmd::SquadHoldGround)) issueOrder(2);
+                if (cmd(Cmd::SquadRegroup)) issueOrder(3);
+                if (cmd(Cmd::SquadFireAtWill)) issueOrder(4);
+                if (cmd(Cmd::SquadGotoCheckpoint)) issueOrder(5);
+                if (cmd(Cmd::EcmEnable) && chase) combat.toggleEcm(player.object());
+                if (cmd(Cmd::ActiveRadarConfig) && chase) combat.setActiveSensors(player.object(), !combat.activeSensors(player.object()));
+                // targeting (FUN_10114210)
+                if (cmd(Cmd::TargetAtReticle)) pickTarget();
+                if (cmd(Cmd::TargetCycle)) cycleTarget(1, false);
+                if (cmd(Cmd::PreviousTarget)) cycleTarget(-1, false);
+                if (cmd(Cmd::NearestEnemy)) cycleTarget(0, false);
+                if (cmd(Cmd::TargetFriendly)) cycleTarget(0, true);
             }
         }
         Uint64 now = SDL_GetTicksNS();
+        // the original's frame clock (FUN_1002a190): no frame shorter than 1/60 s (Combat::kFrameHz)
+        const Uint64 minFrame = Uint64(1e9 / double(Combat::kFrameHz));
+        if (now - last < minFrame) SDL_DelayPrecise(minFrame - (now - last)), now = SDL_GetTicksNS();
         float dt = std::min(float(now - last) * 1e-9f, 0.1f);
+        if (getenv("HG2_PROF")) {  // frame time and the collision queries' share, every 5 s
+            static Uint64 since = now, frames = 0;
+            frames++;
+            if (now - since > 5000000000ull) {
+                SDL_Log("prof: %.1f ms a frame, collision %.2f ms a frame (%.0f queries)", (now - since) * 1e-6 / frames,
+                        scene.profNs * 1e-6 / frames, double(scene.profCalls) / frames);
+                since = now, frames = 0, scene.profNs = 0, scene.profCalls = 0;
+            }
+        }
         last = now;
         if (paused) {
             if (net) net->poll();  // keep the connection alive; the world goes on without us
@@ -1454,15 +1823,23 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
         scene.setTime(scripts.time());
         const bool* k = SDL_GetKeyboardState(nullptr);
         PlayerInput pin;
+        const SDL_MouseButtonFlags mbuttons = SDL_GetMouseState(nullptr, nullptr);
+        auto held = [&](Cmd c) { return keys.held(c, k, mbuttons); };
         if (chase) {
-            pin.throttle = (k[SDL_SCANCODE_W] || k[SDL_SCANCODE_KP_8] ? 1.f : 0.f) - (k[SDL_SCANCODE_S] || k[SDL_SCANCODE_KP_2] ? 1.f : 0.f);
-            pin.turn = (k[SDL_SCANCODE_D] || k[SDL_SCANCODE_KP_6] ? 1.f : 0.f) - (k[SDL_SCANCODE_A] || k[SDL_SCANCODE_KP_4] ? 1.f : 0.f);
-            pin.strafe = (k[SDL_SCANCODE_E] || k[SDL_SCANCODE_KP_9] ? 1.f : 0.f) - (k[SDL_SCANCODE_Q] || k[SDL_SCANCODE_KP_7] ? 1.f : 0.f);
+            pin.throttle = (held(Cmd::Forward) ? 1.f : 0.f) - (held(Cmd::Backward) ? 1.f : 0.f);
+            pin.turn = (held(Cmd::SteerRight) ? 1.f : 0.f) - (held(Cmd::SteerLeft) ? 1.f : 0.f);
+            pin.strafe = (held(Cmd::SideStepRight) ? 1.f : 0.f) - (held(Cmd::SideStepLeft) ? 1.f : 0.f);
             pin.run = true;
-            // Increase / Decrease Throttle (held): +-0.05 a poll, up to 1, down to 0.05 (FUN_10063a10)
-            if (k[SDL_SCANCODE_EQUALS] || k[SDL_SCANCODE_KP_PLUS]) {
+            // Increase / Decrease Throttle (held): +-0.05 a poll, up to 1, down to 0.05 (FUN_10063a10). In space they
+            // leave the setting alone and command the thrusters instead (+0x1040 = +-1), and the setting is added
+            // (forward mode) or taken off (reverse)
+            const bool inc = held(Cmd::IncreaseThrottle), dec = held(Cmd::DecreaseThrottle);
+            if (space) {
+                pin.thrust = inc ? 1.f : dec ? -1.f : 0.f;
+                pin.thrust += throttleForward ? throttleSet : -throttleSet;
+            } else if (inc) {
                 if (throttleSet < 1.f) throttleSet = std::min(1.f, throttleSet + 0.05f);
-            } else if (k[SDL_SCANCODE_MINUS] || k[SDL_SCANCODE_KP_MINUS]) {
+            } else if (dec) {
                 if (throttleSet > 0.05f) throttleSet -= 0.05f;
             }
             // Forward / Backward is an axis (-1 .. 1); steering with no axis drives at 0.05, reverse is held to
@@ -1474,26 +1851,41 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             else if (pin.throttle >= 0 && pin.throttle < throttleSet) pin.throttle = throttleSet;
             pin.down = edge.down, pin.up = edge.up, pin.jump = edge.jump, pin.jumpJets = edge.jumpJets;
             pin.toggleSkates = edge.toggleSkates;
-            // arrow keys orbit / tilt the camera, Home / End zoom the external camera
-            camOrbit += ((k[SDL_SCANCODE_RIGHT] ? 1.f : 0.f) - (k[SDL_SCANCODE_LEFT] ? 1.f : 0.f)) * 1.5f * dt;
-            camPitch = std::max(-0.2f, std::min(1.3f, camPitch + ((k[SDL_SCANCODE_DOWN] ? 1.f : 0.f) - (k[SDL_SCANCODE_UP] ? 1.f : 0.f)) * dt));
-            if (k[SDL_SCANCODE_HOME]) camDist = std::max(8.f, camDist - 20.f * dt);
-            if (k[SDL_SCANCODE_END]) camDist = std::min(60.f, camDist + 20.f * dt);
-            bool steering = k[SDL_SCANCODE_LEFT] || k[SDL_SCANCODE_RIGHT];
-            if (!steering) camOrbit *= std::max(0.f, 1.f - dt * (external ? 1.5f : 0.6f));  // drift back to the gear's heading
+            if (held(Cmd::CenterTorso)) reticleX = reticleY = 0.f;  // FUN_10117fb0: Center Torso centres the reticle
+            // Camera Left / Right / Up / Down and Zoom In / Out, FUN_1007c840 once a frame: 2.5 deg and 0.25 radius a
+            // poll, one poll a frame at the original's frame rate (Combat::kFrameHz); the pitch holds to -30 .. 80 deg, the zoom to 2 .. 8, the orbit
+            // is free (no drift back)
+            const float polls = Combat::kFrameHz * dt;
+            camOrbit += ((held(Cmd::CameraRight) ? 1.f : 0.f) - (held(Cmd::CameraLeft) ? 1.f : 0.f)) * kCamStep * polls;
+            if (held(Cmd::CameraUp) && !held(Cmd::CameraDown)) camPitch = std::min(kPitchMax, camPitch + kCamStep * polls);
+            if (held(Cmd::CameraDown) && !held(Cmd::CameraUp)) camPitch = std::max(kPitchMin, camPitch - kCamStep * polls);
+            if (!deathCam && held(Cmd::ZoomIn)) camZoom = std::max(2.f, camZoom - 0.25f * polls);
+            if (!deathCam && held(Cmd::ZoomOut)) camZoom = std::min(8.f, camZoom + 0.25f * polls);
         }
         bool dead = player.active() && !combat.alive(player.object());
         if (dead) player.die();
+        if (dead && !deathCam && !scripts.cinematic.active) {
+            // FUN_10094700: the user's unit no longer alive switches to the death camera (FUN_10092ff0(8)): external,
+            // pitch and zoom saved, 45 deg at 20 radii
+            deathCam = true, external = true;
+            savedPitch = camPitch, savedZoom = camZoom;
+            camPitch = 0.78539805f, camZoom = 20.f;
+        }
         if (dead || !world.control) pin = PlayerInput{};
         userAutopilot(pin, dead);
-        player.twist = chase ? std::max(-1.2f, std::min(1.2f, camOrbit)) : 0.f;  // torso follows the aim
+        player.twist = 0.f;  // the user's torso has no twist input (the sidestep holds its own angle in player.cpp)
         edge = PlayerInput{};
         player.speedScale = combat.mobility(player.object()), player.maneuverNow = combat.maneuverNow(player.object());
         player.jumpJets = combat.jumpJets(player.object());
         if (int kd = combat.takeKnock(player.object())) player.knockDown(kd);
+        if (combat.takeCripple(player.object())) player.cripple();
         combat.setPosture(player.object(), player.postureCode());
+        // the user's visual sensor looks along its pov frame (Combat::sensorAxis)
         if (botClose && !dead) pin.throttle = 1;
         player.update(dt, pin);
+        if (float v = player.takeImpact()) combat.hardLanding(player.object(), v);
+            combat.setSpeed(player.object(), player.speed());
+            for (int o : player.takeRams()) combat.ram(o, player.object());
         scene.setObjectDrawn(player.object(), external || !chase || scripts.cinematic.active);
         ai.setCombatHold(scripts.combatHold());
         updateStrikes(dt);
@@ -1510,12 +1902,10 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
             audio->update();
             updateAmbient();  // EAR moves its events every frame (FUN_1012e708)
         }
-        pickTarget();
-        if (player.active() && combat.designator(player.object()))
-            combat.setDesignated(userTarget, scene.mission().objects[size_t(player.object())].team);
+        validateTarget();
         bool fired = false;
         Vec3 fmz, faim;
-        if (chase && !dead && world.control && ((SDL_GetMouseState(nullptr, nullptr) & SDL_BUTTON_LMASK) || k[SDL_SCANCODE_LCTRL])) {
+        if (chase && !dead && world.control && held(Cmd::WeaponFire)) {
             aimPoint(fmz, faim);
             combat.setAimTarget(player.object(), userTarget);
             fired = combat.fire(fmz, faim);
@@ -1540,14 +1930,12 @@ static MissionResult play(AppContext& app, const MissionSetup& setup, const Test
         particles.setViewer(frameParams().eye);
         particles.update(dt);
         weatherSound();
-        fountains.update(dt, player.position(), spawnUnit, unitAlive);
-        if (setup.waves > 0 && world.endCode < 0) {
-            bool cleared = std::none_of(waveUnits.begin(), waveUnits.end(), [&](int o) { return combat.alive(o); });
-            if (cleared && (waveTimer -= dt) <= 0) {
-                if (wave < setup.waves) spawnWave(), waveTimer = 5.f;
-                else world.missionOver(1, 4.f);
-            }
+        {
+            FrameParams vf = frameParams();
+            viewProj = vf.view * vf.proj, haveView = true;
         }
+        fountainStep(dt);
+        iaStep();
         drainCombatEvents();
         if (getenv("HG2_AIDBG") && int(scripts.time() / 10) != int((scripts.time() - dt) / 10)) ai.dump();
         if (const char* ws = getenv("HG2_WSIGNAL")) {  // test automation: "t:sig[:unit]" sends a world (or unit) signal once at t s

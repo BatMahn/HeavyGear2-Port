@@ -84,6 +84,7 @@ public:
     bool underWater(const Vec3& p) const { return hasWater_ && p.y < water_; }
     int rainSound() const { return w_.enabled ? w_.sound : -1; }
     std::function<void(const Vec3&)> onLightning;  // envthnd1.wav at the strike
+    void testStrike(const Vec3& at) { strikeBolt(at); }  // test: a bolt at a chosen point
 
 private:
     const Effect* effect(const std::string& name);
@@ -153,6 +154,29 @@ private:
         float acc = 0;
     } w_;
     Vec3 fallDir_ = normalize(Vec3(1, -3, 0)) * 0.9999999f;  // DAT_1026b1c0
+    Mat4 view_;  // the last frame's view (the lightning placement test reads it)
+
+    // Lightning bolt (FUN_100f0400, vtable 0x1014a6a0, 0x5e0 bytes): an 80 m channel straight up from the strike
+    // point, drawn as up to four jagged ribbons (+0x2c0, 200 bytes each) and a flash at the top. Each ribbon is a cubic
+    // Bezier (FUN_10048090) subdivided with random bends (FUN_100f1900) and roughened by 64 stored offsets.
+    struct Ribbon {
+        bool on = false;
+        float life = 0, age = 0;        // +0xb1 / +0xb2 (relative to the slot)
+        float step = 0.8f, width = 0.6f, amp = 5.f;  // +0xdc points spacing, +0xdd half-width, +0xde bend
+        int depth = 3;                  // +0xdf subdivision levels
+        uint8_t seed = 0;               // +0xe0 offset into the 64 roughening values, +2 each draw
+        Vec3 cp[4], perp;               // control points (bolt space), the bend / roughening direction
+    };
+    struct Bolt {
+        Vec3 at;                        // strike point (camera height)
+        float life = 0.5f, age = 0;     // +0x1a8 (0.2 .. 0.6 s, at least 0.1) / +0x1b0
+        float jag[64];                  // +0x1b8: (2 rand - 32767) x 9.1556e-6, about +-0.3 m
+        Ribbon rib[4];
+    };
+    std::vector<Bolt> bolts_;
+    void strikeBolt(const Vec3& at);
+    void respawnRibbon(Bolt& b, int i);
+    void ribbonPoints(const Ribbon& r, const Bolt& b, std::vector<Vec3>& out) const;
 };
 
 }  // namespace hg2

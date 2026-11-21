@@ -5,6 +5,106 @@ Heavy Gear II native port - https://github.com/BatMahn/HeavyGear2-Port
 Each release's source and the macOS / Linux / Windows builds are on the GitHub releases page. No game data is ever
 included: you need your own copy of Heavy Gear II (see the README's "Setting up the game folder").
 
+## 0.30.0 - 2026-11-21
+
+A third review pass, mostly finishing what the last one left open. Addresses are in docs/FORMATS.md.
+
+### Controls and aiming
+- **The original's default key bindings.** They come from the game's own `Defaults.dft`, so the training prompts
+  now match. Movement is on the numeric pad. Mouse button 1 fires and button 2 cycles weapons. `Ctrl+C` switches to
+  the external view and the arrows move the camera. `A` switches active/passive sensors, `Ctrl+E` turns on ECM, and
+  the squad commands are `Ctrl+T/D/S/R/A/G`.
+- **Your old keys have moved.** WASD, Q/E, Z/X, J, R, C, B, K, U, Tab and F5–F10 are no longer bound. Laptops without
+  a numeric pad need to rebind movement under Options → Controls.
+- **The original controls screen works.** You can change keys and use undo, clear, Reset Default, Invert Mouse Y,
+  reversed and sensitivity. Bindings are saved in settings.cfg.
+- **Aiming is the original reticle.** The mouse moves it 30° left/right and 20° up/down, and pad 5 centres it.
+  There is no mouse look or torso twist for the player.
+- **Targeting changes only on the targeting keys.** These are R (at the reticle), T/Y (next/previous), E (nearest
+  enemy) and F (nearest friendly).
+- **The free camera is now a debug option** (`HG2_FREECAM=1`).
+
+### World and AI
+- **Vehicles sit on terrain and tilt with it.** Tanks and trucks use wheel springs from their model frames, hover
+  tanks float about 2 m up, and walkers stand on legs. Ramming damages the smaller body.
+- **Space ship hulls have walkable graphs (S06, S30, S35),** used by the space tactics and the unit generators.
+- **Near misses alert the AI** and give the shooter away. Blast damage counts toward AI fire control.
+- **Each unit class looks out from its own view point,** and the sensor cone test is now in 3D.
+- **The frame clock matches the original:** at most 60 frames per second, with timed effects stepping at 60 Hz.
+- **Instant action:** only enemies respawn, on the original's whole-second clock.
+
+### Damage
+- **Ejection drops the gear's weapon on the ground,** as in the original (no pilot unit is created).
+- **Only squad mates can eject;** your own pilot never does. The script command IsPilotAlive works.
+- **Crippling hits during a jump or on skates are lost,** as in the original.
+- **Corrected gear constants:** drive is 20 + Maneuver and turn torque is 25 + 2·Maneuver.
+- **Space missions are recognised without the shell** (missions with no terrain). Thrust works as in the original.
+
+### Sound
+- **Sounds glide to their new pan and volume** in two 50 ms steps.
+- **The original per-channel limits:** ambient sounds are capped at 4, and the music and dialogue channels queue.
+
+### Fixes
+- **Builds with older Apple clang again** (removed a C++20-only construct).
+
+## 0.29.0 - 2026-11-21
+
+The second review pass: more of what the port had invented is replaced with the original game's behaviour, decoded
+from `hg2sim.dll` and `earpds.dll` (addresses in docs/FORMATS.md). Several of the original's rules are harsher than
+the port's guesses were.
+
+### Collision and pathfinding
+- Units collide with objects through the models' own polygons, probed the way the original does (a centre probe, two
+  side probes and a forward probe), with contact forces. The invented column boxes are gone.
+- Units only collide with each other when one of them is the player, as in the original.
+- Trees have no collision (the original never gives them any), so you walk and shoot through them.
+- Bridges: you walk on the deck, and the route planner crosses them end to end.
+- The route planner checks walkability the original's way (surface flags, objects on the tile, water depth, slope).
+  This fixes D01 enemies stalling below the cliff with no route.
+
+### Spawning, instant action and squads
+- Unit generators use the original's unit pools and scored spawn queue: groups spawn out of view, far from and behind
+  the player, and units that wander out of range are recycled. Two swapped generator fields are fixed.
+- Instant action works like the original: you and the enemies start on the map's spawn points and destroyed enemies
+  come back at another spawn point until their lives run out. "Enemy waves" is the number of lives per enemy. The
+  invented waves, banner and forced alert level are gone.
+- Squad mates take their places from the original's formation tables and re-form as the leader moves or turns.
+
+### Sensors, ECM and fire
+- The original sensor model: visual, ultrasonic, motion, magnetic and radar sensors set by the Sensors rating,
+  detection against concealment, signals that fade, active / passive sensors, sensor damage.
+- The radar scope shows only detected contacts within 300 m, with static when jammed. Targeting is limited to
+  detected contacts.
+- ECM (player only, `K`) jams radars within its field unless ECCM holds; a jammed shooter's guided missiles stop
+  homing. `U` toggles active / passive sensors. These two keys are the port's own; the original defaults weren't found.
+- AI fire control: no random scatter; a unit whose hit share exceeds its fire-control cap aims high.
+- Removed: the invented detection factor, the concealment halving after firing, the random ECM lock roll and the
+  radar range bonuses.
+- The pilot difficulty setting: the original never passes it to the simulation, so it has no effect (documented).
+
+### Damage
+- Lava damages only the player's gear, at the original's rate (fatal in a few frames on D01). No perk reduces it.
+- Hard landings above 20 m/s do damage, up to 2000.
+- Ejection follows the original: squad gears (the player's included) have an 80 % chance on a fatal critical;
+  knock-down criticals now always finish a gear.
+- Water: drag slows wading by depth; gears without Amphibious drown in deep water. In space, gears without Zero-G
+  Movement take vacuum damage.
+- Space missions: no gravity in the air, a 1 g pull towards a surface you touch, and thrusters.
+- Crippled gears switch to the original's crippled animation set.
+- Reinforced Armor adds +20 per level (not +2), the side-facing bits are fixed, Weak Facing halves armour.
+- The invented 600-damage kill for vehicles without a definition is gone.
+
+### Cameras, movement, weather and sound
+- External camera: distance is a multiple of the gear's size (zoom 2–8), pitch −30°…80°, no smoothing, ground
+  clearance from 16 samples. Cockpit view turns with the torso. When you die the camera pulls back.
+- Sidestep swings the legs 90° while the torso keeps facing ahead, as the original; the invented sideways speed is
+  gone.
+- Footsteps fire at each gear's own foot contact points.
+- Lightning strikes are placed as in the original and the bolt is drawn, with branches.
+- Rain draws the nearest tiles first, in the original's order.
+- Sound: the original's direction-based panning tables, and its rules for which sound gives way when a channel is
+  full.
+
 ## 0.28.0 - 2026-11-21
 
 A review pass replacing behaviour the port had invented or estimated with the original game's, decoded from

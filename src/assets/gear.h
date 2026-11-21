@@ -17,6 +17,9 @@ struct GearDef {
     int sensors = 0, fireControl = 0, armor = 0, size = 0, maneuverability = 0, movement1 = 0, movement2 = 0;
     uint32_t perks = 0, flaws = 0;  // 0x9b PerksFlaws bit fields (the shell's layout, see GameData::perkFields)
     float maxWalkSpeed = 0, maxRunSpeed = 0;
+    // LeftFootSound / RightFootSound (0x99 / 0x9a, +0xc08 / +0xc0c): the two points of the walk cycle (fractions)
+    // where the feet come down; defaults 0 and 0.5 (FUN_10035460's constructor)
+    float leftFoot = 0.f, rightFoot = 0.5f;
     float detection[6] = {};  // IR/UV, Radar, Heat, Ultrasonic, Motion, Magnetic
     struct Hardpoint { int slot; int weapon; int ammo; };  // weapon = keyword 0xb3..0xc3
     std::vector<Hardpoint> hardpoints;

@@ -5,6 +5,7 @@
 // See docs/FORMATS.md "Unit brain".
 #pragma once
 #include <functional>
+#include <array>
 #include <map>
 #include <random>
 #include <string>
@@ -39,7 +40,7 @@ public:
         audioHook_ = a;
         for (auto& u : units_) u.body.audio = a, u.body.soundVolume = 0.8f;
     }
-    void setGravity(float g) { for (auto& u : units_) u.body.gravityScale = g; }
+    void setSpace(bool on) { space_ = on; for (auto& u : units_) u.body.space = on; }
     // Cinematic mode without AllowCinematicCombat: brains don't pick or engage targets (FUN_100b9ae0, +0x521).
     void setCombatHold(bool on) { combatHold_ = on; }
     void setParticles(Particles* p) {
@@ -65,9 +66,28 @@ public:
     void notifyRange(int object, float r);
     void command(int object, const std::string& cmd, float a, float b, float c, const std::string& s, float d = 0);
     void hitBy(int object, int shooter);  // remember the attacker, wake up
+    // An enemy round in the unit's 32 m collision cell this frame (FUN_100553f0, gear vtable +0xc4, called by the
+    // collision sweep FUN_100a11b0 for every round sharing the cell; FUN_100b8220 on the brain).
+    void nearMiss(int object, int shooter);
+    // Team +0x235 (FUN_100b88f0): whether the team's AI units cycle their sensors active / passive (FUN_100ba740)
+    // A unit on a walkable graph (brain +0x1b4 the graph, +0x1b8 the node it is at or was sent to)
+    void setGraph(int object, int graph, int node) { if (Unit* u = find(object)) u->graph = graph, u->graphNode = node; }
+    // ORDER_MOVETONODE (kind 3, FUN_10037b40; FUN_1005c110 posts it with flags 0x200): steer straight at the node, done
+    // within 2 m (DAT_10140b90), the node then becomes the brain's +0x1b8
+    void moveToNode(int object, const Vec3& at, int node);
+    void setAutoSensors(int team, bool on) { if (team >= 0 && team < 16) autoSensors_[size_t(team)] = on; }
     void hitReaction(int object, int level) { if (Unit* u = find(object)) u->body.hitReaction(level); }
     // Squad mates: keep a formation slot (leader-relative: x right, z behind) and fight what comes close.
-    void follow(int object, int leader, const Vec3& slot);
+    // join `leader`'s squad as member `slot` (0..3) of formation group `group` (0 = A, 1 = B)
+    void follow(int object, int leader, int group, int slot);
+    // The squad formation (FUN_100be4f0 on the tables of FUN_100be020 and the user squad's preset FUN_100d2e90 #4,
+    // separation 64): where member `slot` of group `group` stands for a leader at `at` with matrix rows axis0 / axis2
+    static Vec3 formationPoint(int group, int slot, const Vec3& at, const Vec3& axis0, const Vec3& axis2);
+    static void yawAxes(float yaw, Vec3& axis0, Vec3& axis2);  // rows 0 and 2 of a gear's matrix for a heading
+    int mode(int object) const { const Unit* u = find(object); return u ? u->mode : 0; }  // brain +0x44
+    // back into the fight from scratch (a pooled fountain unit, an instant-action respawn): the unit is rebuilt
+    // from its mission object, which the caller has moved to the new spot
+    bool respawn(int object);
     // The user's squad commands (the original's key bindings, FUN_100d1bc0): attack / defend the user's target,
     // hold ground, regroup, fire at will, go to the selected nav point.
     enum SquadOrder { OrderFollow = 0, OrderAttack, OrderDefend, OrderHold, OrderFireAtWill, OrderGoto, OrderRegroup };
@@ -94,7 +114,7 @@ private:
     // in combat mode, 0x10 the move ends after `param` s, 0x20 drive backwards, 0x100 flip to backwards while the
     // target is more than 135 degrees off the nose, 0x80 the pathfinder's wading flag.
     struct Order {
-        int kind = 0, flags = 0, obj = -1;
+        int kind = 0, flags = 0, obj = -1, node = -1;
         float param = 0;
         Vec3 pos;
         bool started = false;
@@ -135,7 +155,11 @@ private:
         float seen = 0;             // +0x3c: how long an enemy has been in view
         int attacker = -1;          // +0x1e0
         float hitAgo = 1e30f;       // +0x1e4: seconds since it was hit
-        bool heardShot = false;     // +0xca: an enemy round passed close this frame
+        bool heardShot = false;     // +0xca: hit this frame (the damage handlers set the hit level there)
+        int graph = -1, graphNode = -1;  // +0x1b4 / +0x1b8: the walkable graph (its object) and node
+        bool onGraph = false;       // +0x1b2: sent along a graph
+        int nearShooter = -1;       // +0x1d8: whoever fired the last round that passed close (or at the squad leader)
+        float nearAgo = 1e30f;      // +0x1dc: seconds since; dropped past the record's +0x1c
         bool exposed = false;       // +0xa5: the target shows up on the sensors
         bool los = false;           // +0xa0 bit 2: line of sight to the target
         bool inRange = false;       // +0xa9: within the selected weapon's range
@@ -158,6 +182,10 @@ private:
         int tacMode = -1;
         int step = 0, count = 0;
         float tacTimer = 0;
+        // the space tactics' hull graph walk (FUN_100afe70): the graph (brain +0x1b4) and node (+0x1b8) the unit is
+        // on, and the tactic's run time (+0xc of its record)
+        int hullGraph = -1, hullNode = -1;
+        float graphClock = 0;
         Vec3 point, home, goalPos;
         int lookAt = -1;
         std::vector<Order> orders;
@@ -171,7 +199,9 @@ private:
         int order = 0, orderObj = -1;  // squad command (SquadOrder) and its object
         Vec3 orderPos;
         bool scriptStance = false;  // the script set posture / skates
-        Vec3 slot;
+        int fgroup = 0, fslot = 0;  // squad formation group (A / B) and member index in it
+        Vec3 slotPos;               // brain +0x110: the formation point the squad last gave it
+        bool haveSlot = false;
         std::string combatTactic, nonCombatTactic;
         bool cinematic = false;     // SetCinematicControl(unit): script-driven, no targets of its own (brain +0x198)
         bool autoAim = true;        // AutoAim (brain +0xe8): the gunner tracks its target
@@ -187,6 +217,7 @@ private:
         // AutoScan (brain +0xe9, on by default; off while a target is set, back on when it is dropped or on
         // AutoPilot): an idle gear sweeps its torso (FUN_10037e30)
         bool autoScan = true;
+        float sensorClock = 0;      // +0x38: time in the current active / passive sensor mode
         int lastTarget2 = -1;
         float scanGoal = 0, scanPause = 0;
     };
@@ -209,6 +240,12 @@ private:
     std::map<int, bool> untargetable_;        // CanTarget(unit, 0): brain +0x1a clear, others skip it
     bool targetable(int object) const { auto it = untargetable_.find(object); return it == untargetable_.end() || !it->second; }   // FUN_100dd910's per-tactic use counts (+0x14)
     void scan(Unit& u, float dt);
+    // a squad's formation frame (+0x1100: the leader's pose when last re-formed) and its 1 s re-assignment clock (+0x490)
+    struct SquadFrame { Vec3 pos, axis0, axis2; float timer = 0; bool set = false; };
+    std::map<int, SquadFrame> squads_;
+    bool leaderPose(int leader, Vec3& pos, Vec3& axis0, Vec3& axis2, float& speed, float& vmax) const;
+    void formation(float dt);   // FUN_100d04c0 per squad
+    void assignSlots(int leader, const SquadFrame& f);  // FUN_100cd370
     Unit* find(int object);
     const Unit* find(int object) const;
     bool positionOf(int object, Vec3& out) const;
@@ -228,18 +265,24 @@ private:
     // the MOVETO request a unit's class makes (slope cosine, water-depth limit, water penalty, nodes on the surface)
     struct MoveRules {
         float slopeCos = 0.866f, depthLimit = 1e9f;
+        float radius = 1.f;        // the request's +0x98 / search +0xb8: the unit's bounding radius (object test)
         bool waterCost = true, onSurface = false;
+        bool avoidDamage = true;   // request +0x1a (search +0x3a): damaging surfaces are blocked (cleared by flag 0x10)
     };
     MoveRules moveRules(int self) const;
-    bool walkable(float x, float z, const MoveRules& r) const;
+    bool walkable(float x, float z, const MoveRules& r, int self) const;
+    bool nodeWalkable(Vec3& p, const MoveRules& r, int self, int& graph) const;
     float routeBudget_ = 0;
     bool forcedTac_ = false;
     bool combatHold_ = false;
+    bool space_ = false;
     const FileSystem* fs_ = nullptr;
     Audio* audioHook_ = nullptr;
     Particles* particlesHook_ = nullptr;
     Team teams_[16];
     float viewDist_ = 0;
+    std::array<bool, 16> autoSensors_ = make_true();  // team +0x235 (FUN_100b88f0; on by default)
+    static std::array<bool, 16> make_true() { std::array<bool, 16> a; a.fill(true); return a; }
 };
 
 }  // namespace hg2

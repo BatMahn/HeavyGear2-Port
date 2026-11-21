@@ -32,8 +32,10 @@ void parseWorldStatus(Reader b, Mission& m) {
             case 0x1f: m.fogIntensity = std::min(1.f, std::max(0.f, b.f32())); break;
             case 0x20: case 0x21: case 0x22: case 0x23: m.fog[t - 0x20] = uint8_t(b.u32()); break;
             case 0x24: m.clipping = b.i32(); break;
-            case 0x25: m.lightAmbient = b.f32(); break;
-            case 0x26: m.lightDiffuse = b.f32(); break;
+            // the sun (DAT_1018588c, FUN_10005a90 from FUN_1008dba0): ambient (default 0.3) held to 0 .. 0.5 -> light
+            // +0x190 (vtable +0xb4, FUN_1001a9a0), diffuse (default 0.5) held to 0.1 .. 1 -> +0x198 (FUN_1001aa10)
+            case 0x25: m.lightAmbient = std::clamp(b.f32(), 0.f, 0.5f); break;
+            case 0x26: m.lightDiffuse = std::clamp(b.f32(), 0.1f, 1.f); break;
             case 0x27: case 0x28: case 0x29: m.lightDir[t - 0x27] = b.f32(); break;
             case 0x2a: case 0x2b: case 0x2c: m.lightColor[t - 0x2a] = uint8_t(b.u32()); break;
             case 0x39: m.musicTrack = b.i32(); break;  // RedBook_Track (CD audio track)
@@ -237,7 +239,8 @@ bool parseSurfaces(Reader b, Mission& m) {
                     case 0xd5: for (auto& c : s.color) c = uint8_t(b.u32()); break;
                     case 0xd7: s.friction = b.f32(); break;
                     case 0xd8: s.damage = b.i32(); break;
-                    case 0x153: case 0x154: b.u32(); break;
+                    case 0x153: s.flags = b.u32(); break;
+                    case 0x154: s.movementCost = b.f32(); break;
                     case 0x155: s.footstep = b.str(); break;
                     case 0x156: {
                         uint32_t r = b.u32() & 255, g = b.u32() & 255, bl = b.u32() & 255;
@@ -271,7 +274,7 @@ bool parseFountains(Reader& r, Mission& m) {
                 else return false;
             }
             m.fountainTemplates.push_back(ft);
-        } else if (t == 0x12e) {  // fountain
+        } else if (t == 0x12e) {  // fountain (FUN_1005bb40)
             if (r.u32() != 2) return false;
             Fountain f;
             for (uint32_t k = r.u32(); k != 1; k = r.u32()) {
@@ -281,24 +284,35 @@ bool parseFountains(Reader& r, Mission& m) {
                     case 0xa1: f.script = r.str(); break;
                     case 0x6c: f.team = r.i32(); break;
                     case 0x132: f.active = r.i32() == 3; break;
-                    case 0x133: r.u32(); break;
-                    case 0x12f: f.mode = r.i32(); break;
-                    case 0x130: f.total = r.i32(); break;
-                    case 0x131: f.maxAlive = std::max(1, std::min(8, r.i32())); break;
-                    case 0x12b: f.wave = std::max(1, std::min(16, r.i32())); break;
-                    case 0x134: f.flags = r.u32(); break;
+                    case 0x133: r.u32(); break;  // +0x18, overwritten by 0x134
+                    case 0x12f: { uint32_t v = r.u32(); if (v < 3) f.mode = int(v); break; }
+                    case 0x130: f.total = int(r.u32() & 0xffff); break;
+                    case 0x131: { uint32_t v = r.u32() & 0xffff; if (v != 0 && v < 9) f.wave = int(v); break; }
+                    case 0x12b: f.maxAlive = std::max(1, std::min(16, int(r.u32() & 0xffff))); break;
+                    case 0x134: f.minRange = ((r.u32() >> 8) & 0xff) != 0; break;  // +0x18 as a dword: byte +0x19
                     case 0x40: for (float& v : f.pos) v = r.f32(); break;
                     case 0x41: for (float& v : f.rot) v = r.f32(); break;
                     case 0x15e: f.range[0] = r.f32(); break;
                     case 0x15f: f.range[1] = r.f32(); break;
                     case 0x160: f.range[2] = r.f32(); break;
-                    case 0x135: f.templates.push_back(r.i32()); break;
+                    case 0x135: {  // FUN_1005b230: at most 16, each template once
+                        int ti = int(int16_t(r.u32() & 0xffff));
+                        if (f.templates.size() < 16 && std::find(f.templates.begin(), f.templates.end(), ti) == f.templates.end())
+                            f.templates.push_back(ti);
+                        break;
+                    }
                     default: return false;
                 }
             }
             m.fountains.push_back(f);
+        } else if (t == 0x132) {
+            m.fountainsOn = r.i32() == 3;
+        } else if (t == 0x12b) {
+            m.fountainPool = r.i32();
+        } else if (t == 0x12c) {
+            m.fountainCap = r.i32();
         } else {
-            r.u32();  // system-level scalars (0x132 active, 0x12b template count, 0x12c pool size)
+            r.u32();
         }
     }
     return true;

@@ -1,71 +1,46 @@
-// Collision volumes for static models.
+// Polygon collision for models, as the original tests it.
 //
-// The .M models carry no collision hulls (only per-mesh render BSPs, FUN_1000dd00), so the volumes are derived from
-// the drawn geometry: the triangles are sampled (skipping texels the alpha test cuts away), the samples are binned
-// into a grid of vertical columns over the model's footprint, each column keeps the height ranges that really hold
-// geometry (so gears pass under canopies, arches, bridge decks and tree crowns), roofed spaces closed in by walls are
-// filled, and neighbouring columns with matching ranges are merged into boxes.
+// HG2 has no collision hulls: the world collision pass (FUN_100a0b00) hands each pair of overlapping proxies to the
+// proxy's narrow test (FUN_100a63d0), which runs the other unit's probe segments (gear +0x2b0 / +0x370, count +0x430)
+// through every mesh frame of this object (frame vtable +0x84 = FUN_100214c0). A mesh with a render BSP is searched
+// with FUN_1000d690: a node's plane (its first polygon's stored plane, n.p + d) splits the segment, only a crossing
+// from the front side to the back (dir . n < 0) counts, the crossing point must lie inside one of the node's
+// polygons (FUN_1000d9c0, no texture alpha test) and each hit shortens the segment, so the nearest crossing wins.
+// CollMesh holds the same polygons (fanned into triangles, keeping each polygon's stored plane) in a bounding volume
+// tree instead of the file's BSP; the answer - the nearest front-face crossing - is the same.
 #pragma once
 #include <cstdint>
-#include <functional>
-#include <string>
 #include <vector>
 
-#include <memory>
-#include <unordered_map>
-
 #include "assets.h"
-#include "../core/fs.h"
 
 namespace hg2 {
 
-struct CollBox { Vec3 lo, hi; };
-struct CollShape {
-    std::vector<CollBox> boxes;
-    Vec3 lo{1e9f, 1e9f, 1e9f}, hi{-1e9f, -1e9f, -1e9f};  // bounds of all boxes (cheap reject)
-    // Boxes come in clusters with their own bounds (one per model, or one per mesh of a huge assembly), so a query
-    // only walks the boxes near it.
-    struct Cluster { Vec3 lo, hi; uint32_t first, count; };
-    std::vector<Cluster> clusters;
-    void addCluster(const std::vector<CollBox>& bs);
-    // Calls fn(box) for every box whose cluster overlaps the model-space bounds [qlo, qhi].
-    template <class F> void query(const Vec3& qlo, const Vec3& qhi, F&& fn) const {
-        if (qhi.x < lo.x || qlo.x > hi.x || qhi.y < lo.y || qlo.y > hi.y || qhi.z < lo.z || qlo.z > hi.z) return;
-        for (auto& c : clusters) {
-            if (qhi.x < c.lo.x || qlo.x > c.hi.x || qhi.y < c.lo.y || qlo.y > c.hi.y || qhi.z < c.lo.z || qlo.z > c.hi.z) continue;
-            for (uint32_t k = c.first; k < c.first + c.count; k++) fn(boxes[k]);
-        }
-    }
-};
-struct CollModel {
-    CollShape full;
-    // Only what rises from the model's base (a tree's trunk, not the branches and crown above and around it): the
-    // volume Tree_Object instances collide with.
-    CollShape trunk;
-    // audit figures
-    Vec3 meshLo{1e9f, 1e9f, 1e9f}, meshHi{-1e9f, -1e9f, -1e9f};  // all geometry
-    float cell = 0;          // column size (m)
-    int samples = 0, transparentSamples = 0, sliverTris = 0, decalMeshes = 0;
-    float solidArea = 0;     // footprint of columns that block a gear standing at the model's base (m^2)
+struct CollTri {
+    Vec3 a, b, c;
+    Vec3 n;      // the polygon's stored plane normal
+    float d = 0; // plane: n.p + d = 0
 };
 
-// Opaque test for a sample: material index (0-based, -1 none) and texture coordinates. nullptr: all opaque.
-using OpacityFn = std::function<bool(int material, float u, float v)>;
-
-// Alpha masks of the textures a model's materials name (resolved like Scene::texture: .ppm -> .TGA/.BMP), cached.
-class TextureAlpha {
-public:
-    explicit TextureAlpha(const FileSystem& fs) : fs_(fs) {}
-    OpacityFn forModel(const Model& m);  // samples with alpha < 0.5 (the renderer's alpha test) are not opaque
-
-private:
-    const Image* image(const std::string& name);  // nullptr: no alpha channel / not found
-    const FileSystem& fs_;
-    std::unordered_map<std::string, std::unique_ptr<Image>> cache_;
+struct CollHit {
+    float t = 2.f;  // fraction along the segment
+    Vec3 n;         // plane normal of the polygon hit (same space as the segment)
+    int tri = -1;
 };
 
-void buildCollision(const Model& m, const OpacityFn& opaque, CollModel& out);
-// The previous scheme (one box per frame mesh, trees split in two), kept for the audit's before/after figures.
-void legacyCollision(const Model& m, CollModel& out);
+struct CollMesh {
+    std::vector<CollTri> tris;
+    struct Node { Vec3 lo, hi; int left = -1, right = -1; uint32_t first = 0, count = 0; };
+    std::vector<Node> nodes;
+    Vec3 lo{1e9f, 1e9f, 1e9f}, hi{-1e9f, -1e9f, -1e9f};  // bounds of all polygons
+    bool empty() const { return tris.empty(); }
+    void build();  // the tree, after tris are filled
+    // Nearest front-face crossing of a -> b with t below hit.t (FUN_1000d690); updates hit and returns true if found.
+    bool segment(const Vec3& a, const Vec3& b, CollHit& hit) const;
+};
+
+// The polygons of a model in model space (frame transforms at rest), or of one frame's mesh in its own space.
+void buildCollMesh(const Model& m, CollMesh& out);
+void buildFrameCollMesh(const Model& m, int frame, CollMesh& out);
 
 }  // namespace hg2

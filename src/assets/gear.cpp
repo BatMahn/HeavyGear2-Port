@@ -61,7 +61,8 @@ bool parseGearDef(const uint8_t* p, size_t n, GearDef& g) {
                         case 0x96: g.movement2 = b.i32(); break;
                         case 0x97: g.maxWalkSpeed = b.f32(); break;
                         case 0x98: g.maxRunSpeed = b.f32(); break;
-                        case 0x99: case 0x9a: b.f32(); break;
+                        case 0x99: g.leftFoot = b.f32(); break;
+                        case 0x9a: g.rightFoot = b.f32(); break;
                         case 0x9b: g.perks = b.u32(), g.flaws = b.u32(); break;
                         default: k = 1; b.p = b.end; break;
                     }

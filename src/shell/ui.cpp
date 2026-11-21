@@ -460,7 +460,8 @@ void Ui::drawNode(const LdlNode* n, const std::string& path, const UiRect& r, in
 }
 
 // ---------------------------------------------------------------- widgets
-int Ui::listbox(const std::string& lbPath, const std::vector<std::string>& items, int sel, int& scroll, const std::string& itemTemplate) {
+int Ui::listbox(const std::string& lbPath, const std::vector<std::string>& items, int sel, int& scroll, const std::string& itemTemplate,
+                const std::vector<std::string>* column2, float column2X) {
     const LdlNode* lb = ldl_.find(lbPath);
     if (!lb) return -1;
     UiRect r = rectOf(lbPath);
@@ -486,7 +487,13 @@ int Ui::listbox(const std::string& lbPath, const std::vector<std::string>& items
             if (!hl.empty()) image(hl, ir.x, ir.y, ir.w, ir.h, idx == sel ? 0xffffffffu : 0xffffff90u, "stretch");
             else rect(ir.x, ir.y, ir.w, ir.h, idx == sel ? 0x2050a0a0u : 0x20509060u);
         }
-        textBox(items[size_t(idx)], ir, st, idx == sel ? st.down : hov ? st.hover : st.color);
+        uint32_t col = idx == sel ? st.down : hov ? st.hover : st.color;
+        if (column2 && size_t(idx) < column2->size()) {
+            textBox(items[size_t(idx)], {ir.x, ir.y, column2X, ir.h}, st, col);
+            textBox((*column2)[size_t(idx)], {ir.x + column2X, ir.y, ir.w - column2X, ir.h}, st, col);
+        } else {
+            textBox(items[size_t(idx)], ir, st, col);
+        }
         if (hov && released_ && pressedOn_ == "#lb" + lbPath) {
             result = idx;
             playSound(ldl_.getStr(lb, "executesound", "general.wav"));

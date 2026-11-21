@@ -249,6 +249,23 @@ int main(int argc, char** argv) {
     } else if (!missionName.empty()) {
         MissionSetup setup;
         setup.mission = missionName;
+        // the space flag (DAT_1026667c + 0x14d) comes from the mission's own briefing record, as in the shell: the
+        // .MSN named after the mission, else the one whose .ANN is this mission (hg2shell.prj)
+        {
+            std::string id = upper(missionName);
+            if (id.size() > 4 && id.substr(id.size() - 4) == ".ANN") id.resize(id.size() - 4);
+            Bytes b;
+            MsnInfo m;
+            bool found = app.fs.read(id + ".MSN", b) && parseMsn(b, m);
+            if (!found)
+                for (auto& n : app.fs.shell().names()) {
+                    if (n.size() < 4 || upper(n.substr(n.size() - 4)) != ".MSN") continue;
+                    MsnInfo k;
+                    if (app.fs.read(n, b) && parseMsn(b, k) && upper(k.id) == id) { m = k, found = true; break; }
+                }
+            if (found) setup.space = m.space;
+            if (found && m.space) SDL_Log("mission %s: space (from its briefing record)", id.c_str());
+        }
         // test: squad mates / instant-action waves on any mission
         for (int i = 0; i < squadTest; i++) setup.squad.push_back({"Mate " + std::to_string(i + 1), {}});
         if (wavesTest > 0) {
@@ -262,6 +279,8 @@ int main(int argc, char** argv) {
             fprintf(stderr, "%s\n", r.error.c_str());
             rc = 1;
         }
+        static const char* kOutcome[] = {"failure", "success", "alternate", "aborted", "quit", "error"};
+        printf("mission over: %s after %.0f s\n", kOutcome[r.outcome], r.time);
         if (!app.offscreen) app.settings.save(app.prefDir + "settings.cfg");
     } else {
         Shell shell(app);

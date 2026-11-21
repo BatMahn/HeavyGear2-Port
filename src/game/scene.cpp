@@ -127,14 +127,10 @@ GpuMesh* Scene::model(const std::string& name) {
         std::vector<DrawBatch> batches;
         appendModel(m, v, batches);
         mesh = r_.createMesh(v, std::move(batches));
-        // collision volumes from the drawn geometry (see collision.h)
-        CollModel& cs = boxes_[key];
-        if (getenv("HG2_COLLIDE_LEGACY")) legacyCollision(m, cs);  // A/B test: the old one-box-per-mesh volumes
-        else buildCollision(m, alpha_.forModel(m), cs);
-        if (getenv("HG2_COLLDBG"))
-            SDL_Log("collision %s: %zu boxes (%zu from the base), cell %.1f m, %d%% of the surface cut away by alpha", key.c_str(),
-                    cs.full.boxes.size(), cs.trunk.boxes.size(), cs.cell,
-                    cs.samples ? 100 * cs.transparentSamples / cs.samples : 0);
+        // the polygons the collision pass tests (collision.h)
+        auto cm = std::make_unique<CollMesh>();
+        buildCollMesh(m, *cm);
+        coll_[key] = std::move(cm);
     } else {
         SDL_Log("model not found: %s", name.c_str());
     }
@@ -157,6 +153,31 @@ Scene::Rigged* Scene::rigged(const std::string& name) {
         std::vector<DrawBatch> batches;
         if (rg->model.frames[i].mesh >= 0) appendModel(rg->model, v, batches, int(i));
         rg->parts.push_back(v.empty() ? nullptr : r_.createMesh(v, std::move(batches)));
+        std::unique_ptr<CollMesh> cm;
+        if (rg->model.frames[i].mesh >= 0) {
+            cm = std::make_unique<CollMesh>();
+            buildFrameCollMesh(rg->model, int(i), *cm);
+            if (cm->empty()) cm.reset();
+        }
+        rg->coll.push_back(std::move(cm));
+    }
+    {
+        // FUN_10017ff0: the bounding sphere at rest - the box of the whole hierarchy (FUN_10018af0) gives the centre,
+        // the farthest vertex from it the radius (FUN_10018f80)
+        CollMesh all;
+        buildCollMesh(rg->model, all);
+        if (!all.empty()) {
+            rg->centre = (all.lo + all.hi) * 0.5f;
+            float r2 = 0;
+            for (auto& t : all.tris)
+                for (const Vec3* q : {&t.a, &t.b, &t.c}) r2 = std::max(r2, dot(*q - rg->centre, *q - rg->centre));
+            rg->radius = std::sqrt(r2);
+        }
+        // FUN_100a79b0: with no centre frame named by the owner (+0x158), the middle one of the mesh frames
+        std::vector<int> meshFrames;
+        for (size_t i = 0; i < rg->model.frames.size(); i++)
+            if (rg->coll[i]) meshFrames.push_back(int(i));
+        if (!meshFrames.empty()) rg->middle = meshFrames[meshFrames.size() / 2];
     }
     Rigged* p = rg.get();
     rigged_[key] = std::move(rg);
@@ -254,6 +275,15 @@ void Scene::walkPose(const Instance& i, const std::function<void(int, const Fram
     walk(0, i.world, false, false, 0);
 }
 
+bool Scene::objectWorld(int object, Mat4& out) const {
+    for (auto& i : instances_)
+        if (i.object == object) {
+            out = i.world;
+            return true;
+        }
+    return false;
+}
+
 bool Scene::objectPosition(int object, Vec3& out) const {
     for (auto& i : instances_)
         if (i.object == object) {
@@ -269,6 +299,118 @@ bool Scene::objectAxis(int object, int row, Vec3& out) const {
             out = Vec3(i.world.m[row][0], i.world.m[row][1], i.world.m[row][2]);
             return true;
         }
+    return false;
+}
+
+bool Scene::frameWorldMatrix(int object, const std::string& frame, Mat4& out) const {
+    for (auto& i : instances_) {
+        if (i.object != object || !i.rig) continue;
+        bool found = false;
+        walkPose(i, [&](int, const Frame& f, const Mat4& w, bool) {
+            if (!found && frameIs(f.name, frame)) out = w, found = true;
+        });
+        return found;
+    }
+    return false;
+}
+
+const Scene::GenGraph* Scene::walkGraph(int object) {
+    auto it = genGraphs_.find(object);
+    if (it != genGraphs_.end()) return it->second.get();
+    std::unique_ptr<GenGraph>& g = genGraphs_[object];
+    const auto& objs = mission_.objects;
+    if (object < 0 || size_t(object) >= objs.size() || objs[size_t(object)].walkGraph.empty()) return nullptr;
+    Bytes text;
+    if (!fs_.read(objs[size_t(object)].walkGraph, text) && !fs_.read("Objects/" + objs[size_t(object)].walkGraph, text)) {
+        SDL_Log("walkable graph not found: %s", objs[size_t(object)].walkGraph.c_str());
+        return nullptr;
+    }
+    std::string src(text.begin(), text.end()), geom;
+    std::vector<std::pair<int, std::vector<int>>> verts;
+    size_t pos = 0;
+    while (pos < src.size()) {
+        size_t eol = src.find('\n', pos);
+        if (eol == std::string::npos) eol = src.size();
+        std::string line = src.substr(pos, eol - pos);
+        pos = eol + 1;
+        size_t a = line.find_first_not_of(" \t\r");
+        if (a == std::string::npos || line[a] == '#') continue;
+        line = line.substr(a);
+        if (line.compare(0, 14, "Geometry_File:") == 0) {
+            size_t b = line.find_first_not_of(" \t\"", 14);
+            if (b != std::string::npos) {
+                size_t e = line.find_first_of(" \t\r\"}", b);
+                geom = line.substr(b, e == std::string::npos ? std::string::npos : e - b);
+            }
+        } else if (line.compare(0, 6, "Vertex") == 0) {
+            int n = -1;
+            std::vector<int> l;
+            const char* c = line.c_str() + 6;
+            char* end = nullptr;
+            n = int(std::strtol(c, &end, 10));
+            const char* b = std::strchr(end, '{');
+            for (c = b ? b + 1 : end; c && *c && *c != '}';) {
+                long v = std::strtol(c, &end, 10);
+                if (end == c) { c++; continue; }
+                l.push_back(int(v)), c = end;
+            }
+            verts.push_back({n, l});
+        }
+    }
+    // the geometry (.six names the model the sim ships as .M)
+    std::string key = upper(geom);
+    size_t dot = key.rfind('.');
+    if (dot != std::string::npos) key = key.substr(0, dot) + ".M";
+    Bytes mb;
+    Model m;
+    if (geom.empty() || !fs_.read(modelKey(fs_, key), mb) || !loadModel(mb, m) || m.frames.empty()) {
+        SDL_Log("walkable graph %s: geometry %s not loaded", objs[size_t(object)].walkGraph.c_str(), geom.c_str());
+        return nullptr;
+    }
+    Mat4 root = Mat4::identity();
+    for (auto& i : instances_)
+        if (i.object == object) root = i.world;
+    auto ng = std::make_unique<GenGraph>();
+    std::function<void(int, const Mat4&)> walk = [&](int fi, const Mat4& parent) {
+        while (fi >= 0 && size_t(fi) < m.frames.size() && ng->nodes.size() < 0x800) {
+            const Frame& f = m.frames[size_t(fi)];
+            Mat4 w = fi == 0 ? root : frameMatrix(f) * parent;
+            ng->nodes.push_back(Vec3(w.m[3][0], w.m[3][1], w.m[3][2]));
+            if (f.child >= 0) walk(f.child, w);
+            fi = f.sibling;
+        }
+    };
+    walk(0, Mat4::identity());
+    ng->links.assign(ng->nodes.size(), {});
+    ng->taken.assign(ng->nodes.size(), false);
+    for (auto& [n, l] : verts)  // FUN_10084f90 keeps a Vertex line only for a node that exists
+        if (n >= 0 && size_t(n) < ng->nodes.size() && !l.empty()) ng->links[size_t(n)] = l;
+    SDL_Log("walkable graph %s on object %d: %zu nodes, %zu linked", objs[size_t(object)].walkGraph.c_str(), object,
+            ng->nodes.size(), verts.size());
+    g = std::move(ng);
+    return g.get();
+}
+
+bool Scene::graphNodeAt(const Vec3& p, int& object, int& node) {
+    auto cheb = [](const Vec3& a, const Vec3& b) { return std::max({std::fabs(a.x - b.x), std::fabs(a.y - b.y), std::fabs(a.z - b.z)}); };
+    const auto& objs = mission_.objects;
+    for (size_t o = 0; o < objs.size(); o++) {
+        if (objs[o].walkGraph.empty() || objectHidden(int(o))) continue;
+        const GenGraph* g = walkGraph(int(o));
+        Vec3 op;
+        if (!g || g->nodes.empty() || !objectPosition(int(o), op) || cheb(op, p) > objectRadius(int(o))) continue;
+        float best = 1e30f;
+        int bi = -1;
+        for (size_t n = 0; n < g->nodes.size(); n++) {
+            float d = cheb(g->nodes[n], p);
+            if (d < best) {
+                best = d, bi = int(n);
+                if (d <= 2.f) break;
+            }
+        }
+        object = int(o), node = bi;
+        return bi >= 0;
+    }
     return false;
 }
 
@@ -411,7 +553,7 @@ void Scene::setFrameDamage(int object, const std::string& frame, const std::stri
 
 void Scene::hideFrame(int object, const std::string& frame) {
     for (auto& i : instances_)
-        if (i.object == object) i.hiddenFrames.push_back(lower(frame));
+        if (i.object == object) i.hiddenFrames.push_back(lower(frame)), i.poseDirty = true;
 }
 
 void Scene::buildTerrain() {
@@ -473,6 +615,46 @@ void Scene::buildTerrain() {
     terrainMesh_ = r_.createMesh(all, std::move(batches));
 }
 
+// FUN_1003f950 (on the bridge's first update) / FUN_1003f6a0: the ends are the frames HP1 and HP2, each put on the
+// ground under it (FUN_100a4070) and then both at the lower height; the box is the object's (FUN_10019df0); the
+// widths come from FUN_1003f370 (the smaller horizontal size w of the box: +0xe80 w, +0xe88 w / 2, +0xe84 w / 8).
+void Scene::addBridge(int idx, const std::string& mdl) {
+    const Instance& i = instances_[size_t(idx)];
+    Bytes b;
+    Model m;
+    if (!fs_.read(modelKey(fs_, mdl), b) || !loadModel(b, m)) return;
+    Bridge br;
+    br.object = i.object;
+    int found = 0;
+    std::function<void(int, const Mat4&)> walk = [&](int fi, const Mat4& parent) {
+        while (fi >= 0 && fi < int(m.frames.size())) {
+            const Frame& f = m.frames[size_t(fi)];
+            Mat4 w = frameMatrix(f) * parent;
+            for (int k = 0; k < 2; k++)
+                if (frameIs(f.name, k ? "hp2" : "hp1")) {
+                    Mat4 ww = w * i.world;
+                    br.end[k] = Vec3(ww.m[3][0], ww.m[3][1], ww.m[3][2]);
+                    br.axis[k] = normalize(Vec3(ww.m[2][0], ww.m[2][1], ww.m[2][2]));
+                    br.xaxis[k] = normalize(Vec3(ww.m[0][0], ww.m[0][1], ww.m[0][2]));
+                    found |= 1 << k;
+                }
+            if (f.child >= 0) walk(f.child, w);
+            fi = f.sibling;
+        }
+    };
+    walk(0, Mat4::identity());
+    if (found != 3) return;
+    for (auto& e : br.end) e.y = groundHeight(e.x, e.z);
+    br.end[0].y = br.end[1].y = std::min(br.end[0].y, br.end[1].y);
+    instanceBox(i, br.lo, br.hi);
+    float w = std::min(br.hi.x - br.lo.x, br.hi.z - br.lo.z);
+    br.halfW = w * 0.5f, br.lineTol = w * 0.125f;
+    bridgeOf_[size_t(idx)] = int(bridges_.size());
+    bridges_.push_back(br);
+    SDL_Log("bridge %d: ends %.0f,%.1f,%.0f and %.0f,%.1f,%.0f", br.object, br.end[0].x, br.end[0].y, br.end[0].z, br.end[1].x,
+            br.end[1].y, br.end[1].z);
+}
+
 void Scene::addInstance(size_t index) {
         const MissionObject& o = mission_.objects[index];
         if (o.defIndex < 0 || size_t(o.defIndex) >= mission_.defs.size()) return;
@@ -496,22 +678,24 @@ void Scene::addInstance(size_t index) {
         // Light_Information (0x43): the factory makes the light, gives it the object's name and placement and then
         // releases the object itself (lampicon.m is the editor's icon).
         if ((o.type >= 0x56 && o.type <= 0x59) || o.isLight) inst.noDraw = true;
+        // In the collision world (FUN_100a5820) unless the class constructor cleared the object's [5] bit 0x40000:
+        // Object_NoColl (0x162, also [4] & ~0x10000) and Plane_NoColl (0x61) (object factories FUN_10085570 /
+        // FUN_100883d0). Tree_Object (0x47) instances are made by FUN_10079ef0 (vtable 0x10145c38) into the tree list
+        // (DAT_101fcd78) that the mission loader (FUN_1008dba0) adds to the world's plain object list (+0x2858) only:
+        // trees have no proxy, so nothing collides with them. The spawn point markers (0x56-0x59) never join the
+        // object lists and lights release their object (see above); 0x5c is a marker too.
+        bool noColl = o.type == 0x162 || o.type == 0x61 || o.type == 0x47 || (o.type >= 0x56 && o.type <= 0x59) ||
+                      o.type == 0x5c || o.isLight;
+        inst.collides = !noColl;
+        // Unit classes (biped 0x48, Jeep 0x4e, hovertank 0x4f, infantry 0x50, mount 0x51, chicken walker 0x52, frame
+        // 0x53, ghosts 0x13d - FUN_10066d10, a unit with a brain): dynamic proxies, tested against other units only in
+        // pairs that hold the player (FUN_100a0b00), and never obstacles for the pathfinder (vehicle base [4] bit)
+        inst.unit = (o.type >= 0x48 && o.type <= 0x53 && o.type != 0x49 && o.type != 0x4a && o.type != 0x4b &&
+                     o.type != 0x4c && o.type != 0x4d) || o.type == 0x13d;
         if (inst.mesh) {
             std::string key = modelKey(fs_, mdl);
-            auto bi = boxes_.find(key);
-            // No collision volume: Object_NoColl (0x162) and Plane_NoColl (0x61) - classes whose constructors clear the
-            // object's collision flag bits (object factories FUN_10085570 / FUN_100883d0) -, the spawn point markers (0x56-0x59)
-            // and light icons.
-            bool marker = (o.type == 0x162 || o.type == 0x61 || (o.type >= 0x56 && o.type <= 0x59) || o.type == 0x5c || o.isLight) &&
-                          !getenv("HG2_COLLIDE_LEGACY");
-            // Tree_Object: only the trunk stands in the way; gears brush through branches and crowns.
-            const CollShape* cs = bi == boxes_.end() || marker ? nullptr : o.type == 0x47 ? &bi->second.trunk : &bi->second.full;
-            if (cs && !cs->boxes.empty()) inst.boxes = cs;
-            // Jeeps (0x4e) and hovertanks (0x4f): the world collision pass (FUN_100a0b00 -> vtable +0x88 on both
-            // objects) reaches them like any unit, but their contact handler is the empty FUN_10004590 (gears note the
-            // other object, FUN_10036280; the base vehicle flags itself, FUN_100045c0) and nothing pushes units apart, so
-            // nothing is stopped by them: their boxes take hits only.
-            if (o.type == 0x4e || o.type == 0x4f) inst.solid = false;
+            auto ci = coll_.find(key);
+            if (ci != coll_.end() && ci->second && !ci->second->empty() && inst.collides) inst.coll = ci->second.get();
             // rigid inverse: transpose the rotation, rotate the negated translation
             Mat4 inv = Mat4::identity();
             for (int r2 = 0; r2 < 3; r2++)
@@ -522,6 +706,16 @@ void Scene::addInstance(size_t index) {
             inst.inv = inv;
         }
         instances_.push_back(inst);
+        int idx = int(instances_.size()) - 1;
+        if (bridgeOf_.size() < instances_.size()) bridgeOf_.resize(instances_.size(), -1);
+        if (o.type == 0x13f && instances_.back().coll) addBridge(idx, mdl);
+        if (!o.walkGraph.empty()) addWalkGraph(idx, o.walkGraph);
+        if (instances_.back().coll) {
+            instanceBox(instances_.back(), instances_.back().wlo, instances_.back().whi);
+            gridInsert(idx);
+        } else if (instances_.back().rig && instances_.back().collides) {
+            movers_.push_back(idx);
+        }
     }
 
 int Scene::addObject(const MissionObject& o) {
@@ -569,6 +763,7 @@ bool Scene::load(const std::string& missionName, std::string* err, const std::fu
         w = {v(-4096, -4096), v(8192, -4096), v(8192, 8192), v(-4096, -4096), v(8192, 8192), v(-4096, 8192)};
         waterMesh_ = r_.createMesh(w, {{tex, 0, 6, true, false}});
     }
+    grid_.assign(128 * 128, {});
     for (size_t i = 0; i < mission_.objects.size(); i++) addInstance(i);
     return true;
 }
@@ -611,37 +806,6 @@ void Scene::render(const FrameParams& fp) {
         }
     }
     if (waterMesh_) r_.draw(waterMesh_, Mat4::translate(Vec3(0, waterLevel() - mission_.waterLevel, 0)), false);
-    if (getenv("HG2_COLLVIEW")) drawCollision();
-}
-
-// HG2_COLLVIEW: the static collision boxes as translucent red blocks (debug view; built once, in world space, from
-// the instances placed at the time - moving units with boxes are not followed).
-void Scene::drawCollision() {
-    if (!boxMesh_) {
-        std::vector<Vertex> v;
-        for (auto& i : instances_) {
-            if (!i.boxes || i.hidden) continue;
-            for (auto& b : i.boxes->boxes) {
-                Vec3 c[8];
-                const float e = 0.08f;  // a little proud of the surfaces they hug, so they don't z-fight
-                for (int k = 0; k < 8; k++)
-                    c[k] = i.world.transformPoint(Vec3(k & 1 ? b.hi.x + e : b.lo.x - e, k & 2 ? b.hi.y + e : b.lo.y - e, k & 4 ? b.hi.z + e : b.lo.z - e));
-                auto quad = [&](int a0, int b0, int c0, int d0, uint8_t shade) {
-                    for (int k : {a0, b0, c0, a0, c0, d0}) {
-                        Vertex o{};
-                        o.pos[0] = c[k].x, o.pos[1] = c[k].y, o.pos[2] = c[k].z;
-                        o.normal[1] = 1;
-                        o.color[0] = shade, o.color[1] = uint8_t(shade / 5), o.color[2] = uint8_t(shade / 5), o.color[3] = 255;
-                        v.push_back(o);
-                    }
-                };
-                quad(0, 1, 5, 4, 160), quad(2, 6, 7, 3, 255), quad(0, 2, 3, 1, 200), quad(4, 5, 7, 6, 200), quad(0, 4, 6, 2, 230), quad(1, 3, 7, 5, 230);
-            }
-        }
-        if (v.empty()) return;
-        boxMesh_ = r_.createMesh(v, {{r_.whiteTexture(), 0, uint32_t(v.size()), true, false}});
-    }
-    r_.draw(boxMesh_, Mat4::identity(), false, 0.45f);
 }
 
 void Scene::setObjectPose(int object, const Vec3& pos, float yaw, int animSet, float frame) {
@@ -651,98 +815,241 @@ void Scene::setObjectPose(int object, const Vec3& pos, float yaw, int animSet, f
             i.inv = Mat4::translate(Vec3(-pos.x, -pos.y, -pos.z)) * Mat4::rotY(-yaw);
             i.set = animSet;
             i.frame = frame;
+            i.poseDirty = true;
+            if (i.coll) {  // a static model placed again (dropships, trains, elevators): its box follows it
+                instanceBox(i, i.wlo, i.whi);
+                if (!i.mover) i.mover = true, movers_.push_back(int(&i - instances_.data()));
+            }
         }
 }
 
 void Scene::setObjectFade(int object, int animSet, float frame, float weight) {
     for (auto& i : instances_)
-        if (i.object == object) i.fadeSet = weight > 0 ? animSet : -1, i.fadeFrame = frame, i.fadeWeight = weight;
+        if (i.object == object) i.fadeSet = weight > 0 ? animSet : -1, i.fadeFrame = frame, i.fadeWeight = weight, i.poseDirty = true;
 }
 
 void Scene::setObjectOverlay(int object, int animSet, float frame, const std::string& rootFrame) {
     for (auto& i : instances_)
-        if (i.object == object) i.overlaySet = animSet, i.overlayFrame = frame, i.overlayRoot = lower(rootFrame);
+        if (i.object == object) i.overlaySet = animSet, i.overlayFrame = frame, i.overlayRoot = lower(rootFrame), i.poseDirty = true;
 }
 
 void Scene::clearDamage(int object) {
     for (auto& i : instances_)
-        if (i.object == object) i.hiddenFrames.clear(), i.damagedFrames.clear(), i.hidden = false;
+        if (i.object == object) i.hiddenFrames.clear(), i.damagedFrames.clear(), i.hidden = false, i.poseDirty = true;
 }
 
-bool Scene::collide(Vec3& pos, float radius, float height, int ignoreObject) const {
-    bool hit = false;
-    for (auto& i : instances_) {
-        if (!i.boxes || !i.solid || i.object == ignoreObject || i.hidden) continue;
-        Vec3 lp = i.inv.transformPoint(pos);
-        bool hitHere = false;
-        // boxes reaching above the knee (1.2 m step) and below the head; others are stepped over / walked under
-        i.boxes->query(Vec3(lp.x - radius, lp.y + 1.2f, lp.z - radius), Vec3(lp.x + radius, lp.y + height, lp.z + radius), [&](const CollBox& b) {
-            if (lp.x < b.lo.x - radius || lp.x > b.hi.x + radius || lp.z < b.lo.z - radius || lp.z > b.hi.z + radius) return;
-            if (b.hi.y < lp.y + 1.2f || b.lo.y > lp.y + height) return;
-            float cx = std::max(b.lo.x, std::min(lp.x, b.hi.x)), cz = std::max(b.lo.z, std::min(lp.z, b.hi.z));
-            float dx = lp.x - cx, dz = lp.z - cz, d2 = dx * dx + dz * dz;
-            if (d2 >= radius * radius) return;
-            if (d2 > 1e-6f) {
-                float d = std::sqrt(d2), push = radius - d;
-                lp.x += dx / d * push, lp.z += dz / d * push;
-            } else {  // centre inside the box: leave by the nearest side
-                float e[4] = {lp.x - b.lo.x, b.hi.x - lp.x, lp.z - b.lo.z, b.hi.z - lp.z};
-                int k = int(std::min_element(e, e + 4) - e);
-                if (k == 0) lp.x = b.lo.x - radius;
-                else if (k == 1) lp.x = b.hi.x + radius;
-                else if (k == 2) lp.z = b.lo.z - radius;
-                else lp.z = b.hi.z + radius;
-            }
-            hit = hitHere = true;
-            if (getenv("HG2_COLLDBG") && ignoreObject == atoi(getenv("HG2_COLLDBG")))
-                SDL_Log("collide obj %d (%s) box (%.1f %.1f %.1f)-(%.1f %.1f %.1f) at %.0f,%.0f", i.object,
-                        i.object >= 0 && size_t(i.object) < mission_.objects.size() ? mission_.objects[size_t(i.object)].name.c_str() : "?",
-                        b.lo.x, b.lo.y, b.lo.z, b.hi.x, b.hi.y, b.hi.z, pos.x, pos.z);
-        });
-        if (hitHere) pos = i.world.transformPoint(lp);
+namespace {
+// world -> local for an affine row-vector matrix (animation keys may carry scale, so not just the transpose)
+Mat4 affineInverse(const Mat4& m) {
+    float a = m.m[0][0], b = m.m[0][1], c = m.m[0][2], d = m.m[1][0], e = m.m[1][1], f = m.m[1][2], g = m.m[2][0],
+          h = m.m[2][1], k = m.m[2][2];
+    float A = e * k - f * h, B = -(d * k - f * g), C = d * h - e * g;
+    float det = a * A + b * B + c * C;
+    Mat4 r = Mat4::identity();
+    if (std::fabs(det) < 1e-12f) return r;
+    float id = 1.f / det;
+    r.m[0][0] = A * id, r.m[0][1] = -(b * k - c * h) * id, r.m[0][2] = (b * f - c * e) * id;
+    r.m[1][0] = B * id, r.m[1][1] = (a * k - c * g) * id, r.m[1][2] = -(a * f - c * d) * id;
+    r.m[2][0] = C * id, r.m[2][1] = -(a * h - b * g) * id, r.m[2][2] = (a * e - b * d) * id;
+    Vec3 t(m.m[3][0], m.m[3][1], m.m[3][2]);
+    Vec3 it = r.transformDir(t);
+    r.m[3][0] = -it.x, r.m[3][1] = -it.y, r.m[3][2] = -it.z;
+    return r;
+}
+int tileOf(float v) { return std::clamp(int(std::floor(v / 32.f)), 0, 127); }
+}  // namespace
+
+void Scene::posed(const Instance& i) const {
+    if (!i.rig) return;
+    size_t n = i.rig->model.frames.size();
+    if (!i.poseDirty && i.pose.size() == n) return;
+    i.pose.assign(n, Mat4::identity());
+    i.poseHidden.assign(n, 0);
+    walkPose(i, [&](int fi, const Frame&, const Mat4& w, bool hid) {
+        if (fi >= 0 && size_t(fi) < n) i.pose[size_t(fi)] = w, i.poseHidden[size_t(fi)] = hid;
+    });
+    i.poseDirty = false;
+}
+
+// The proxy's box (FUN_100a5ff0 / FUN_100a6240): a static model's world box, at least 1 m on each axis; a rigged
+// unit's bounding sphere.
+void Scene::instanceBox(const Instance& i, Vec3& lo, Vec3& hi) const {
+    lo = Vec3(1e9f, 1e9f, 1e9f), hi = Vec3(-1e9f, -1e9f, -1e9f);
+    if (i.coll) {
+        const Vec3 &a = i.coll->lo, &b = i.coll->hi;
+        for (int k = 0; k < 8; k++) {
+            Vec3 p = i.world.transformPoint(Vec3(k & 1 ? b.x : a.x, k & 2 ? b.y : a.y, k & 4 ? b.z : a.z));
+            lo = Vec3(std::min(lo.x, p.x), std::min(lo.y, p.y), std::min(lo.z, p.z));
+            hi = Vec3(std::max(hi.x, p.x), std::max(hi.y, p.y), std::max(hi.z, p.z));
+        }
+        // FUN_100a6240: an axis thinner than 1 m is widened by 0.5 m each way
+        if (hi.x - lo.x < 1.f) lo.x -= 0.5f, hi.x += 0.5f;
+        if (hi.y - lo.y < 1.f) lo.y -= 0.5f, hi.y += 0.5f;
+        if (hi.z - lo.z < 1.f) lo.z -= 0.5f, hi.z += 0.5f;
+    } else if (i.rig && i.rig->radius > 0) {
+        Vec3 c = i.world.transformPoint(i.rig->centre);
+        float r = i.rig->radius;
+        lo = c - Vec3(r, r, r), hi = c + Vec3(r, r, r);
     }
-    return hit;
+}
+
+void Scene::gridInsert(int idx) {
+    const Instance& i = instances_[size_t(idx)];
+    if (grid_.empty() || i.whi.x < i.wlo.x) return;
+    for (int tz = tileOf(i.wlo.z); tz <= tileOf(i.whi.z); tz++)
+        for (int tx = tileOf(i.wlo.x); tx <= tileOf(i.whi.x); tx++) grid_[size_t(tz * 128 + tx)].push_back(idx);
+}
+
+bool Scene::segmentInstance(const Instance& i, const Vec3& a, const Vec3& b, SegmentHit& hit, int object) const {
+    bool found = false;
+    if (i.coll) {
+        CollHit ch;
+        ch.t = hit.t;
+        if (i.coll->segment(i.inv.transformPoint(a), i.inv.transformPoint(b), ch)) {
+            hit.t = ch.t, hit.n = normalize(i.world.transformDir(ch.n)), hit.object = object;
+            found = true;
+        }
+    } else if (i.rig) {
+        posed(i);
+        for (size_t fi = 0; fi < i.rig->coll.size() && fi < i.pose.size(); fi++) {
+            const CollMesh* cm = i.rig->coll[fi].get();
+            if (!cm || i.poseHidden[fi]) continue;
+            Mat4 inv = affineInverse(i.pose[fi]);
+            CollHit ch;
+            ch.t = hit.t;
+            if (cm->segment(inv.transformPoint(a), inv.transformPoint(b), ch)) {
+                hit.t = ch.t, hit.n = normalize(i.pose[fi].transformDir(ch.n)), hit.object = object;
+                found = true;
+            }
+        }
+    }
+    return found;
+}
+
+bool Scene::segment(const Vec3& a, const Vec3& b, int ignoreObject, int units, SegmentHit& hit, bool endInBox) const {
+    static const bool prof = getenv("HG2_PROF") != nullptr;
+    Uint64 t0 = prof ? SDL_GetTicksNS() : 0;
+    struct Done {
+        const Scene* s; Uint64 t0;
+        ~Done() { if (t0) s->profNs += SDL_GetTicksNS() - t0, s->profCalls++; }
+    } done{this, t0};
+    Vec3 lo(std::min(a.x, b.x), std::min(a.y, b.y), std::min(a.z, b.z)), hi(std::max(a.x, b.x), std::max(a.y, b.y), std::max(a.z, b.z));
+    if (seen_.size() < instances_.size()) seen_.resize(instances_.size(), 0);
+    if (++seenStamp_ == 0) std::fill(seen_.begin(), seen_.end(), 0), seenStamp_ = 1;
+    bool found = false;
+    auto test = [&](int idx) {
+        if (seen_[size_t(idx)] == seenStamp_) return;
+        seen_[size_t(idx)] = seenStamp_;
+        const Instance& i = instances_[size_t(idx)];
+        if (i.hidden || !i.collides || i.object == ignoreObject || (!i.coll && !i.rig)) return;
+        if (i.unit && (units == -1 || (units >= 0 && i.object != units))) return;
+        Vec3 blo = i.wlo, bhi = i.whi;
+        if (!i.coll) instanceBox(i, blo, bhi);
+        if (hi.x < blo.x || lo.x > bhi.x || hi.y < blo.y || lo.y > bhi.y || hi.z < blo.z || lo.z > bhi.z) return;
+        if (endInBox) {
+            auto in = [&](const Vec3& p) {
+                return p.x >= blo.x && p.x <= bhi.x && p.y >= blo.y && p.y <= bhi.y && p.z >= blo.z && p.z <= bhi.z;
+            };
+            if (!in(a) && !in(b)) return;
+        }
+        if (segmentInstance(i, a, b, hit, i.object)) found = true;
+    };
+    if (!grid_.empty())
+        for (int tz = tileOf(lo.z); tz <= tileOf(hi.z); tz++)
+            for (int tx = tileOf(lo.x); tx <= tileOf(hi.x); tx++)
+                for (int idx : grid_[size_t(tz * 128 + tx)])
+                    if (!instances_[size_t(idx)].mover) test(idx);
+    for (int idx : movers_) test(idx);
+    return found;
 }
 
 int Scene::raycast(const Vec3& a, const Vec3& b, int ignoreObject, float& tOut) const {
-    int best = -1;
-    tOut = 2.f;
-    for (auto& i : instances_) {
-        if (i.object == ignoreObject || i.hidden) continue;
-        if (!i.boxes) {
-            if (!i.rig) continue;
-            // animated units: test a 2.5 m x 7 m cylinder-ish box around the origin
-            Vec3 o(i.world.m[3][0], i.world.m[3][1], i.world.m[3][2]);
-            Vec3 d = b - a;
-            float dd = dot(d, d);
-            if (dd <= 0) continue;
-            Vec3 c = o + Vec3(0, 3.5f, 0);
-            float t = std::max(0.f, std::min(1.f, dot(c - a, d) / dd));
-            Vec3 p = a + d * t;
-            if (std::fabs(p.y - c.y) < 3.5f && (p.x - c.x) * (p.x - c.x) + (p.z - c.z) * (p.z - c.z) < 2.5f * 2.5f && t < tOut)
-                tOut = t, best = i.object;
-            continue;
+    SegmentHit h;
+    segment(a, b, ignoreObject, -2, h);
+    tOut = h.t;
+    return h.object;
+}
+
+bool Scene::bridgeWalkable(const Bridge& b, const Vec3& p, int& end) const {
+    end = -1;
+    // FUN_1003faa0: inside the object's box
+    bool inside = p.x >= b.lo.x && p.x <= b.hi.x && p.y >= b.lo.y && p.y <= b.hi.y && p.z >= b.lo.z && p.z <= b.hi.z;
+    float proj[2] = {-1.f, -1.f};
+    for (int k = 0; k < 2; k++) {  // FUN_10040430
+        const Vec3& t = b.end[k];
+        if (p.y < t.y - 1.f) continue;
+        if (std::fabs(p.x - t.x) <= b.square && std::fabs(p.z - t.z) <= b.square) {  // FUN_10040360: the end's square
+            end = k;
+            return true;
         }
-        Vec3 la = i.inv.transformPoint(a), lb = i.inv.transformPoint(b), d = lb - la;
-        Vec3 qlo(std::min(la.x, lb.x), std::min(la.y, lb.y), std::min(la.z, lb.z)), qhi(std::max(la.x, lb.x), std::max(la.y, lb.y), std::max(la.z, lb.z));
-        i.boxes->query(qlo, qhi, [&](const CollBox& bx) {  // slab test
-            float t0 = 0, t1 = 1;
-            const float lo[3] = {bx.lo.x, bx.lo.y, bx.lo.z}, hi[3] = {bx.hi.x, bx.hi.y, bx.hi.z};
-            const float o[3] = {la.x, la.y, la.z}, dv[3] = {d.x, d.y, d.z};
-            for (int k = 0; k < 3; k++) {
-                if (std::fabs(dv[k]) < 1e-6f) {
-                    if (o[k] < lo[k] || o[k] > hi[k]) return;
-                    continue;
-                }
-                float u0 = (lo[k] - o[k]) / dv[k], u1 = (hi[k] - o[k]) / dv[k];
-                if (u0 > u1) std::swap(u0, u1);
-                t0 = std::max(t0, u0), t1 = std::min(t1, u1);
-                if (t0 > t1) return;
-            }
-            if (t0 < tOut) tOut = t0, best = i.object;
-        });
+        proj[k] = dot(p - t, b.axis[k]);
+        if (proj[k] >= 0) return inside || length(p - t) <= b.halfW;  // past the end, off the bridge
     }
-    return best;
+    // between the ends, at deck height, near the line joining them (FUN_100b5c40)
+    if (p.y >= b.end[0].y - 1.f && proj[0] < 0 && proj[1] < 0) {
+        Vec3 d = b.end[1] - b.end[0];
+        float dd = dot(d, d), u = dd > 0 ? std::clamp(dot(p - b.end[0], d) / dd, 0.f, 1.f) : 0.f;
+        if (length(p - (b.end[0] + d * u)) < b.lineTol) return true;
+    }
+    return false;
+}
+
+int Scene::objectTest(const Vec3& p, float r, int self, int* by, int* end) const {
+    if (end) *end = -1;
+    if (grid_.empty()) return 0;
+    auto test = [&](int idx) {
+        const Instance& i = instances_[size_t(idx)];
+        if (i.hidden || !i.coll || i.object == self || i.unit) return 0;
+        if (size_t(idx) < bridgeOf_.size() && bridgeOf_[size_t(idx)] >= 0) {  // vtable +0xb4 / +0xb8
+            int e;
+            int bi = bridgeOf_[size_t(idx)];
+            if (bridgeWalkable(bridges_[size_t(bi)], p, e)) {
+                if (end && e >= 0) *end = bi * 2 + e;
+                if (by) *by = i.object;
+                return 2;
+            }
+        }
+        // FUN_100c20e0 with the request's radius (+0xb8)
+        if (i.wlo.z > p.z + r || i.whi.z < p.z - r || i.wlo.x > p.x + r || i.whi.x < p.x - r) return 0;
+        if (i.wlo.y > p.y + 2.f * r || i.whi.y < p.y) return 0;
+        if (by) *by = i.object;
+        return 1;
+    };
+    int tx = tileOf(p.x), tz = tileOf(p.z);
+    for (int idx : grid_[size_t(tz * 128 + tx)])
+        if (!instances_[size_t(idx)].mover)
+            if (int t = test(idx)) return t;
+    for (int idx : movers_) {
+        const Instance& i = instances_[size_t(idx)];
+        if (i.coll && tileOf(i.wlo.x) <= tx && tx <= tileOf(i.whi.x) && tileOf(i.wlo.z) <= tz && tz <= tileOf(i.whi.z))
+            if (int t = test(idx)) return t;
+    }
+    return 0;
+}
+
+float Scene::boundRadius(int object) const {
+    for (auto& i : instances_) {
+        if (i.object != object) continue;
+        if (i.rig) return i.rig->radius;
+        if (i.coll) return 0.5f * length(i.coll->hi - i.coll->lo);
+        return 0.f;
+    }
+    return 0.f;
+}
+
+bool Scene::bodySegments(int object, Vec3& centre, std::vector<Vec3>& ends) const {
+    ends.clear();
+    for (auto& i : instances_) {
+        if (i.object != object || !i.rig || i.rig->middle < 0) continue;
+        posed(i);
+        size_t mid = size_t(i.rig->middle);
+        const CollMesh* cm = i.rig->coll[mid].get();
+        centre = i.pose[mid].transformPoint((cm->lo + cm->hi) * 0.5f);  // the frame's sphere centre (+0xa0)
+        for (size_t fi = 0; fi < i.rig->coll.size() && fi < i.pose.size(); fi++)
+            if (i.rig->coll[fi] && !i.poseHidden[fi]) ends.push_back(Vec3(i.pose[fi].m[3][0], i.pose[fi].m[3][1], i.pose[fi].m[3][2]));
+        return !ends.empty();
+    }
+    return false;
 }
 
 void Scene::hideObject(int object) {
@@ -751,11 +1058,11 @@ void Scene::hideObject(int object) {
 }
 void Scene::setObjectTwist(int object, float yaw) {
     for (auto& i : instances_)
-        if (i.object == object) i.twist = yaw;
+        if (i.object == object) i.twist = yaw, i.poseDirty = true;
 }
 void Scene::setObjectPitch(int object, float up) {
     for (auto& i : instances_)
-        if (i.object == object) i.pitch = up;
+        if (i.object == object) i.pitch = up, i.poseDirty = true;
 }
 
 void Scene::setObjectDrawn(int object, bool drawn) {
@@ -763,18 +1070,9 @@ void Scene::setObjectDrawn(int object, bool drawn) {
         if (i.object == object) i.noDraw = !drawn;
 }
 
-float Scene::supportHeight(const Vec3& pos, float step, int ignoreObject) const {
-    float best = groundHeight(pos.x, pos.z);
-    for (auto& i : instances_) {
-        if (!i.boxes || !i.solid || i.object == ignoreObject || i.hidden) continue;
-        Vec3 lp = i.inv.transformPoint(pos);
-        i.boxes->query(Vec3(lp.x, -1e9f, lp.z), Vec3(lp.x, lp.y + step, lp.z), [&](const CollBox& b) {
-            if (lp.x < b.lo.x || lp.x > b.hi.x || lp.z < b.lo.z || lp.z > b.hi.z) return;
-            float top = i.world.transformPoint(Vec3(lp.x, b.hi.y, lp.z)).y;
-            if (top <= pos.y + step && top > best) best = top;
-        });
-    }
-    return best;
+void Scene::showObject(int object) {
+    for (auto& i : instances_)
+        if (i.object == object) i.hidden = false;
 }
 
 bool Scene::objectHidden(int object) const {
@@ -822,10 +1120,10 @@ Vec3 Scene::groundNormal(float x, float z) const {
     return hasTerrain_ ? terrain_.normal(x, z) : Vec3(0, 1, 0);
 }
 
-float Scene::objectRadius(int object) const {
+bool Scene::objectBox(int object, Vec3& lo, Vec3& hi) const {
     for (auto& i : instances_) {
         if (i.object != object) continue;
-        Vec3 lo(1e30f, 1e30f, 1e30f), hi(-1e30f, -1e30f, -1e30f);
+        lo = Vec3(1e30f, 1e30f, 1e30f), hi = Vec3(-1e30f, -1e30f, -1e30f);
         auto grow = [&](const Vec3& a, const Vec3& b, const Mat4& w) {
             for (int k = 0; k < 8; k++) {
                 Vec3 p = w.transformPoint(Vec3(k & 1 ? b.x : a.x, k & 2 ? b.y : a.y, k & 4 ? b.z : a.z));
@@ -840,9 +1138,341 @@ float Scene::objectRadius(int object) const {
         } else if (i.mesh) {
             grow(i.mesh->bmin, i.mesh->bmax, i.world);
         }
-        return hi.x < lo.x ? 0.f : 0.5f * length(hi - lo);
+        return hi.x >= lo.x;
     }
-    return 0.f;
+    return false;
+}
+
+float Scene::objectRadius(int object) const {
+    Vec3 lo, hi;
+    return objectBox(object, lo, hi) ? 0.5f * length(hi - lo) : 0.f;
+}
+
+bool Scene::objectCenter(int object, Vec3& out) const {
+    Vec3 lo, hi;
+    if (!objectBox(object, lo, hi)) return false;
+    out = (lo + hi) * 0.5f;
+    return true;
+}
+
+void Scene::setObjectPose(int object, const Vec3& pos, float yaw, int animSet, float frame, float pitch, float roll) {
+    if (pitch == 0 && roll == 0) return setObjectPose(object, pos, yaw, animSet, frame);
+    // rotX(+) lifts -Z (the nose); rotZ(+) tips +X up
+    Mat4 w = Mat4::rotZ(roll) * Mat4::rotX(pitch) * Mat4::rotY(yaw) * Mat4::translate(pos);
+    for (auto& i : instances_)
+        if (i.object == object) {
+            i.world = w;
+            i.inv = affineInverse(w);
+            i.set = animSet;
+            i.frame = frame;
+            i.poseDirty = true;
+            if (i.coll) {
+                instanceBox(i, i.wlo, i.whi);
+                if (!i.mover) i.mover = true, movers_.push_back(int(&i - instances_.data()));
+            }
+        }
+}
+
+bool Scene::frameRest(int object, const std::string& frame, Vec3& origin, Vec3& lo, Vec3& hi) const {
+    for (auto& i : instances_) {
+        if (i.object != object) continue;
+        Model own;  // a unit without an animation script is drawn as one mesh: read its frames from the file
+        if (!i.rig) {
+            const MissionObject& o = mission_.objects[size_t(object)];
+            if (o.defIndex < 0 || size_t(o.defIndex) >= mission_.defs.size()) return false;
+            Bytes b;
+            if (!fs_.read(modelKey(fs_, mission_.defs[size_t(o.defIndex)].firstModel), b) || !loadModel(b, own)) return false;
+        }
+        const Model& m = i.rig ? i.rig->model : own;
+        bool found = false;
+        std::function<void(int, const Mat4&)> walk = [&](int fi, const Mat4& parent) {
+            while (!found && fi >= 0 && fi < int(m.frames.size())) {
+                const Frame& f = m.frames[size_t(fi)];
+                Mat4 w = frameMatrix(f) * parent;
+                if (frameIs(f.name, frame)) {
+                    origin = Vec3(w.m[3][0], w.m[3][1], w.m[3][2]);
+                    lo = hi = Vec3();
+                    if (f.mesh >= 0 && size_t(f.mesh) < m.meshes.size() && !m.meshes[size_t(f.mesh)].v.empty()) {
+                        lo = Vec3(1e30f, 1e30f, 1e30f), hi = Vec3(-1e30f, -1e30f, -1e30f);
+                        for (const Vec3& v : m.meshes[size_t(f.mesh)].v)  // the frame's own mesh box (FUN_1001f3c0)
+                            lo = Vec3(std::min(lo.x, v.x), std::min(lo.y, v.y), std::min(lo.z, v.z)),
+                            hi = Vec3(std::max(hi.x, v.x), std::max(hi.y, v.y), std::max(hi.z, v.z));
+                    }
+                    found = true;
+                    return;
+                }
+                if (f.child >= 0) walk(f.child, w);
+                fi = f.sibling;
+            }
+        };
+        walk(0, Mat4::identity());
+        return found;
+    }
+    return false;
+}
+
+float Scene::boxVolume(int object) const {
+    for (auto& i : instances_) {
+        if (i.object != object) continue;
+        Vec3 lo(1e30f, 1e30f, 1e30f), hi(-1e30f, -1e30f, -1e30f);
+        if (i.coll) {
+            lo = i.coll->lo, hi = i.coll->hi;
+        } else if (i.rig) {
+            const Model& m = i.rig->model;
+            std::function<void(int, const Mat4&)> walk = [&](int fi, const Mat4& parent) {
+                while (fi >= 0 && fi < int(m.frames.size())) {
+                    const Frame& f = m.frames[size_t(fi)];
+                    Mat4 w = frameMatrix(f) * parent;
+                    if (size_t(fi) < i.rig->parts.size() && i.rig->parts[size_t(fi)]) {
+                        const GpuMesh* g = i.rig->parts[size_t(fi)];
+                        for (int k = 0; k < 8; k++) {
+                            Vec3 p = w.transformPoint(Vec3(k & 1 ? g->bmax.x : g->bmin.x, k & 2 ? g->bmax.y : g->bmin.y,
+                                                           k & 4 ? g->bmax.z : g->bmin.z));
+                            lo = Vec3(std::min(lo.x, p.x), std::min(lo.y, p.y), std::min(lo.z, p.z));
+                            hi = Vec3(std::max(hi.x, p.x), std::max(hi.y, p.y), std::max(hi.z, p.z));
+                        }
+                    }
+                    if (f.child >= 0) walk(f.child, w);
+                    fi = f.sibling;
+                }
+            };
+            walk(0, Mat4::identity());
+        }
+        if (hi.x < lo.x) return 0.1f;
+        return std::max(0.1f, (hi.x - lo.x) * (hi.y - lo.y) * (hi.z - lo.z));
+    }
+    return 0.1f;
+}
+
+bool Scene::isUnit(int object) const {
+    for (auto& i : instances_)
+        if (i.object == object) return i.unit;
+    return false;
+}
+
+namespace {
+// The graph geometry's frames (FUN_100954a0 loads the Geometry_File; FUN_1001a1a0 numbers its frames depth-first from
+// the root - first child (+0x13c), then next sibling (+0x138) - and takes each frame's model-space origin). The .six
+// files are the exporter's text dump (objects with parent / sibling / child words and a row-major local transform,
+// object 0 the ROOT); the one .x file (tse20005.x) is DirectX text, whose top-level frames hang under an implicit root.
+bool graphFrames(const std::string& text, bool dotX, std::vector<Vec3>& out) {
+    struct F { Mat4 local = Mat4::identity(); int parent = -1; std::vector<int> kids; };
+    std::vector<F> fr;
+    auto lines = [&](auto&& fn) {
+        size_t p = 0;
+        while (p < text.size()) {
+            size_t e = text.find('\n', p);
+            if (e == std::string::npos) e = text.size();
+            fn(text.substr(p, e - p));
+            p = e + 1;
+        }
+    };
+    if (!dotX) {
+        std::vector<int> par, sib, kid;
+        int row = -1;
+        lines([&](std::string l) {
+            auto num = [&]() {  // the first value on the line (hex word or float)
+                size_t a = l.find_first_of("-0123456789");
+                return a == std::string::npos ? std::string() : l.substr(a);
+            };
+            if (l.find(";name") != std::string::npos && l.find("string") != std::string::npos) {
+                fr.push_back(F()), par.push_back(-1), sib.push_back(-1), kid.push_back(-1), row = -1;
+            } else if (fr.empty()) {
+                return;
+            } else if (l.find(";parent") != std::string::npos) {
+                par.back() = int(int32_t(std::stoul(num(), nullptr, 16)));
+            } else if (l.find(";sibling") != std::string::npos) {
+                sib.back() = int(int32_t(std::stoul(num(), nullptr, 16)));
+            } else if (l.find(";child") != std::string::npos) {
+                kid.back() = int(int32_t(std::stoul(num(), nullptr, 16)));
+            } else if (l.find(";local transform") != std::string::npos) {
+                row = 0;
+            }
+            if (row >= 0 && row < 4 && l.find("float") != std::string::npos) {
+                float v[4] = {};
+                std::string s = num();
+                for (char& c : s) if (c == ',') c = ' ';
+                if (sscanf(s.c_str(), "%f %f %f %f", &v[0], &v[1], &v[2], &v[3]) >= 3)
+                    for (int c = 0; c < 3; c++) fr.back().local.m[row][c] = v[c];
+                row++;
+            }
+        });
+        for (size_t k = 0; k < fr.size(); k++) {
+            fr[k].parent = par[k];
+            for (int c = kid[k]; c >= 0 && size_t(c) < fr.size() && fr[k].kids.size() < fr.size(); c = sib[size_t(c)])
+                fr[k].kids.push_back(c);
+        }
+    } else {
+        fr.push_back(F());  // the implicit root
+        std::vector<int> stack;  // per open brace: the frame it opens, or -1
+        std::string tok;
+        int pendingFrame = -1, want = 0;  // want: matrix numbers still to read
+        float mat[16];
+        int got = 0;
+        bool inTemplate = false, templ = false;
+        size_t i = 0;
+        auto cur = [&]() { for (auto it = stack.rbegin(); it != stack.rend(); ++it) if (*it >= 0) return *it; return 0; };
+        while (i < text.size()) {
+            char c = text[i];
+            if (c == '{') {
+                if (templ || inTemplate) inTemplate = true, templ = false, stack.push_back(-2);
+                else if (pendingFrame >= 0) stack.push_back(pendingFrame), pendingFrame = -1;
+                else stack.push_back(-1);
+                if (tok == "FrameTransformMatrix") want = 16, got = 0;
+                tok.clear(), i++;
+                continue;
+            }
+            if (c == '}') {
+                if (!stack.empty()) {
+                    if (stack.back() == -2) {
+                        stack.pop_back();
+                        inTemplate = false;
+                        for (int s : stack) if (s == -2) inTemplate = true;
+                    } else {
+                        stack.pop_back();
+                    }
+                }
+                tok.clear(), want = 0, i++;
+                continue;
+            }
+            if (want > 0 && (std::isdigit(uint8_t(c)) || c == '-' || c == '.')) {
+                size_t e = i;
+                while (e < text.size() && (std::isdigit(uint8_t(text[e])) || text[e] == '-' || text[e] == '.' || text[e] == 'e' || text[e] == 'E' || text[e] == '+')) e++;
+                mat[got++] = std::strtof(text.substr(i, e - i).c_str(), nullptr);
+                if (--want == 0) {
+                    Mat4 m = Mat4::identity();
+                    for (int r = 0; r < 4; r++)
+                        for (int k = 0; k < 3; k++) m.m[r][k] = mat[r * 4 + k];
+                    fr[size_t(cur())].local = m;
+                }
+                i = e;
+                continue;
+            }
+            if (std::isspace(uint8_t(c)) || c == ',' || c == ';') {
+                i++;
+                continue;
+            }
+            size_t e = i;
+            while (e < text.size() && !std::isspace(uint8_t(text[e])) && text[e] != '{' && text[e] != '}') e++;
+            std::string w = text.substr(i, e - i);
+            if (w == "template") templ = true;
+            if (!inTemplate && !templ && tok == "Frame") {  // "Frame <name> {"
+                int parent = cur();
+                fr.push_back(F());
+                fr.back().parent = parent;
+                fr[size_t(parent)].kids.push_back(int(fr.size()) - 1);
+                pendingFrame = int(fr.size()) - 1;
+            }
+            tok = w, i = e;
+        }
+    }
+    if (fr.empty()) return false;
+    // depth first from the root: the frame, then its children in order
+    out.clear();
+    std::vector<int> seen(fr.size(), 0);
+    std::function<void(int, const Mat4&)> visit = [&](int k, const Mat4& parent) {
+        if (k < 0 || size_t(k) >= fr.size() || seen[size_t(k)]) return;
+        seen[size_t(k)] = 1;
+        Mat4 w = fr[size_t(k)].local * parent;
+        out.push_back(Vec3(w.m[3][0], w.m[3][1], w.m[3][2]));
+        for (int c : fr[size_t(k)].kids) visit(c, w);
+    };
+    visit(0, Mat4::identity());
+    return !out.empty();
+}
+}  // namespace
+
+// FUN_10084f90: the .grx text - "Geometry_File: <name>" (keyword 0x6e) loads the geometry and makes one node per
+// frame; "Vertex <n> { a b ... }" (0xcd) gives node n its links (indices past the node count are ignored). After the
+// object is placed FUN_1001a550 moves the nodes by its world matrix.
+void Scene::addWalkGraph(int idx, const std::string& file) {
+    Bytes b;
+    if (!fs_.read("Objects/" + file, b) && !fs_.read(file, b)) {
+        SDL_Log("walkable graph %s: not found", file.c_str());
+        return;
+    }
+    std::string text(b.begin(), b.end());
+    for (char& c : text) if (c == '\r') c = '\n';
+    WalkGraph g;
+    g.object = instances_[size_t(idx)].object;
+    std::vector<std::pair<int, std::vector<int>>> verts;
+    std::string geom;
+    size_t p = 0;
+    while (p < text.size()) {
+        size_t e = text.find('\n', p);
+        if (e == std::string::npos) e = text.size();
+        std::string l = text.substr(p, e - p);
+        p = e + 1;
+        size_t h = l.find('#');
+        if (h != std::string::npos) l.erase(h);
+        if (size_t k = l.find("Geometry_File:"); k != std::string::npos) {
+            std::string s = l.substr(k + 14);
+            s.erase(0, s.find_first_not_of(" \t\""));
+            s.erase(s.find_last_not_of(" \t\"") + 1);
+            geom = s;
+        } else if (size_t k2 = l.find("Vertex"); k2 != std::string::npos) {
+            std::string s = l.substr(k2 + 6);
+            while (s.find('}') == std::string::npos && p < text.size()) {  // a list may run over lines
+                size_t e2 = text.find('\n', p);
+                if (e2 == std::string::npos) e2 = text.size();
+                s += " " + text.substr(p, e2 - p);
+                p = e2 + 1;
+            }
+            for (char& c : s) if (c == '{' || c == '}') c = ' ';
+            std::vector<int> v;
+            const char* q = s.c_str();
+            char* end;
+            long n = std::strtol(q, &end, 10);
+            if (end == q) continue;
+            q = end;
+            for (long a = std::strtol(q, &end, 10); end != q; a = std::strtol(q, &end, 10)) v.push_back(int(a)), q = end;
+            verts.push_back({int(n), v});
+        }
+    }
+    Bytes gb;
+    if (geom.empty() || (!fs_.read("Objects/" + geom, gb) && !fs_.read(geom, gb))) {
+        SDL_Log("walkable graph %s: geometry %s not found", file.c_str(), geom.c_str());
+        return;
+    }
+    std::vector<Vec3> local;
+    if (!graphFrames(std::string(gb.begin(), gb.end()), extension(geom) == "x", local)) return;
+    const Mat4& w = instances_[size_t(idx)].world;
+    for (auto& v : local) g.nodes.push_back(w.transformPoint(v));
+    g.links.assign(g.nodes.size(), {});
+    for (auto& [n, v] : verts)
+        if (n >= 0 && size_t(n) < g.nodes.size())
+            for (int a : v)
+                if (a >= 0 && size_t(a) < g.nodes.size()) g.links[size_t(n)].push_back(a);
+    // FUN_100c1da0 measures from the object's origin against its bounding radius (+0x98)
+    g.centre = Vec3(w.m[3][0], w.m[3][1], w.m[3][2]);
+    g.radius = boundRadius(g.object);
+    SDL_Log("walkable graph %s on object %d: %zu nodes from %s, %zu linked", file.c_str(), g.object, g.nodes.size(),
+            geom.c_str(), verts.size());
+    graphs_.push_back(std::move(g));
+}
+
+bool Scene::nearestGraphNode(const Vec3& p, int& graph, int& node) const {
+    // FUN_100c1da0 over the static objects listed on p's terrain tile; distances are FUN_100b5ce0's largest axis
+    // difference. A graph object counts when p is within its bounding radius (+0x98) of its origin; its nearest node
+    // is taken (the first within 2 m, DAT_10148418, at once) and the search stops there.
+    auto cheb = [](const Vec3& a, const Vec3& b) {
+        return std::max(std::fabs(a.x - b.x), std::max(std::fabs(a.y - b.y), std::fabs(a.z - b.z)));
+    };
+    graph = node = -1;
+    for (size_t gi = 0; gi < graphs_.size(); gi++) {
+        const WalkGraph& g = graphs_[gi];
+        if (cheb(p, g.centre) > g.radius) continue;
+        float best = 1e30f;
+        for (size_t k = 0; k < g.nodes.size(); k++) {
+            float d = cheb(g.nodes[k], p);
+            if (d < best) {
+                best = d, graph = int(gi), node = int(k);
+                if (d <= 2.f) return true;
+            }
+        }
+        if (graph >= 0) return true;
+    }
+    return false;
 }
 
 Vec3 Scene::startPosition() const {

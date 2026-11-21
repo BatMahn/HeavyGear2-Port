@@ -38,25 +38,28 @@ struct MissionPath {
 };
 
 // FountainSystem (0x12a): unit generators. Templates name a definition + object type (+ script); each fountain
-// spawns from a list of templates at its position (parser FUN_1005bc?? / text form FUN_1005b4a0).
+// spawns from a list of templates at its position (binary reader FUN_1005e8c0, generator FUN_1005bb40, template
+// FUN_1005e7a0; generator object FUN_1005b020). Field offsets are the generator's in the original.
 struct FountainTemplate { int defIndex = -1, type = 0x48; std::string script; };
 struct Fountain {
     std::string name, script;
-    int team = 101;            // 0x6c (mission team numbering)
-    bool active = true;        // 0x132 == 3
-    int mode = 0;              // 0x12f (0..2)
-    int total = 0;             // 0x130 units it can make (0 = no limit)
-    int maxAlive = 1;          // 0x131 (1..8) at once
-    int wave = 1;              // 0x12b (1..16)
-    uint32_t flags = 0;        // 0x134
+    int team = 101;            // 0x6c (mission team numbering; +0xc holds team - 99)
+    bool active = true;        // 0x132 == 3 (+0x14)
+    int mode = 0;              // 0x12f (0..2, +0x2e; every mode spawns the same way)
+    int total = 0;             // 0x130 (+0x28) units it may lose before it switches off (0 = no limit)
+    int maxAlive = 0;          // 0x12b (+0x2c, 1..16) of its units in the field at once (0 = no limit)
+    int wave = 1;              // 0x131 (+0x2a, 1..8) units per spawn, all from one template
+    bool minRange = true;      // +0x19 (byte 1 of 0x134): only spawn beyond range[0] of the user
     float pos[3] = {0, 0, 0}, rot[3] = {0, 0, 0};
-    float range[3] = {400, 500, 580};  // 0x15e / 0x15f / 0x160
-    std::vector<int> templates;        // 0x135 indices into Mission::fountainTemplates
+    float range[3] = {400, 500, 580};  // 0x15e min / 0x15f max spawn distance, 0x160 recycle distance
+    std::vector<int> templates;        // 0x135 indices into Mission::fountainTemplates (up to 16, no repeats)
 };
 
 // Surfaces (0xd2): terrain surface types — colour key, friction, damage per second (lava), footstep sound.
 struct Surface {
     int index = 0; uint8_t color[3] = {0, 0, 0}; float friction = 1; int damage = 0; std::string footstep;
+    float movementCost = 0;  // 0x154 (entry +0x44)
+    uint32_t flags = 0;      // 0x153 (entry +0x48): bits 2-5 tell the pathfinder 1 open / 2 blocked (FUN_100c2520)
     uint32_t dustColor = 0;  // 0x156 DustColor as 0x00RRGGBB (tints SPARK0 / SPARK1 / SPARKU)
     int dustIndex = 0;       // 0x165 DustIndex: bullet ground hits use SPARK0 (0), SPARK1 (1), else SPARKO
 };
@@ -68,7 +71,7 @@ struct Mission {
     uint8_t fog[4] = {0, 0, 0, 0};
     int clipping = 0;
     int musicTrack = 0;  // RedBook_Track (0x39): CD audio track for the mission, 0 if none
-    float lightAmbient = 0.3f, lightDiffuse = 0.7f, lightDir[3] = {0, -1, 0};
+    float lightAmbient = 0.3f, lightDiffuse = 0.5f, lightDir[3] = {0, -1, 0};
     uint8_t lightColor[3] = {255, 255, 255};
     bool hasWater = false;
     float waterLevel = 0, waterTidal = 0, waterAnim = 0;
@@ -81,6 +84,11 @@ struct Mission {
     std::vector<MissionPath> paths;
     std::vector<FountainTemplate> fountainTemplates;
     std::vector<Fountain> fountains;
+    // FountainSystem scalars (FUN_1005e8c0): 0x132 == 3 switches the system on (+0x15, off by default), 0x12b units in
+    // each template's pool and the most fountain units alive at once (+0x1c, default 4), 0x12c the most units the
+    // system makes over the mission, counting the lost (+0x18, 0 = no limit)
+    bool fountainsOn = false;
+    int fountainPool = 4, fountainCap = 0;
     std::vector<Surface> surfaces;
     const MissionPath* path(const std::string& name) const;
 };

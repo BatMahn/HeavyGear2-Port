@@ -147,6 +147,13 @@ private:
     struct Popup { std::string id; UiRect anchor; std::vector<std::string> items; int sel = -1, scroll = 0; bool open = false; int picked = -1; };
     Popup popup_;
     std::string dragging_;
+    // controls screen (bindings_config_window): category, selected command row, list scroll, the bindings on entry
+    // (Undo / Main Menu), waiting for the key to bind
+    int bindCat_ = 0, bindSel_ = 0, bindScroll_ = 0;
+    bool bindEditing_ = false, bindCapture_ = false;
+    Bindings bindSaved_;
+    bool invertSaved_ = false;
+    bool captureBinding(const SDL_Event& ev);
     int creditScroll_ = 0;
     float creditT_ = 0;
     Uint64 lastTick_ = 0;

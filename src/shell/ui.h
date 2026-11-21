@@ -100,7 +100,8 @@ public:
     // List box: `lbPath` is the layout's list node (frame image, header, item offsets / height); returns
     // the clicked item index or -1. `sel` is drawn highlighted; `scroll` is kept by the caller.
     int listbox(const std::string& lbPath, const std::vector<std::string>& items, int sel, int& scroll,
-                const std::string& itemTemplate = "msn_lb_item");
+                const std::string& itemTemplate = "msn_lb_item", const std::vector<std::string>* column2 = nullptr,
+                float column2X = 0);  // column2: a second text column starting column2X into the row
     // Scrolling text area in a rectangle with a scroll bar; `scroll` in lines.
     void scrollText(const std::string& s, const UiRect& r, const TextStyle& st, int& scroll);
     // One-line text entry; returns true when Enter is pressed.

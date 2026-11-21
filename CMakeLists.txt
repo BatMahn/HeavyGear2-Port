@@ -3,7 +3,7 @@
 # SDL3 and zlib are taken from the system when found, otherwise downloaded and built
 # (HG2_FETCH_DEPS=ON forces the download, which is what the release workflow does).
 cmake_minimum_required(VERSION 3.21)
-project(hg2port VERSION 0.28.0 LANGUAGES C CXX)
+project(hg2port VERSION 0.30.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -39,7 +39,7 @@ set(CORE_SRC
   src/assets/gear.cpp src/assets/weapon.cpp src/assets/collision.cpp)
 set(GAME_SRC
   src/render/renderer.cpp src/game/scene.cpp src/game/player.cpp src/game/combat.cpp src/game/ai.cpp
-  src/audio/audio.cpp src/game/hud.cpp src/game/particles.cpp src/game/fountains.cpp src/game/session.cpp
+  src/audio/audio.cpp src/game/hud.cpp src/game/particles.cpp src/game/fountains.cpp src/game/session.cpp src/game/bindings.cpp
   src/shell/ldl.cpp src/shell/ui.cpp src/shell/gamedata.cpp src/shell/avi.cpp src/shell/movie.cpp src/shell/shell.cpp src/net/net.cpp src/main.cpp)
 
 # Intel Indeo 5 video decoder (from FFmpeg, LGPL-2.1-or-later; see third_party/indeo5/COPYING.LGPLv2.1)

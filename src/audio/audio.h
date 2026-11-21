@@ -36,6 +36,7 @@ public:
     float masterVolume = 0.8f;
     float musicVolume = 0.5f;
     float effectsVolume = 1.f, dialogVolume = 1.f;  // scale effects / loops and speech
+    int soundDetail = 2;  // the original's sound setting: 0 low, 1 medium, 2 high (channel voice counts)
     // Raw PCM (any SDL format) played once as dialog (briefing audio). Replaces playing dialog.
     bool playPcm(const SDL_AudioSpec& spec, const uint8_t* data, size_t bytes, float volume = 1.f);
     bool dialogPlaying();
@@ -48,6 +49,10 @@ public:
         float minVol = 0, maxVol = 10000, outer = 100.f, inner = 0;
         int channel = 1, priority = 0;
         bool loop = false, distance = false;
+        bool directional = false;  // EAR_PERF_DISTANCE / EAR_PERF_UPDATE (event flag 0x10): the pan follows the source
+        bool prioritize = false;   // EAR_PERF_PRIORITIZE (0x10000): the priority counts when a channel is full
+        int matrix = 0x40, azimut = 0;  // "matrix:" (0x40 unless 1) and "azimut:" (the fixed matrix entry)
+        int ring[7] = {0, 100, 100, 100, 1000, 5000, 7500};  // Ring_0 .. Ring_6 (cm)
         float volume = 1.f, range = 100.f;  // maxVol / 10000 and outer, for callers
     };
     const SoundInfo* info(const std::string& wav) const;
@@ -61,7 +66,27 @@ public:
 
 private:
     struct Clip { std::vector<int16_t> pcm; };  // stereo 44.1 kHz
-    struct Voice { std::shared_ptr<Clip> clip; size_t pos; float l, r; bool dialog; int loop = -1; bool music = false; std::string name; };
+    struct Voice {
+        std::shared_ptr<Clip> clip; size_t pos; float l, r; bool dialog; int loop = -1; bool music = false; std::string name;
+        int channel = 0, priority = 0;  // EAR channel and (EAR_PERF_PRIORITIZE) priority; channel 0: not an EAR event
+        float level = 0;                // the event's EAR level (0..10000) at its distance, for voice stealing
+        // the gains glide (earpds FUN_1000ab47 / FUN_1001528c): a new left / right target (tl, tr) is reached from
+        // the last settled values (ol, or_) in two 50 ms ticks, half way and then all the way; glide = the step
+        float tl = -1, tr = -1, ol = 0, or_ = 0;
+        int glide = 0;
+    };
+    int glideFrames_ = 0;    // output frames since the last 50 ms update tick
+    void glideTick();        // one EAR update tick over the voices (mutex_ held)
+    // A channel's limit (RegisterChannel, FUN_1012e708; the fourth argument is voices << 16 | events, see
+    // FORMATS.md): the playing voices of 2, 3, 4 and 6 are 16 at the high sound setting (8 medium, 4 low), of 7 and 9
+    // half that; the events a channel may hold are 80 (2), 24 (3), 16 (4), 32 (6), 16 (7), 4 (8) and 4 (9). Channels 1
+    // and 5 are queued channels (flag 2): never full. The port has no waiting events, so the limit is the smaller.
+    int channelVoices(int channel) const;
+    // Room for a new event on its channel (earpds FUN_10004ee3): true if the channel has a free voice or one was
+    // stopped for it; false drops the new event. Called with mutex_ held.
+    bool makeRoom(int channel, int priority, float level);
+    // The pan matrix entry (pan in DirectSound mB, level scale) EAR gives an event (FUN_10004234 / FUN_100049a0).
+    static void matrixEntry(const SoundInfo& si, const Vec3* rel, int& pan, float& gain);
     std::unordered_map<std::string, SoundInfo> infos_;
     void loadSoundList();
     std::vector<std::string> tracks_;
@@ -72,7 +97,7 @@ private:
     std::atomic<bool> loadingTrack_{false};
     bool musicOn_ = false;
     std::shared_ptr<Clip> decodeTrack(const std::string& path);
-    void gains(float volume, const Vec3* at, const SoundInfo& si, float& l, float& r) const;
+    void gains(float volume, const Vec3* at, const SoundInfo& si, float& l, float& r, float* level = nullptr) const;
   public:
     // EAR's level for a sound at a distance (FUN_10004504): the maximum inside the inner range, falling in a straight
     // line to the minimum at the outer range (EAR_PERF_DISTANCE sounds only), 0..10000.

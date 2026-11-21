@@ -29,11 +29,13 @@ struct MissionSetup {
     std::string title;             // shown at the start (the shell's mission title); empty: the mission file's
     GearChoice player;
     std::vector<SquadMate> squad;  // AI squad mates following the user
-    // instant action: waves of `enemies` hunting the user; success when every wave is destroyed
+    // instant action (sim launch type 4): `enemies` start at the arena's team-2 spawn points and hunt the user; each
+    // comes back at a spawn point until it has been destroyed `waves` times (the shell's fire teams, config +0x80);
+    // success when none is left, failure when the user is destroyed
     std::vector<SquadMate> enemies;
     int waves = 0;
     float difficulty = 0.5f;       // 0 easiest .. 1 hardest: enemy accuracy / alertness
-    bool space = false;            // an asteroid / station mission (the briefing's space flag): low gravity
+    bool space = false;            // an asteroid / station mission (the briefing's space flag): zero-G physics
     NetGame* net = nullptr;  // network match (instant-action arena, players from the lobby)
 };
 

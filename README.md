@@ -10,7 +10,7 @@ installation needed).
 
 See [CHANGELOG.md](CHANGELOG.md) for what each release changed.
 
-## Status (v0.28.0) — the whole single-player game
+## Status (v0.30.0) — the whole single-player game
 
 The game now starts in the original shell, drawn from the game's own layouts and artwork:
 
@@ -42,34 +42,23 @@ The game now starts in the original shell, drawn from the game's own layouts and
   variant's perks and flaws.
 
 - **Gear lab structure and perks & flaws**: armour, sensors, fire control and manoeuvre can be stepped up or down,
-  and any perk or flaw switched on, off or to another level; the threat value follows, and so does the fight:
-  manoeuvre sets the turn rate (0.6 + 0.05 × rating, as the original) and makes the gear harder to hit; sensors
-  stretch the radar and the range enemies are seen at; stealth shrinks the range the gear is seen at; ECM throws off
-  enemy fire unless the shooter has ECCM; jump jets jump higher; Reinforced Armor, Heat Resistant Armor (lava) and
-  Haywire Resistant cut damage, Weak Facing adds to it; Backup Fire Control, Reinforced Chassis, Rugged Movement and
-  Reinforced Crew Compartment each soak up one critical hit, exposed-system flaws make criticals worse, and heavy
-  criticals knock ECM, ECCM, jump jets or stealth down a level. Mission gears get their perks and flaws from their
-  own definitions too.
-- **Squad commands** (the original's six, F5–F10): attack my target, defend my target, hold ground, regroup, fire at
-  will, go to the selected nav point. "My target" is the hostile nearest the crosshair, bracketed on the HUD.
-- **More perks in the fight**: guided missiles (AAM, AGM, ATM, HATM) home on the target you're aiming at, and a
-  target's ECM can break the lock unless the shooter's ECCM holds it; Sniper Systems steadies aim and adds a zoom
-  (V); Target Designator steadies your whole side against your target; Satellite Uplink widens the radar; Amphibious
-  gears don't slow down wading through deep water; Backup Sensors keep the sensors working after a sensor hit;
-  Shielded Weapons and Emergency Medical soak up a critical hit; squad mates with an Ejection System survive losing
-  their gear (they're not lost to the campaign); Zero-G Movement keeps full speed on space missions (which now have
-  low gravity); Easy To Modify lets the gear lab put any weapon on any hardpoint; hostile-environment protection halves
-  lava damage; Backup Life Support soaks up a crew critical; without a Backup Communication System, squad commands
-  fail once the sensor head is shot off.
-- **Concealment** (decoded from the gear's posture handling, `FUN_10064d20`): standing or moving 0.15, kneeling 0.25,
-  prone 0.4, plus 0.05 per Stealth level, minus 0.15 for a Large Sensors Profile, halved for two seconds after
-  firing. It sets how far away a gear is spotted, so kneeling or going prone (and holding fire) now hides you.
-- **AI**: the campaign pilot's difficulty now counts (how far hostiles see you and how well they shoot); gears skate
-  on long runs out of a fight and kneel to shoot when holding ground (scripted stances and paths are left alone);
-  units pick the weapon for the distance (melee up close, otherwise the hardest hitter in reach), hold at the
-  selected weapon's range as the original's standard combat tactic asks, won't shoot into a hill or through a friend
-  (they move to get a clear line instead), back off and turn when stuck, and walk out of lava (waves no longer spawn
-  in it, and units never doze while standing in it).
+  and any perk or flaw switched on, off or to another level; the threat value follows, and so does the fight, using
+  the original's rules (0.29): manoeuvre sets the turn rate (0.6 + 0.05 × rating); the sensor rating decides which
+  sensors the gear carries (visual, ultrasonic, motion, magnetic, radar) and how strong they are; Reinforced Armor
+  adds 20 per level to the facing it covers and Weak Facing halves it; Amphibious gears don't drown; Zero-G Movement
+  lets a gear survive vacuum; criticals knock out sensors, ECM and other systems.
+- **Squad commands** (the original's six, Ctrl+T / D / S / R / A / G): attack my target, defend my target, hold
+  ground, regroup, fire at will, go to the selected nav point. "My target" is your current target (T / Y cycle, R at
+  the reticle, E nearest enemy), bracketed on the HUD.
+- **Sensors and ECM** (0.29, the original's model): each sensor tests a contact's concealment (standing 0.15,
+  kneeling 0.25, prone 0.4, plus Stealth, halved while the contact's own sensors are active) and raises its signal;
+  near misses and hits give a shooter away. The radar scope shows only detected contacts within 300 m, and you can
+  only target what your side has detected. `A` switches your sensors between active and passive; `Ctrl+E` switches on
+  ECM, which jams radars inside its field (150–750 m by level) unless their ECCM holds. A jammed radar loses its
+  target and guided missiles stop homing.
+- **AI**: there is no random scatter; each unit's fire control caps the share of its shots that hit, and past that
+  it shoots high, as the original. The campaign pilot's difficulty never reached the original's simulation, so it
+  doesn't in the port either.
 - **Original AI tactics** (0.19): units now run the original tactic objects' state machines, decoded from
   `hg2sim.dll` — GearCombat1/2/3, the flank family, hand-to-hand, stand-and-shoot, turret and tank attacks,
   run-away, HuntUser/HuntTarget re-planning, patrol / free-range wandering round home, pursue and hold-ground —
@@ -369,27 +358,34 @@ Without `--data` (or `HG2_DATA`) it looks for a `data` folder next to the progra
   `HG2_OBJY=1` (object-vs-terrain height check), `HG2_PATH=name` (path heights)
 - `HG2_DATA` can be set instead of `--data`
 
-Controls (the original numeric-pad layout works too, so the training messages match):
+Controls are the original's defaults (the shell's Reset Default set, `Shell\Bindings\Defaults.dft`), so the
+training messages match; Options → Controls rebinds them (saved in `settings.cfg`). Movement is on the numeric pad as
+in the original, so on a laptop without one, rebind movement there first:
 
 | Action | Keys |
 |---|---|
-| Forward / back, turn | `W` `S` `A` `D` or pad `8` `2` `4` `6` (held: full forward; turning alone drives at a crawl) |
-| Throttle setting (the original's) | `,` 1/3, `.` 2/3, `/` full, `=` / `-` up / down, `0` full stop, `Backspace` reverse |
-| Jump jets (gears with the perk) | `J` |
-| Sidestep | `Q` / `E` or pad `7` / `9` |
-| Posture down / up (stand → kneel → prone) | `Z` / `X` or pad `/` / `*` |
-| Jump | `Space` or pad `Enter` |
-| SMS skates on/off (when stopped) | `R`, `Insert` or pad `0` |
-| Internal / external view | `C` (the original's Ctrl-C) |
-| Rotate / tilt camera, zoom | arrow keys, `Home` / `End` or mouse wheel; mouse also looks / aims |
-| Fire, select weapon | left mouse or `Ctrl`; `1`–`8`, `Tab` |
-| Next / previous nav point | `N` / `B` |
-| Music on/off | `M` |
-| Skip camera flight | `Space` |
-| Free camera | `F1` (mouse look, `WASD`, `Space`/`Ctrl` up/down, `Shift` fast) |
-| Squad commands | `F5` attack my target, `F6` defend my target, `F7` hold ground, `F8` regroup, `F9` fire at will, `F10` go to nav point |
-| Sniper zoom | `V` (gears with Sniper Systems) |
+| Forward / back, turn | pad `8` `2` `4` `6` (held: full forward; turning alone drives at a crawl) |
+| Sidestep | pad `7` / `9` |
+| Throttle setting | `[` 1/3, `]` 2/3, `\` full, pad `+` / `-` up / down, `=` full stop, `Backspace` reverse |
+| Crouch (stand → kneel → prone) / stand up | pad `/` / pad `*` |
+| Jump, jump jets (gears with the perk) | pad `Enter` (or `Space`), pad `.` |
+| SMS skates on/off (when stopped) | pad `0` (`Ins`) |
+| Aim (the reticle, 30° left/right, 20° up/down), centre it | mouse, pad `5` |
+| Fire, next weapon | left mouse button, right mouse button (`1`–`8` select a weapon) |
+| Target under the reticle, next / previous, nearest enemy, nearest friendly | `R`, `T` / `Y`, `E`, `F` |
+| Sensors active / passive, ECM on | `A`, `Ctrl`+`E` |
+| Internal / external view | `Ctrl`+`C` |
+| Rotate / tilt external camera, zoom | arrow keys, `Home` / `End` or mouse wheel |
+| Next nav point | `N` |
+| Squad commands | `Ctrl`+`T` attack my target, `Ctrl`+`D` defend my target, `Ctrl`+`S` hold ground, `Ctrl`+`R` regroup, `Ctrl`+`A` fire at will, `Ctrl`+`G` go to nav point |
+| Skip camera flight | `Space` (or pad `Enter`) |
+| Music on/off, sniper zoom (Sniper Systems) | `M`, `V` |
 | Pause menu (resume / abort / quit) | `Esc` |
+
+The other commands of the original's list (grenades, artillery, laser targeting, radar zoom, imaging, HUD toggles,
+tactical map, goals, console, chat and taunts, the command menu) can be bound but do nothing yet. `HG2_FREECAM=1`
+starts a mission in a free camera for looking around (mouse look, `WASD`, `Space` / `Ctrl` up / down, `Shift` fast;
+`F1` back to the gear and again).
 
 `./build/hg2extract <datadir> scripts T01 60` runs a mission's scripts headless for 60 seconds and lists the
 builtins it needed that aren't implemented yet.

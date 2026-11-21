@@ -427,25 +427,135 @@ void Particles::stepWeather(float dt) {
         else d.pos = d.pos + v;
         d.left -= dt;
     }
-    // lightning (FUN_100f7b50, rain only)
+    // lightning (FUN_100f7b50, rain only): a strike when the counter is past 0x1fff and rand() + 1 is below it; a strike
+    // that finds no place leaves the counter alone
+    for (auto& b : bolts_) {
+        // FUN_100f0a50: the bolt lives +0x1a8 seconds; a ribbon that is off is (re)made, the first at once and the
+        // branches with their first step counted; on ones age and go off past their life
+        b.age += dt;
+        if (b.age > b.life) continue;
+        for (int i = 0; i < 4; i++) {
+            Ribbon& r = b.rib[i];
+            if (!r.on) {
+                respawnRibbon(b, i);
+                if (i == 0) continue;
+            }
+            r.age += dt;
+            if (r.age > r.life) r.on = false;
+        }
+    }
+    bolts_.erase(std::remove_if(bolts_.begin(), bolts_.end(), [](const Bolt& b) { return b.age > b.life; }), bolts_.end());
     if (w_.snow) return;
     if (w_.lightning >= 0x1fff && unsigned(rng_() & 0x7fff) + 1 < w_.lightning) {
-        // FUN_100f7c40: 50..180 m from the camera in a random direction; envthnd1.wav there
-        float dist = 50.f + rnd() * 130.f, ang = (rnd() + rnd()) * 3.14159265f;
-        Vec3 at = eye_ + Vec3(std::cos(ang) * dist, 0, std::sin(ang) * dist);
-        if (groundHeight) at.y = groundHeight(at.x, at.z);
-        if (onLightning) onLightning(at);
-        w_.lightning -= unsigned(int(rnd() * (60000.f - 1000.f) + 1000.f));
-        if (w_.lightning > 0x7fff) w_.lightning = 0;
+        // FUN_100f7c40: up to 32 tries at 50 .. 180 m (+0xde8 / +0xdec) and a random bearing (one rand() x 2 pi) from
+        // the camera, at the camera's height. A try is taken only when right.z dx + forward.z dz <= 0 (the view's
+        // +0xd0 / +0xe0, so mostly behind or beside the view); otherwise the last taken one stands. It must be on the
+        // map. The bolt lives 0.2 .. 0.6 s (+0xdf4 / +0xdf8); envthnd1.wav plays at the strike.
+        bool have = false, placed = false;
+        Vec3 at;
+        for (int tries = 1; tries <= 32; tries++) {
+            float dist = (180.f - 50.f) * rnd() + 50.f;
+            float ang = rnd() * 2.f * 3.14159265f;
+            float c = std::cos(ang), sn = std::sin(ang);
+            if (view_.m[2][0] * c * dist + view_.m[2][2] * sn * dist <= 0.f)
+                at = Vec3(eye_.x + c * dist, eye_.y, eye_.z + sn * dist), have = true;
+            if (have && at.x >= 0 && at.z >= 0 && at.x < 4096.f && at.z < 4096.f) {
+                placed = true;
+                break;
+            }
+        }
+        if (placed) {
+            strikeBolt(at);
+            if (onLightning) onLightning(at);
+            w_.lightning -= unsigned(int(rnd() * (60000.f - 1000.f) + 1000.f));
+            if (w_.lightning > 0x7fff) w_.lightning = 0;
+        }
     } else {
         if (w_.lightningRate) w_.lightning += unsigned(std::max(1, int(float(w_.lightningRate) * dt)));
         if (w_.lightning > 0x7fff) w_.lightning = 0;
     }
 }
 
+void Particles::strikeBolt(const Vec3& at) {
+    Bolt b;
+    b.at = at;
+    b.life = (0.6f - 0.2f) * rnd() + 0.2f;
+    if (b.life < 0.1f) b.life = 1.f;
+    for (float& j : b.jag) j = float(int(rng_() & 0x7fff) * 2 - 0x7fff) * 9.155553e-6f;
+    respawnRibbon(b, 0);
+    bolts_.push_back(b);
+}
+
+void Particles::respawnRibbon(Bolt& b, int i) {
+    // the curve setter (FUN_10048090): p0 = a, p1 = a + (b - a) / 3 + r1 T, p2 = a + 2 (b - a) / 3 + r2 T, p3 = b with
+    // r1, r2 = (rand() - 16383) / 16383.5 and T the bend vector
+    auto curve = [&](Ribbon& r, const Vec3& a, const Vec3& e, const Vec3& T) {
+        float r1 = (float(rng_() & 0x7fff) - 16383.f) * 6.103888e-5f, r2 = (float(rng_() & 0x7fff) - 16383.f) * 6.103888e-5f;
+        r.cp[0] = a, r.cp[1] = a + (e - a) * (1.f / 3.f) + T * r1, r.cp[2] = a + (e - a) * (2.f / 3.f) + T * r2, r.cp[3] = e;
+    };
+    auto perpOf = [](const Vec3& d) {  // normalize(d x (0, 0, -1)), (1, 0, 0) when d is along z
+        Vec3 c(-d.y, d.x, 0);
+        float l = length(c);
+        return l > 1e-4f ? c * (1.f / l) : Vec3(1, 0, 0);
+    };
+    Ribbon& r = b.rib[i];
+    r.on = true, r.age = 0;
+    r.life = 0.1f + rnd() * 0.3f;                  // 0.1 - rand x (1 / 32767) x -0.3
+    r.step = 0.8f, r.depth = 3;
+    r.seed = uint8_t(rng_() & 0xff);
+    if (i == 0) {
+        // the main channel: from the top (+0x160, 80 m up) down to the strike, bent along +0x190 x 35
+        Vec3 top(0, 80.f, 0), bottom(0, 0, 0);
+        r.perp = perpOf(bottom - top);
+        r.width = 0.6f, r.amp = 5.f;
+        curve(r, top, bottom, r.perp * 35.f);
+    } else {
+        // a branch from the main curve at t = i / 4, heading -0.7 / +0.7 / -0.7 times the main's control step i - 1 -> i,
+        // bent 17.5 m across itself; i x 0.25 x 0.9 x 0.6 wide, bend 2.5, the main ribbon's life
+        const Ribbon& m = b.rib[0];
+        float t = float(i) * 0.25f, u = 1.f - t;
+        Vec3 start = m.cp[0] * (u * u * u) + m.cp[1] * (3 * u * u * t) + m.cp[2] * (3 * u * t * t) + m.cp[3] * (t * t * t);
+        Vec3 d = m.cp[i] - m.cp[i - 1];
+        Vec3 end = start + Vec3(-0.7f * d.x, 0.7f * d.y, -0.7f * d.z);
+        r.perp = perpOf(end - start);
+        r.width = float(i) * 0.25f * 0.9f * 0.6f, r.amp = 2.5f;
+        r.life = m.life;
+        curve(r, start, end, r.perp * 17.5f);
+    }
+}
+
+void Particles::ribbonPoints(const Ribbon& r, const Bolt& b, std::vector<Vec3>& out) const {
+    // FUN_100f1460 / FUN_100f1900: split the curve in halves `depth` times; at each split the left half's third
+    // control point moves by k x amp along the bend direction and the right half's second by -k x amp (k = -1, 0 or 1
+    // from two random bits), amp x 0.9 a level; the pieces are then walked at the ribbon's point spacing (FUN_100f1820)
+    std::mt19937 g(unsigned(b.at.x * 131.f + b.at.z * 17.f) ^ (unsigned(r.seed) * 2654435761u) ^ unsigned(r.life * 1e6f));
+    std::function<void(const Vec3*, int, float)> split = [&](const Vec3* c, int depth, float amp) {
+        if (depth == 0) {
+            float len = length(c[1] - c[0]) + length(c[2] - c[1]) + length(c[3] - c[2]);
+            int n = std::max(1, int(std::ceil(len / r.step)));
+            for (int k = out.empty() ? 0 : 1; k <= n; k++) {
+                float t = float(k) / float(n), u = 1.f - t;
+                out.push_back(c[0] * (u * u * u) + c[1] * (3 * u * u * t) + c[2] * (3 * u * t * t) + c[3] * (t * t * t));
+            }
+            return;
+        }
+        Vec3 a = (c[0] + c[1]) * 0.5f, bb = (c[1] + c[2]) * 0.5f, cc = (c[2] + c[3]) * 0.5f;
+        Vec3 d = (a + bb) * 0.5f, e = (bb + cc) * 0.5f, m = (d + e) * 0.5f;
+        int k = int(g() & 1) - 1 + int(g() & 1);
+        Vec3 off = r.perp * (float(k) * amp);
+        Vec3 L[4] = {c[0], a, d + off, m}, R[4] = {m, e - off, cc, c[3]};
+        split(L, depth - 1, amp * 0.9f);
+        split(R, depth - 1, amp * 0.9f);
+    };
+    split(r.cp, r.depth, r.amp);
+    for (size_t i = 1; i + 1 < out.size(); i++) out[i] = out[i] + r.perp * b.jag[(i + r.seed) & 63];
+    for (auto& p : out) p = p + b.at;
+}
+
 // ---------------------------------------------------------------- drawing
 
 void Particles::submit(const Mat4& view, const Mat4& proj) {
+    view_ = view;
     // camera axes from the view matrix (row-vector, left-handed: columns hold right / up / forward)
     Vec3 right(view.m[0][0], view.m[1][0], view.m[2][0]), up(view.m[0][1], view.m[1][1], view.m[2][1]),
         fwd(view.m[0][2], view.m[1][2], view.m[2][2]);
@@ -545,11 +655,50 @@ void Particles::submit(const Mat4& view, const Mat4& proj) {
         auto& rings = byTex[{splashTex, 0}];
         const uint8_t rainCol[4] = {255, 255, 255, 20}, ringCol[4] = {0xdc, 0xe6, 0xff, 0xd2};
         float ex = proj.m[0][0], ey = proj.m[1][1];
-        int tx0 = int(std::floor(eye_.x / 32.f)), tz0 = int(std::floor(eye_.z / 32.f));
+        // FUN_100a1a30: the tiles inside the view's ground rectangle (here the frustum out to kTileReach tiles) go into
+        // a max-heap keyed 1e12 - (squared distance from the camera to the tile centre), inserted row by row (z, then
+        // x); the nearest 25 are popped and drawn nearest first, then the rest in the heap's array order. Each tile
+        // draws the drop field (FUN_10096fe0 -> FUN_100f7f00) until the frame's allowance is spent, so this order
+        // decides which drops show.
+        float far = float(kTileReach) * 32.f, hx = far / std::max(0.1f, ex), hy = far / std::max(0.1f, ey);
+        float x0r = eye_.x, x1r = eye_.x, z0r = eye_.z, z1r = eye_.z;
+        for (int c = 0; c < 4; c++) {
+            Vec3 q = eye_ + fwd * far + right * (c & 1 ? hx : -hx) + up * (c & 2 ? hy : -hy);
+            x0r = std::min(x0r, q.x), x1r = std::max(x1r, q.x), z0r = std::min(z0r, q.z), z1r = std::max(z1r, q.z);
+        }
+        int cx0 = std::max(0, int(std::floor(x0r / 32.f))), cz0 = std::max(0, int(std::floor(z0r / 32.f)));
+        int cx1 = std::min(128, int(std::floor(x1r / 32.f)) + 1), cz1 = std::min(128, int(std::floor(z1r / 32.f)) + 1);
+        struct HeapEntry { double key; int x, z; };
+        std::vector<HeapEntry> heap(1, HeapEntry{1e13, 0, 0});
+        for (int tz = cz0; tz < cz1; tz++)
+            for (int tx2 = cx0; tx2 < cx1; tx2++) {
+                double dx = eye_.x - (tx2 * 32.0 + 16.0), dz = eye_.z - (tz * 32.0 + 16.0);
+                HeapEntry e{1e12 - (dx * dx + dz * dz), tx2, tz};
+                heap.push_back(e);
+                size_t i = heap.size() - 1;
+                while (!(e.key < heap[i >> 1].key)) heap[i] = heap[i >> 1], i >>= 1;
+                heap[i] = e;
+            }
         std::vector<std::pair<int, std::pair<int, int>>> tiles;
-        for (int dz = -kTileReach; dz <= kTileReach; dz++)
-            for (int dx = -kTileReach; dx <= kTileReach; dx++) tiles.push_back({dx * dx + dz * dz, {tx0 + dx, tz0 + dz}});
-        std::sort(tiles.begin(), tiles.end());
+        int count = int(heap.size()) - 1;
+        for (int pops = std::min(25, count); pops > 0; pops--) {
+            HeapEntry top = heap[1], v = heap[size_t(count)];
+            count--;
+            int i = 1;
+            if (0 < (count >> 1)) {
+                int c;
+                do {
+                    c = i * 2;
+                    if (c < count && heap[size_t(c)].key < heap[size_t(c) + 1].key) c++;
+                    if (heap[size_t(c)].key <= v.key) break;
+                    heap[size_t(i)] = heap[size_t(c)];
+                    i = c;
+                } while (c <= (count >> 1));
+            }
+            heap[size_t(i)] = v;
+            tiles.push_back({0, {top.x, top.z}});
+        }
+        for (int i = 1; i <= count; i++) tiles.push_back({0, {heap[size_t(i)].x, heap[size_t(i)].z}});
         int drawn = 0, n = w_.n;
         Vec3 dirW = fallDir_ * (1.f / length(fallDir_));
         for (auto& tt : tiles) {
@@ -595,6 +744,37 @@ void Particles::submit(const Mat4& view, const Mat4& proj) {
                     streaks.push_back(vert(E + wv, 0, 0, rainCol));
                 }
                 drawn++;
+            }
+        }
+    }
+    // lightning (FUN_100f0ed0): a level flash square at the top of the channel, half-size (1 - age / life)^2 x 5,
+    // effect2c.tga 0.5 .. 0.75 x 0.75 .. 1, colour 0xffdcff fading with it; then each live ribbon (FUN_100f1c00) as
+    // quads between its points, widened by (-+0.707 w, 0.707 w, 0) in the world (the x sign by the curve's slope),
+    // effect2c.tga 0.75 .. 1 x 0 .. 0.06, white; the roughening moves on by 2 each frame
+    if (!bolts_.empty()) {
+        int tex = texture("effect2c.tga");
+        auto& add = byTex[{tex, 1}];
+        for (auto& b : bolts_) {
+            float f = 1.f - b.age / b.life, hs = f * f * 5.f;
+            Vec3 top = b.at + Vec3(0, 80.f, 0);
+            const uint8_t fc[4] = {0xff, 0xdc, 0xff, uint8_t(std::max(0.f, std::min(255.f, f * 255.f)))};
+            Vertex q[4] = {vert(top + Vec3(hs, 0, hs), 0.5f, 0.75f, fc), vert(top + Vec3(-hs, 0, hs), 0.75f, 0.75f, fc),
+                           vert(top + Vec3(-hs, 0, -hs), 0.75f, 1.f, fc), vert(top + Vec3(hs, 0, -hs), 0.5f, 1.f, fc)};
+            add.insert(add.end(), {q[0], q[1], q[2], q[0], q[2], q[3]});
+            const uint8_t wc[4] = {255, 255, 255, 255};
+            for (auto& r : b.rib) {
+                if (!r.on) continue;
+                std::vector<Vec3> pts;
+                ribbonPoints(r, b, pts);
+                float w = r.width;
+                float dx = (r.cp[3].y - r.cp[0].y) * (r.cp[3].x - r.cp[0].x) >= 0 ? -0.707f * w : 0.707f * w, dy = 0.707f * w;
+                Vec3 off(dx, dy, 0);
+                for (size_t i = 0; i + 1 < pts.size(); i++) {
+                    Vertex v0 = vert(pts[i] + off, 0.75f, 0.f, wc), v1 = vert(pts[i] - off, 1.f, 0.f, wc),
+                           v2 = vert(pts[i + 1] - off, 1.f, 0.06f, wc), v3 = vert(pts[i + 1] + off, 0.75f, 0.06f, wc);
+                    add.insert(add.end(), {v0, v1, v2, v0, v2, v3});
+                }
+                r.seed = uint8_t(r.seed + 2);
             }
         }
     }

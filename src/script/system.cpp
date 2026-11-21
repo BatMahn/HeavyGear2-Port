@@ -187,6 +187,18 @@ void ScriptSystem::attachScript(const std::string& file, int unit) {
     vms_.back().vm->signal(0);
 }
 
+void ScriptSystem::detachScripts(int unit) {
+    if (unit < 0) return;
+    for (auto& i : vms_)
+        if (i.unit == unit) {
+            ScriptVM* v = i.vm.get();
+            timers_.erase(std::remove_if(timers_.begin(), timers_.end(), [&](const Timer& t) { return t.vm == v; }), timers_.end());
+            if (fade.vm == v) fade.vm = nullptr;
+            if (cinematic.vm == v) cinematic.vm = nullptr;
+        }
+    vms_.erase(std::remove_if(vms_.begin(), vms_.end(), [&](const Instance& i) { return i.unit == unit; }), vms_.end());
+}
+
 void ScriptSystem::setTimer(ScriptVM& vm, float seconds, int sig) {
     if (seconds <= 0) return;
     timers_.push_back({&vm, time_ + seconds, sig & 0x3f});
@@ -439,6 +451,20 @@ void ScriptSystem::bindBuiltins() {
     });
     V::bind("IsAlive", 1, [](V& vm, const uint8_t* t, ScriptValue& r) {
         r.setInt(g_sys->world().isAlive(g_sys->world().findUnit(vm.strings().get(argI(t, 4)))));
+    });
+    // IsPilotAlive (FUN_100d42c0 / FUN_100d4320): a squad slot 7 .. 0x11 names a campaign wingman (FUN_100b47c0,
+    // the table at 0x1015eff8: Bray, Kage, Mailliaux, Nulf, ONeil, Pinter, Pulciano, Sobec, Temple, Vesping,
+    // Wallis), or the name is given; the result is 0 when that pilot's roster status (FUN_10084170 after
+    // FUN_100842e0) is > 0 - ejected - and 1 otherwise, also with no campaign roster (single missions, network)
+    V::bind("IsPilotAlive", 0, [](V&, const uint8_t* t, ScriptValue& r) {
+        static const char* names[11] = {"Bray", "Kage", "Mailliaux", "Nulf", "ONeil", "Pinter",
+                                        "Pulciano", "Sobec", "Temple", "Vesping", "Wallis"};
+        int slot = argI(t, 4);
+        int status = slot > 6 && slot < 0x12 ? g_sys->world().pilotStatus(names[slot - 7 > 10 ? 0 : slot - 7]) : 0;
+        r.setInt(status > 0 ? 0 : 1);
+    });
+    V::bind("IsPilotAlive", 1, [](V& vm, const uint8_t* t, ScriptValue& r) {
+        r.setInt(g_sys->world().pilotStatus(vm.strings().get(argI(t, 4))) > 0 ? 0 : 1);
     });
     V::bind("MissionOver", 0, [](V&, const uint8_t* t, ScriptValue&) { g_sys->world().missionOver(argI(t, 4), 0.f); });
     V::bind("MissionOver", 1, [](V&, const uint8_t* t, ScriptValue&) { g_sys->world().missionOver(argI(t, 8), argF(t, 4)); });

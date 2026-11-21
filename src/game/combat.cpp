@@ -94,9 +94,11 @@ bool Combat::init(const FileSystem& fs, Scene& scene, const GearDef& def, int pl
         const MissionObject& o = m.objects[i];
         if (o.defIndex < 0 || size_t(o.defIndex) >= m.defs.size() || int(i) == playerObject) continue;
         GearDef g;
-        if (parseGearDef(m.defs[size_t(o.defIndex)].data, m.defs[size_t(o.defIndex)].size, g) && g.hitPoints > 0 &&
-            g.hitPoints < 99999)
-            structure_[int(i)] = float(g.hitPoints);
+        if (!parseGearDef(m.defs[size_t(o.defIndex)].data, m.defs[size_t(o.defIndex)].size, g)) continue;
+        // unit classes (gears, turrets, vehicles, infantry, walkers, planes) are units with their definition's
+        // armour whether or not the AI drives them (the AI re-registers its own with the same definition)
+        if (isUnitClass(o.type)) addUnit(int(i), g);
+        else if (g.hitPoints > 0 && g.hitPoints < 99999) structure_[int(i)] = float(g.hitPoints);
     }
     Renderer& r = scene.renderer();
     auto mk = [&](uint8_t cr, uint8_t cg, uint8_t cb, uint8_t ca) {
@@ -141,6 +143,7 @@ void Combat::setLoadout(int object, const std::vector<std::pair<int, int>>& weap
         }
     if (out.empty()) return;
     // ranged weapons first: melee weapons share a hand with a gun and are the last resort
+    it->second.first = out.front().def;  // +0xb88 keeps the placement order (FUN_1004f730)
     std::stable_partition(out.begin(), out.end(), [](const Loadout& l) { return l.def->type != 2; });
     it->second.loadout = out;
     it->second.broken.assign(out.size(), false);
@@ -168,7 +171,7 @@ void Combat::revive(int object, const GearDef& def) {
     Unit keep = it->second;
     addUnit(object, def);
     Unit& u = units_[object];
-    u.loadout = keep.loadout, u.broken.assign(u.loadout.size(), false), u.remote = keep.remote;
+    u.loadout = keep.loadout, u.broken.assign(u.loadout.size(), false), u.remote = keep.remote, u.first = keep.first;
     for (auto& l : u.loadout)
         if (l.def && l.def->ammunition > 0) l.ammo = l.def->ammunition;
     if (keep.maxHp > 0 && u.armoured) {  // keep shell stats (setStats)
@@ -186,37 +189,13 @@ void Combat::setSystems(int object, int sensors, int maneuver, uint32_t perks, u
     it->second.maneuverNow = maneuver;
 }
 
-float Combat::aimSpread(int shooter, int target) const {
-    float k = 1.f;
-    int jam = ecm(target) - eccm(shooter);
-    if (jam > 0) k *= 1.f + 0.15f * float(jam);
-    k *= 1.f + 0.25f * float(field(shooter, 1, 17, 2));               // Defective Fire Control
-    k *= std::max(0.6f, 1.f + 0.08f * float(maneuverRating(target)));  // nimble gears are harder to hit
-    if (sniper(shooter)) k *= 0.75f;                                     // Sniper Systems
-    if (target == designated_ && shooter >= 0 && size_t(shooter) < scene_->mission().objects.size() &&
-        scene_->mission().objects[size_t(shooter)].team == designatorTeam_)
-        k *= 0.7f;                                                       // a designated target
-    return k;
-}
-
 float Combat::concealment(int object) const {
     auto it = units_.find(object);
     if (it == units_.end()) return 0.15f;
     const Unit& u = it->second;
     float base = u.posture == 0 ? 0.4f : u.posture == 2 ? 0.25f : 0.15f;
     float c = base + 0.05f * float(u.flaws >> 10 & 7) - 0.15f * float(u.flaws >> 25 & 1);
-    c = std::clamp(c, 0.f, 1.f);
-    if (clock_ - u.firedAt < 2.f) c *= 0.5f;  // muzzle flashes give a gear away
-    return c;
-}
-
-float Combat::detectFactor(int viewer, int target) const {
-    float k = std::max(0.4f, 1.f + 0.1f * float(sensorRating(viewer)));
-    // concealment against a standing gear's 0.15; ECCM sees through some of the stealth
-    float c = concealment(target) - 0.025f * float(eccm(viewer));
-    k *= std::max(0.2f, (1.f - std::max(0.f, c)) / 0.85f);
-    if (field(viewer, 1, 15, 2)) k *= 1.f - 0.15f * float(field(viewer, 1, 15, 2));  // Defective Active Sensors
-    return k;
+    return std::clamp(c, 0.f, 1.f);
 }
 
 void Combat::setStats(int object, int armor, int fireControl) {
@@ -232,6 +211,7 @@ void Combat::setStats(int object, int armor, int fireControl) {
 void Combat::addUnit(int object, const GearDef& def) {
     Unit u;
     u.loadout = buildLoadout(def);
+    u.first = u.loadout.empty() ? nullptr : u.loadout.front().def;
     u.broken.assign(u.loadout.size(), false);
     u.armoured = def.armor > 0;
     // FUN_1004bcf0 stores Armor x 10; things without it use their structure points (0xad)
@@ -239,6 +219,7 @@ void Combat::addUnit(int object, const GearDef& def) {
     u.hp = u.maxHp = hp;
     u.fireControl = def.fireControl;
     u.sensors = def.sensors, u.maneuverStat = def.maneuverability, u.perks = def.perks, u.flaws = def.flaws;
+    for (int i = 0; i < 6; i++) u.sens.det[i] = def.detection[i];
     u.maneuverNow = def.maneuverability;
     u.movement = u.movementBase = std::max(1, def.movement1);
     {
@@ -297,7 +278,6 @@ bool Combat::weaponBroken(int object, int index) const {
 bool Combat::sensorsOkRaw(int object) const {
     auto it = units_.find(object);
     if (it == units_.end()) return true;
-    if (it->second.sensorsLost) return false;
     for (auto& p : it->second.parts)
         if (p.system == 3 && p.gone) return false;
     return true;
@@ -305,12 +285,7 @@ bool Combat::sensorsOkRaw(int object) const {
 
 bool Combat::sensorsOk(int object) const {
     auto it = units_.find(object);
-    if (it == units_.end()) return true;
-    if (it->second.sensorsLost) return false;    // FUN_100622b0 took the sensors (and the backup)
-    if (it->second.perks >> 5 & 1) return true;  // Backup Sensors
-    for (auto& p : it->second.parts)
-        if (p.system == 3 && p.gone) return false;
-    return true;
+    return it == units_.end() || !(it->second.sens.off & 16);
 }
 
 bool Combat::muzzle(int shooter, Vec3& out) const {
@@ -345,6 +320,7 @@ void Combat::partDestroyed(int object, Unit& u, Part& part, const Vec3& at) {
 
 float Combat::health(int object) const {
     auto it = units_.find(object);
+    if (it != units_.end() && (it->second.ejected || it->second.dying >= 0)) return 0.f;  // +0xc11 / +0xc10
     return it == units_.end() || it->second.maxHp <= 0 ? 1.f : std::max(0.f, it->second.hp / it->second.maxHp);
 }
 
@@ -458,7 +434,7 @@ bool Combat::fire(int shooter, const Vec3& muzzle, const Vec3& aim) {
     // rounds a NextBurst pause, after which Next_Round_Time runs again
     l.cooldown = std::max(0.03f, w.nextRoundTime);
     if (w.burst > 0 && ++l.burstCount >= w.burst) l.burstCount = 0, l.cooldown += std::max(0.f, w.nextBurst);
-    it->second.firedAt = clock_;
+    it->second.shotDamage += w.damage;  // FUN_10050190: brain +0x94 += the round's damage
     if (l.ammo > 0) l.ammo--;
     shotsBy[shooter]++;
     Vec3 dir = normalize(aim - muzzle);
@@ -483,18 +459,13 @@ bool Combat::fire(int shooter, const Vec3& muzzle, const Vec3& aim) {
     }
     float speed = std::max(60.f, w.velocity);
     Shot sh{muzzle, dir * speed, range / speed, &w, false, shooter};
+    // guided missiles take the shooter's target (the user's HUD target, an AI's brain target) and home on it while
+    // the shooter's radar isn't jammed (FUN_100e62b0); there is no lock roll
     static const char* guided[] = {"AAM", "AGM", "ATM", "HATM"};
     for (const char* g : guided)
         if (w.name == g) {
             auto t = aimTarget_.find(shooter);
-            if (t != aimTarget_.end() && t->second >= 0 && alive(t->second)) {
-                sh.target = t->second;
-                // the target's ECM tries to break the lock; the shooter's ECCM holds it (ECCM x 100 against a
-                // roll, FUN_101117f0)
-                int e = ecm(sh.target);
-                sh.jammed = e > 0 && rand() % 1000 >= eccm(shooter) * 100 && rand() % 100 < e * 20;
-                sh.life *= 1.3f;
-            }
+            if (t != aimTarget_.end() && t->second >= 0 && alive(t->second)) sh.target = t->second, sh.life *= 1.3f;
             break;
         }
     if (explosive(w)) sh.trail = startTrail(std::max(0, w.trailEffect), muzzle);
@@ -569,28 +540,37 @@ void Combat::impact(const Vec3& p, const WeaponDef& w, int object, int shooter, 
             Vec3 q;
             if (!scene_->objectPosition(int(i), q) || scene_->objectHidden(int(i))) continue;
             float dist = length(q - p);
-            if (dist <= w.collateralRadius) blasts_.push_back({int(i), dist / 60.f, d, p, shooter, mask, haywire});
+            if (dist <= w.collateralRadius) blasts_.push_back({int(i), dist / 60.f, d, p, shooter, mask, haywire, w.damage});
         }
     }
     if (object < 0 || size_t(object) >= damage.size()) return;
     if (audio && !explosive(w)) audio->play("hitbull6.wav", 0.5f, &p, 200.f);
+    // FUN_100501f0 (from the unit's damage handler): a round hitting a unit of a team (not neutral) adds its
+    // damage to the shooter's brain +0x98
+    if (units_.count(object) && scene_->mission().objects[size_t(object)].team != 99) {
+        auto sh2 = units_.find(shooter);
+        if (sh2 != units_.end()) sh2->second.hitDamage += w.damage;
+    }
     applyDamage(object, shooter, d, p, mask, haywire);
 }
 
-void Combat::applyDamage(int object, int shooter, float d, const Vec3& p, uint32_t mask, bool haywire) {
+void Combat::applyDamage(int object, int shooter, float d, const Vec3& p, uint32_t mask, bool haywire, bool directional) {
     if (object < 0 || size_t(object) >= damage.size() || d <= 0) return;
+    {
+        // FUN_10063460: no damage once the gear is going down (+0xc10) or its pilot is out (+0xc11)
+        auto it = units_.find(object);
+        if (it != units_.end() && (it->second.ejected || it->second.dying >= 0)) return;
+    }
     damage[size_t(object)] += d;
-    const MissionObject& o = scene_->mission().objects[size_t(object)];
     auto u = units_.find(object);
     if (u == units_.end()) {
         auto st = structure_.find(object);
         if (st != structure_.end()) {  // buildings: structure points
             hits.push_back({object, shooter, 2});
             if (st->second > 0 && (st->second -= d) <= 0) destroyObject(object, p);
-        } else if (isUnitClass(o.type) && damage[size_t(object)] >= 600.f) {
-            hits.push_back({object, shooter, 2});
-            destroyObject(object, p);
         }
+        // (a unit-class object without a definition can't exist in the original - every object is built from one -
+        // so the port's old 600-damage kill for those is gone; they just take no damage)
         return;
     }
     Unit& un = u->second;
@@ -601,11 +581,12 @@ void Combat::applyDamage(int object, int shooter, float d, const Vec3& p, uint32
         return;
     }
     int level = 2;
+    bool finished = false;  // FUN_10062980 already ran for this hit
     if (!un.invincible) {
         // FUN_100f3630: the hit's direction against the unit's axes; within 60 deg of its fore-aft axis it is a
         // front / back hit (word bits 1 / 2), otherwise a side hit (8 / 4)
         int dirBit = 0;
-        {
+        if (directional) {
             Vec3 tp, src = p;
             if (shooter >= 0 && shooter != object) scene_->objectPosition(shooter, src);
             Vec3 back, side;
@@ -619,10 +600,14 @@ void Combat::applyDamage(int object, int shooter, float d, const Vec3& p, uint32
             }
         }
         float before = un.hp, A = un.hp, lost = 0;
-        // the facing's Reinforced Armor level adds 2 per level to the armour the hit is measured against (+0xc34)
-        if (dirBit) {
-            int k = dirBit == 1 ? 0 : dirBit == 2 ? 1 : dirBit == 4 ? 2 : 3;
-            A += 2.f * float(un.flaws >> (2 * k) & 3);
+        // FUN_100618a0: the facing's Reinforced Armor level (flaw word +0xc34 bits 0-1 front, 2-3 rear, 4-5 for
+        // direction 8, 6-7 for direction 4) adds 20 per level to the armour x 10 the hit is measured against; a
+        // facing without it is halved by its Weak Facing flaw (bits 28 / 29 / 30 / 31 for directions 1 / 2 / 8 / 4)
+        if (dirBit && un.gear) {
+            int k = dirBit == 1 ? 0 : dirBit == 2 ? 1 : dirBit == 8 ? 2 : 3;
+            int lv = int(un.flaws >> (2 * k) & 3);
+            if (lv) A += 20.f * float(lv);
+            else if (un.flaws >> (28 + k) & 1) A = std::floor(A * 0.5f);
         }
         bool kill = false;
         uint32_t crit = 0;
@@ -637,6 +622,7 @@ void Combat::applyDamage(int object, int shooter, float d, const Vec3& p, uint32
                 un.knock = dirBit == 1 ? 0x11 : 0x12;
             level = sev >= 3 ? 4 : sev == 2 ? 3 : 2;
             float hp0 = un.hp;
+            un.finishLater = false;
             applyCritical(object, un, crit, kill);
             // haywire (damage word bit 0x40, FUN_10063460): unless Haywire Resistant (perk bit 17), another critical
             // roll, and a third with flaw bit 27
@@ -646,6 +632,20 @@ void Combat::applyDamage(int object, int shooter, float d, const Vec3& p, uint32
             }
             lost = hp0 - un.hp;
             un.hp = hp0;
+            // FUN_10062430 -> FUN_10062980: destroyed (0x100000) and the fatal cockpit roll finish the gear now, the
+            // knock-down critical (0x80000) after the fall; either way the pilot may eject first
+            if (un.gear && (kill || un.finishLater)) {
+                bool later = !kill;
+                kill = false;
+                un.hp = std::max(0.f, un.hp - lost), lost = 0;
+                finishGear(object, un, p, later, kill);
+                finished = true;
+                if (!kill) {
+                    hits.push_back({object, shooter, level});
+                    hitsBy[shooter]++;
+                    return;
+                }
+            }
         }
         un.hp = kill ? 0.f : std::max(0.f, un.hp - lost);
         // locate the hit on the damage hierarchy: the nearest surviving part takes the same wear
@@ -667,6 +667,15 @@ void Combat::applyDamage(int object, int shooter, float d, const Vec3& p, uint32
     }
     hits.push_back({object, shooter, level});
     hitsBy[shooter]++;
+    if (un.hp <= 0 && un.gear && !finished && !un.ejected && un.dying < 0) {
+        // armour worn to nothing: the next hit is a 0x100000 in the original (D >= 6 x 0); finish it the same way
+        bool kill = false;
+        finishGear(object, un, p, false, kill);
+        if (!kill) {
+            if (shooter >= 0 && shooter != object) killsBy[shooter]++;
+            return;
+        }
+    }
     if (un.hp <= 0) {
         if (shooter >= 0 && shooter != object) killsBy[shooter]++;
         if (object == playerObject_) {
@@ -675,6 +684,138 @@ void Combat::applyDamage(int object, int shooter, float d, const Vec3& p, uint32
         } else {
             destroyObject(object, p);
         }
+    }
+}
+
+void Combat::finishGear(int object, Unit& u, const Vec3& p, bool delayed, bool& kill) {
+    // FUN_10062980 (gear vtable 0x101434a0). Multiplayer (DAT_101fcf44 + 0x1b), and the player's own gear unless it
+    // comes from the knock-down critical, go straight to the destruction (vtable +0xc8, FUN_10062bc0). Otherwise a
+    // roll r = rand / 32767 against the ejection chance +0xd88:
+    //  r >= chance (always, for -1): delayed -> +0xc10 and a 0.8 .. 2.8 s timer (+0x13dc, run down by FUN_100668b0,
+    //                                then FUN_10062bc0); immediate -> destroyed now.
+    //  r <  chance: delayed -> +0xc11 only (the gear stands down where it fell); immediate -> FUN_10062ad0: +0xc11,
+    //               object flag 0x8000 (no more damage), the knock-down ECY trigger 0x13 once, and with
+    //               rand / 32767 > 0.25 FUN_100632e0 leaves the gear's slot-0 weapon on the ground (outside space).
+    // FUN_10062980 also stops the unit first (vtable +0x1b4, FUN_10056040(0), FUN_10049a10(1)).
+    kill = false;
+    if (multiplayer || (object == playerObject_ && !delayed)) {
+        kill = true;
+        return;
+    }
+    float r = float(rand() % 32768) * 3.0518509e-05f;  // DAT_101433c0
+    if (u.ejectChance <= r) {
+        if (delayed) u.dying = 0.8f + float(rand() % 32768) * 6.1037019e-05f;  // DAT_101433d0 - rand x DAT_101433c8
+        else kill = true;
+        if (getenv("HG2_DEBUG")) SDL_Log("gear %d finished: %s", object, delayed ? "going down" : "destroyed");
+        return;
+    }
+    u.ejected = true;
+    u.hp = 0;
+    if (!delayed && !multiplayer && !u.knock) u.knock = 0x13;
+    // FUN_10062ad0 (immediate only): with rand / 32767 > 0.25 (DAT_101433d8) vtable +0x2a4, FUN_100632e0, outside
+    // space: when the slot-0 weapon object (+0xb88[0]) is an ordinary, two-handed or melee weapon (class +0x2ac <= 2,
+    // not a grenade / haywire / remote charge) a new weapon object of the same keyword and definition is made
+    // (FUN_10049f40), given the gear's rounds (+0x1d4 / +0x1d8) and hardpoint (+0x2b0), no owner (+0x278 = 0), a
+    // 40 s life (+0x300) and the gear's transform: the gun is left lying where the gear stood. It is not a pilot.
+    if (!delayed && float(rand() % 32768) * 3.0518509e-05f > 0.25f && !space_ && u.first && u.first->type <= 2) {
+        Dropped d{u.first, Mat4::identity(), -1, 40.f};
+        for (auto& l : u.loadout)
+            if (l.def == u.first) { d.ammo = l.ammo; break; }
+        if (scene_->objectWorld(object, d.world)) {
+            dropped_.push_back(d);
+            if (getenv("HG2_DEBUG"))
+                SDL_Log("gear %d: %s left on the ground (%d rounds, model %s %s)", object, d.def->name.c_str(), d.ammo,
+                        d.def->geometry.empty() ? "-" : d.def->geometry[0].c_str(),
+                        !d.def->geometry.empty() && scene_->extraModel(d.def->geometry[0]) ? "loaded" : "missing");
+        }
+    }
+    if (object == playerObject_) log.push_back("EJECTED");
+    destroyed.push_back(object);  // out of the fight: the squad / script bookkeeping treats it as lost
+    ejectedList.push_back(object);
+    if (getenv("HG2_DEBUG")) SDL_Log("gear %d: pilot ejected (%s)", object, delayed ? "after a fall" : "now");
+    (void)p;
+}
+
+void Combat::hardLanding(int object, float v) {
+    auto it = units_.find(object);
+    if (it == units_.end() || !it->second.gear || it->second.hp <= 0 || v <= 20.f) return;
+    // FUN_1003cc30: +0x1078 = 1 from 40 m/s (+0x1088), else (|v| - 20) / (40 - 20); D = ftol(+0x1078 x 2000)
+    // (DAT_10140ca8) in the damage word's top bits, no flags, mask 0xff, the hit sounds on (vtable +0x8c)
+    float frac = v >= 40.f ? 1.f : (v - 20.f) / 20.f;
+    float D = std::trunc(frac * 2000.f);
+    if (D < 1.f) return;
+    Vec3 p;
+    scene_->objectPosition(object, p);
+    if (getenv("HG2_DEBUG")) SDL_Log("hard landing: object %d at %.1f m/s, damage %.0f", object, v, D);
+    applyDamage(object, -1, D, p, 0xff, false, false);
+}
+
+void Combat::ram(int a, int b) {
+    if (a == b || !scene_) return;
+    auto sp = [&](int o) { auto it = speeds_.find(o); return it == speeds_.end() ? 0.f : it->second; };
+    // FUN_100a63d0: v = the two owners' vtable +0x164 (the signed forward speed: -(velocity . Z), +0xf80); the
+    // volumes are the proxies' +0x58 (FUN_100a79b0: the model box's extents multiplied, at least 0.1). The amounts
+    // are rounded to the nearest integer (the 1.5 x 2^52 trick, DAT_1015a570) after x 0.1 (DAT_10146fa0); 1/22 is
+    // DAT_10147088.
+    const float v = sp(a) + sp(b), va = scene_->boxVolume(a), vb = scene_->boxVolume(b);
+    const int toB = int(std::nearbyint((v * float(1.0 / 22.0) * va - vb) * 0.1f));
+    const int toA = int(std::nearbyint((v * float(1.0 / 22.0) * vb - va) * 0.1f));
+    auto hit = [&](int victim, int other, int D) {
+        if (D <= 0) return;
+        Vec3 p;
+        scene_->objectPosition(victim, p);
+        if (getenv("HG2_DEBUG")) SDL_Log("ram: object %d by %d (speeds %.1f), damage %d", victim, other, v, D);
+        // the word D << 14 | 0x400 (no hit direction) with mask 6 and the hit sounds on, no attacker
+        applyDamage(victim, -1, float(D), p, 6, false, false);
+    };
+    hit(b, a, toB);
+    hit(a, b, toA);
+}
+
+void Combat::environment(int object, Unit& u) {
+    // FUN_1003db20 (gear vtable +0x170, the contact handler the world update FUN_100a5af0 calls once a frame)
+    if (!u.gear || u.hp <= 0 || u.ejected || u.dying >= 0) return;
+    Vec3 p;
+    if (!scene_->objectPosition(object, p)) return;
+    // lava: for the player's gear only (+0x1f0), a ground contact whose terrain is within 2 m (DAT_10140b90) of the
+    // body takes vtable +0x8c with the word (surface damage x 10) << 14 | 0x10, mask 0xff, every frame. The surface
+    // record (FUN_10078570, 0x48 bytes) +4 is the damage. Neither Heat Resistant Armor (perk bits 18-21; only the
+    // heat-sensor detection test FUN_10110xxx reads it) nor HEP (bits 22-23; never read) changes it.
+    if (object == playerObject_ && !space_) {
+        const Surface* s = scene_->surfaceAt(p.x, p.z);
+        if (s && s->damage > 0 && std::fabs(scene_->groundHeight(p.x, p.z) - p.y) < 2.f) {
+            if (getenv("HG2_DEBUG")) SDL_Log("surface %d damage %d -> %d to object %d", s->index, s->damage, s->damage * 10, object);
+            applyDamage(object, -1, float(s->damage * 10), p, 0xff, false, false);
+            if (u.hp <= 0) return;
+        }
+    }
+    // drowning: a water contact with the BDC frame (+0x11e8, else BDD) under the surface sets +0x1324 from the second
+    // frame on (the counter +0x1328 starts at 1e-5); then, unless Amphibious (perk bit 1), +0x1328 += 0.1 a frame
+    // and the word (ftol(+0x1328) x 10) << 14 | 0x100. Out of the water the counter resets.
+    if (scene_->mission().hasWater && !space_) {
+        Vec3 c;
+        if (!scene_->frameWorld(object, "bdc", c) && !scene_->frameWorld(object, "bdd", c)) c = p + Vec3(0, 4.f, 0);
+        if (c.y < scene_->waterLevel()) {
+            if (u.drown > 0) u.underWater = true;
+            u.drown += 1e-5f;
+        } else {
+            u.underWater = false, u.drown = 0;
+        }
+        if (u.underWater && !(u.perks >> 1 & 1)) {
+            u.drown += 0.1f;
+            float D = std::trunc(u.drown) * 10.f;
+            if (D >= 1.f) {
+                if (object == playerObject_ && getenv("HG2_DEBUG")) SDL_Log("drowning: %.1f -> %.0f", u.drown, D);
+                applyDamage(object, -1, D, p, 0xff, false, false);
+                if (u.hp <= 0) return;
+            }
+        }
+    }
+    // space: without Zero-G Movement (flaw word bit 14) +0x1330 += 0.1 a frame, word (ftol x 10) << 14 | 0x200
+    if (space_ && !(u.flaws >> 14 & 1)) {
+        u.vacuum += 0.1f;
+        float D = std::trunc(u.vacuum) * 10.f;
+        if (D >= 1.f) applyDamage(object, -1, D, p, 0xff, false, false);
     }
 }
 
@@ -751,13 +892,20 @@ void Combat::applyCritical(int object, Unit& u, uint32_t bits, bool& kill) {
     // FUN_10062430 (gears) / FUN_10059240 (other units), lowest bit first
     auto msg = [&](const char* m) { if (object == playerObject_) log.push_back(m); };
     auto fc = [&](int step) { u.fireControl = std::max(-5, u.fireControl - step); };
-    auto immobile = [&]() { u.movement = 1; };
+    // a Movement word at 1 sends ECY trigger 15 (the crippled stance) and sets +0xc12
+    auto immobile = [&]() { u.movement = 1; if (u.gear) u.cripple = true; };
     for (uint32_t b = 1; b && bits; b <<= 1) {
         if (!(bits & b)) continue;
         bits &= ~b;
         switch (b) {
-            case 0x80: u.movement = std::max(1, u.movement - 1), msg("DRIVE SYSTEM DAMAGED"); break;
-            case 0x100: u.movement = std::max(1, u.movement >> 1), msg("DRIVE SYSTEM DAMAGED"); break;
+            case 0x80:
+                u.movement = std::max(1, u.movement - 1), msg("DRIVE SYSTEM DAMAGED");
+                if (u.movement == 1) immobile();
+                break;
+            case 0x100:
+                u.movement = std::max(1, u.movement >> 1), msg("DRIVE SYSTEM DAMAGED");
+                if (u.movement == 1) immobile();
+                break;
             case 0x200:  // FUN_100622b0: one system lost entirely
                 for (;;) {
                     int r = int(std::lround(float(rand() % 7000) * 0.001f));
@@ -765,7 +913,11 @@ void Combat::applyCritical(int object, Unit& u, uint32_t bits, bool& kill) {
                     if (r == 2) { u.perks &= ~(7u << 13); break; }                      // ECCM
                     if (r == 3) { if (u.perks >> 4 & 1) u.perks &= ~(1u << 4); else u.flaws &= ~(1u << 14); break; }
                     if (r == 4) { u.perks &= ~(3u << 24); break; }                      // jump jets
-                    if (r == 5) { if (u.perks >> 5 & 1) u.perks &= ~(1u << 5); else u.sensorsLost = true; break; }
+                    if (r == 5) {  // Backup Sensors (perk 5) takes it; else the SENSORS display is damaged (+0x179)
+                        if (u.perks >> 5 & 1) u.perks &= ~(1u << 5);
+                        else u.sens.damaged = true, msg("SENSORS DAMAGED");
+                        break;
+                    }
                     if (r == 6) { u.flaws &= ~(7u << 10); break; }                      // stealth
                     if (r == 7) { if (u.perks >> 2 & 1) u.perks &= ~(1u << 2); else u.commsLost = true; break; }
                 }
@@ -777,6 +929,17 @@ void Combat::applyCritical(int object, Unit& u, uint32_t bits, bool& kill) {
                     if (r == 1) dropLevel(u.perks, 10, 3);
                     else if (r == 2) dropLevel(u.perks, 13, 3);
                     else if (r == 4) dropLevel(u.perks, 24, 2);
+                    else if (r == 5) {  // FUN_10119820: one sub-sensor out (1 visual, 2 ultrasonic, 3 motion, 6
+                        // magnetic, 7 the radar itself; 4 / 5 none) and the display damaged
+                        for (;;) {
+                            int k = int(std::lround(float(rand() % 7000) * 0.001f));
+                            if (k == 0) continue;
+                            static const uint8_t bit[8] = {0, 1, 2, 4, 0, 0, 8, 16};
+                            u.sens.off |= bit[k];
+                            break;
+                        }
+                        u.sens.damaged = true, msg("SENSORS DAMAGED");
+                    }
                     else if (r == 6) dropLevel(u.flaws, 10, 3);
                     else if (r == 0 || r == 7) done = false;
                 }
@@ -793,7 +956,10 @@ void Combat::applyCritical(int object, Unit& u, uint32_t bits, bool& kill) {
                 }
                 break;
             case 0x4000: fc(1), fc(1), msg("FIRE CONTROL DAMAGED"); break;
-            case 0x8000:  // cockpit (Backup Life Support perk bit 0 takes it once)
+            // cockpit: FUN_10062430 at 0x100627e6 tests perk-word bit 0 (test byte [esi+0xc30], 1) and clears it, so
+            // the roll is absorbed once by Ammo_Fuel_Containment_System (PERKSTBL id 1, bit 0), not Backup Life
+            // Support (id 5, bit 4). The original's choice, kept.
+            case 0x8000:
                 if (u.perks & 1) { u.perks &= ~1u; break; }
                 if ((u.flaws >> 24 & 1) ? (rand() & 2) != 0 : (rand() & 1) == 0) kill = true;
                 else immobile(), msg("DRIVE SYSTEM DAMAGED");
@@ -803,7 +969,9 @@ void Combat::applyCritical(int object, Unit& u, uint32_t bits, bool& kill) {
             case 0x40000: immobile(); break;
             case 0x80000:
                 if (!u.gear) { kill = true; break; }
+                // knocked over once (single player, +0x13d0), then FUN_10062980(1)
                 if (!multiplayer && !u.knock) u.knock = (rand() & 1) ? 0x13 : 0x14;
+                u.finishLater = true;
                 break;
             case 0x100000: kill = true; break;
             // armour: gears -3 / -8 / -25 (FUN_10062430), other units -5 / -10 / -20 (FUN_10059240), on armour x 10
@@ -828,19 +996,24 @@ void Combat::destroyObject(int object, const Vec3& p) {
 
 void Combat::update(float dt) {
     clock_ += dt;
+    updateSensors(dt);
+    // the per-frame environment damage (FUN_100a5af0 calls the contact handler once a frame), at the original's frame
+    // rate (kFrameHz)
+    for (envClock_ += dt; envClock_ >= 1.f / kFrameHz; envClock_ -= 1.f / kFrameHz)
+        for (auto& [obj, u] : units_)
+            if (!u.remote) environment(obj, u);
     for (auto& [obj, u] : units_) {
         for (auto& l : u.loadout) l.cooldown = std::max(0.f, l.cooldown - dt);
-        // damaging terrain (lava): units standing on a surface with a damage value take it about once a second
-        // while their feet touch the ground (the gear's contact handler, vtable +0x8c from FUN_1003db20)
-        if (u.hp > 0 && (u.surfaceTimer -= dt) <= 0) {
-            u.surfaceTimer = 1.f;
+        // +0xc10: the knock-down that failed to eject runs its timer down, then the gear blows up (FUN_100668b0)
+        if (u.dying >= 0 && (u.dying -= dt) < 0) {
+            u.dying = -1.f, u.hp = 0;
             Vec3 p;
-            if (scene_->objectPosition(obj, p)) {
-                const Surface* s = scene_->surfaceAt(p.x, p.z);
-                if (s && s->damage > 0 && std::fabs(p.y - scene_->groundHeight(p.x, p.z)) < 1.f) {
-                    if (getenv("HG2_DEBUG")) SDL_Log("surface %d damage %d to object %d", s->index, s->damage, obj);
-                    applyDamage(obj, -1, float(s->damage), p);
-                }
+            scene_->objectPosition(obj, p);
+            if (obj == playerObject_) {
+                destroyed.push_back(obj);
+                if (!particles || !particles->spawn("EXP_HG", p, 1.5f)) flashes_.push_back({p, 0.f, 6.f});
+            } else {
+                destroyObject(obj, p);
             }
         }
         // damaged gears smoke (DAMAGEL light / DAMAGEH heavy)
@@ -869,7 +1042,7 @@ void Combat::update(float dt) {
         Shot& s = shots_[i];
         s.life -= dt;
         bool dead = s.life <= 0;
-        if (!s.beam && !dead && s.target >= 0 && !s.jammed && alive(s.target)) {  // guided: turn towards the target
+        if (!s.beam && !dead && s.target >= 0 && !radarJammed(s.shooter) && alive(s.target)) {  // guided: turn towards the target
             Vec3 tp;
             if (scene_->objectPosition(s.target, tp)) {
                 tp.y += 3.f;
@@ -882,6 +1055,20 @@ void Combat::update(float dt) {
         if (!s.beam && dead && explosive(*s.def)) impact(s.pos, *s.def, -1, s.shooter, 1.f, true);  // end of flight
         if (!s.beam && !dead) {
             Vec3 next = s.pos + s.vel * dt;
+            // near misses: every unit whose 32 m cell (FUN_100a48c0: x 0.5 >> 4 on the terrain grid) the round's
+            // step touches, its shooter aside
+            if (s.shooter >= 0 && !multiplayer) {  // FUN_100b8220: single player only
+                auto cell = [](float v) { return int(std::floor(v / 32.f)); };
+                int x0 = cell(std::min(s.pos.x, next.x)), x1 = cell(std::max(s.pos.x, next.x));
+                int z0 = cell(std::min(s.pos.z, next.z)), z1 = cell(std::max(s.pos.z, next.z));
+                for (auto& [uo, uu] : units_) {
+                    if (uo == s.shooter || uu.hp <= 0 || uu.remote) continue;
+                    Vec3 up;
+                    if (!scene_->objectPosition(uo, up) || scene_->objectHidden(uo)) continue;
+                    int cx = cell(up.x), cz = cell(up.z);
+                    if (cx >= x0 && cx <= x1 && cz >= z0 && cz <= z1) nearShots.push_back({uo, s.shooter});
+                }
+            }
             float tg = scene_->terrainRay(s.pos, next), to;
             int obj = scene_->raycast(s.pos, next, s.shooter, to);
             float t = std::min(tg, to);
@@ -899,6 +1086,12 @@ void Combat::update(float dt) {
         else i++;
     }
     updateShells(dt);
+    // dropped weapons: +0x300 runs down only in network play (FUN_10094xxx, DAT_101fcf44 + 0x1b); they go at 0
+    if (multiplayer)
+        for (size_t i = 0; i < dropped_.size();) {
+            if ((dropped_[i].life -= dt) < 0) dropped_.erase(dropped_.begin() + long(i));
+            else i++;
+        }
     for (size_t i = 0; i < flashes_.size();) {
         flashes_[i].age += dt;
         if (flashes_[i].age > 0.35f) flashes_.erase(flashes_.begin() + long(i));
@@ -913,6 +1106,9 @@ void Combat::draw() {
     }
     for (auto& s : shells_)
         if (length(s.vel) > 1.f) scene_->drawExtra(tracer_, along(s.pos - normalize(s.vel) * 2.f, s.vel, 2.f, 0.3f), false);
+    for (auto& d : dropped_)
+        if (!d.def->geometry.empty())
+            if (GpuMesh* m = scene_->extraModel(d.def->geometry[0])) scene_->drawExtra(m, d.world, true);
     for (auto& f : flashes_) {
         float sz = f.size * (0.4f + f.age * 3.f);
         scene_->drawExtra(flash_, along(f.pos - Vec3(0, sz * 0.5f, 0), Vec3(0, 1, 0), sz, sz), false,
@@ -993,7 +1189,15 @@ void Combat::updateShells(float dt) {
         if ((blasts_[i].wait -= dt) > 0) { i++; continue; }
         Blast b = blasts_[i];
         blasts_.erase(blasts_.begin() + long(i));
-        if (!scene_->objectHidden(b.object)) applyDamage(b.object, b.shooter, b.damage, b.at, b.mask, b.haywire);
+        if (scene_->objectHidden(b.object)) continue;
+        // the explosion (FUN_100f3140) carries its round's shooter at +0x190 (FUN_100dece0), so the unit's damage
+        // handler (FUN_10063460) books blast damage on a unit of a team to the shooter's hit share (+0x98,
+        // FUN_100501f0) as it does a direct hit
+        if (b.share > 0 && units_.count(b.object) && scene_->mission().objects[size_t(b.object)].team != 99) {
+            auto sh = units_.find(b.shooter);
+            if (sh != units_.end()) sh->second.hitDamage += b.share;
+        }
+        applyDamage(b.object, b.shooter, b.damage, b.at, b.mask, b.haywire);
     }
 }
 }  // namespace hg2
@@ -1010,5 +1214,230 @@ void Combat::kill(int object) {
     destroyed.push_back(object);
     if (object == playerObject_) return;
     scene_->hideObject(object);
+}
+}  // namespace hg2
+
+namespace hg2 {
+// ---- sensors ----------------------------------------------------------------------------------------------------
+// The gear's SENSORS suite (FUN_10118d80) by its Sensors rating S: a contact list (FUN_1010fd40) of every unit within
+// the radar's reach, then the sub-sensors in this order: visual (S >= -4, FUN_10110070), ultrasonic (S >= 2, 100 m,
+// FUN_10110b60), motion (S >= 3, 50 m, FUN_10110630), magnetic (S = 5, 300 m, FUN_101108b0), and the radar's own
+// pass (S >= -1, FUN_101113e0). Each sensor's sensitivity is (S + 5) x 0.1 less 0.05 per sensor set up before it
+// (+0xe4, FUN_1010b850, clamped 0..1); the radar reads a quarter of its own while the unit's sensors are passive.
+// A sensor that picks a unit up refreshes the viewer team's memory nibble on it, marks it detected for the team and
+// raises its signal (+0xc50); AI units see an enemy while its concealment is within that signal (FUN_100ba1c0).
+namespace {
+constexpr float kEcmRadius[8] = {0, 150, 250, 350, 450, 550, 650, 750};  // DAT_1015a578
+inline int teamSlot(int team) { return std::clamp(team - 99, 0, 7); }
+inline float sens01(float x) { return std::clamp(x, 0.f, 1.f); }
+}  // namespace
+
+bool Combat::exposed(int target) const {
+    auto it = units_.find(target);
+    if (it == units_.end()) return true;
+    float c = concealment(target);
+    if (it->second.sens.active) c *= 0.5f;
+    return double(c) <= it->second.sens.signal;
+}
+
+void Combat::reveal(int object, float add) {
+    auto it = units_.find(object);
+    if (it == units_.end()) return;
+    auto& s = it->second.sens;
+    s.signal = 0.25 * (s.signal + double(add)) + 0.75 * s.signal;
+}
+
+bool Combat::detectedBy(int object, int team) const {
+    auto it = units_.find(object);
+    return it != units_.end() && (it->second.sens.seenBy >> teamSlot(team) & 1);
+}
+
+void Combat::toggleEcm(int object) {
+    // FUN_10110e60 (the ECM Enable key, through the SENSORS gadget's +0xe0): only a gear built with ECM has the device
+    auto it = units_.find(object);
+    if (it == units_.end() || !(it->second.perks & 0x1c00u)) return;
+    it->second.sens.ecmOn = !it->second.sens.ecmOn;
+}
+
+bool Combat::overAccurate(int object) const {
+    auto it = units_.find(object);
+    if (it == units_.end() || it->second.shotDamage <= 0) return false;
+    float acc = std::clamp(float(it->second.fireControl + 5) / 8.f, 0.05f, 1.f);
+    return it->second.hitDamage / it->second.shotDamage > acc * 0.3f;
+}
+
+Vec3 Combat::sensorAxis(int object) const {
+    const auto& objs = scene_->mission().objects;
+    int type = object >= 0 && size_t(object) < objs.size() ? objs[size_t(object)].type : 0;
+    static const char* const kPov[] = {"pov", nullptr};
+    static const char* const kHp[] = {"hp1", "pov", nullptr};
+    static const char* const kGun[] = {"hp1", nullptr};
+    const char* const* frames = kPov;
+    if (type == 0x4f || type == 0x4e) frames = kHp;
+    else if (type == 0x4b || type == 0x55) frames = kGun;
+    Mat4 m;
+    for (const char* const* f = frames; *f; f++)
+        if (scene_->frameWorldMatrix(object, *f, m)) return normalize(Vec3(m.m[2][0], m.m[2][1], m.m[2][2]) * kSensorZ);
+    Vec3 z(0, 0, 1);
+    scene_->objectAxis(object, 2, z);
+    return normalize(z * kSensorZ);
+}
+
+void Combat::updateSensors(float dt) {
+    const auto& objs = scene_->mission().objects;
+    auto raise = [](Unit::Sensors& s, double x) { s.signal = 0.25 * x + 0.75 * s.signal; };  // FUN_10016090
+    // the signal's per-frame decay (FUN_10052d90: the filter fed 0.75 y, so y *= 0.9375 a frame), at the original's
+    // frame rate (kFrameHz)
+    double decay = std::pow(0.9375, double(dt) * double(kFrameHz));
+    for (auto& [obj, u] : units_) {
+        u.sens.signal *= decay;
+        Vec3 p;
+        if (scene_->objectPosition(obj, p)) {
+            if (u.sens.havePos && dt > 0) u.sens.speed = length(p - u.sens.lastPos) / dt;
+            u.sens.lastPos = p, u.sens.havePos = true;
+        }
+    }
+    // ECM devices (FUN_10110d00, gears built with ECM): on, they drain their charge and put a jamming field of
+    // radius DAT_1015a578[ECM level] round the unit; off, they recharge at half rate up to 30 s
+    jamFields_.clear();
+    for (auto& [obj, u] : units_) {
+        auto& s = u.sens;
+        if (s.ecmCharge <= 0) s.ecmOn = false;
+        if (!s.ecmOn) { s.ecmCharge = std::min(30.f, s.ecmCharge + dt * 0.5f); continue; }
+        s.ecmCharge = std::max(0.f, s.ecmCharge - dt);
+        int level = int(u.perks >> 10 & 7);
+        if (u.hp > 0 && level > 0 && s.havePos) jamFields_.push_back({s.lastPos, kEcmRadius[level]});
+    }
+    // light and fog only reach the user's visual sensor (FUN_10119960 hands the user's suite the sun and the fog)
+    static const bool dbg = getenv("HG2_SENSDBG") != nullptr;
+    if (dbg && int(clock_) != int(clock_ - dt))
+        for (auto& [obj, u] : units_)
+            if (u.hp > 0 && u.sens.havePos)
+                SDL_Log("sens %d S%d %s sig %.3f conc %.2f exp %d seen %x jam %d ecm %d/%.0f hit %.0f/%.0f", obj, u.sensors,
+                        u.sens.active ? "act" : "pas", u.sens.signal, concealment(obj), int(exposed(obj)), u.sens.seenBy,
+                        int(u.sens.jammed), int(u.sens.ecmOn), u.sens.ecmCharge, u.hitDamage, u.shotDamage);
+    const Mission& m = scene_->mission();
+    float clip = viewDist_, clip2 = clip * clip;
+    // the visual sensors' light term (+0x1d4, FUN_1010ff90): (1 - (sun +0x198 diffuse + +0x190 ambient)) x 0.5, 0 when
+    // negative - the mission's World_Status light, as clamped when the sun is set up (Mission parse)
+    float light = std::max(0.f, (1.f - (m.lightAmbient + m.lightDiffuse)) * 0.5f);
+    bool fog = m.fogMax > m.fogMin && m.fogMin > 0;
+    float fogMin2 = fog ? m.fogMin * m.fogMin : 0.f, fogK = fog ? 1.f / ((m.fogMax - m.fogMin) * (m.fogMax - m.fogMin)) : 0.f;
+    float fogFar = fog ? std::max(0.f, (clip - m.fogMax) / clip) : 0.f;
+    for (auto& [vo, V] : units_) {
+        auto& vs = V.sens;
+        if (V.hp <= 0 || vo < 0 || size_t(vo) >= objs.size() || scene_->objectHidden(vo) || !vs.havePos) continue;
+        const bool user = vo == playerObject_;
+        // jamming (FUN_101117f0, every frame): the deepest any ECM field reaches into the radar; under ECCM x 100 m
+        // deep the ECCM holds it. A Defective Active Sensors flaw (flaw word 15..16) adds static: rand & 15 under
+        // twice its level.
+        float depth = 0;
+        for (auto& f : jamFields_) depth = std::max(depth, f.radius - length(vs.lastPos - f.pos));
+        vs.jammed = depth > 1e-5f;
+        int deep = vs.jammed ? int(depth) : 0;
+        if (vs.jammed && deep < int(V.perks >> 13 & 7) * 100) vs.jammed = false;
+        if (int defect = int(V.flaws >> 15 & 3); defect && !vs.jammed) {
+            int v = rand() & 15;
+            if (v < defect * 2) deep = v;
+            if (deep > 0) vs.jammed = true;
+        }
+        if (vs.off & 16) continue;  // the radar itself is out: no sweep
+        if ((vs.sweep += dt) < 0.2f) continue;  // +0x734: a sweep every 0.2 s
+        vs.sweep = 0;
+        const int tv = objs[size_t(vo)].team, slot = teamSlot(tv);
+        const uint8_t bit = uint8_t(1u << slot);
+        const int S = std::min(V.sensors, 5);
+        // the contact list (FUN_1010fd40; the user's isn't rebuilt while jammed); once the shared one-second clock
+        // runs out the memory fades: a unit no team remembers drops off this team's detected set, and the user's
+        // own team's memory counts down
+        bool gather = !(user && vs.jammed);
+        if (gather && (decayClock_ += dt) > 1.f) {
+            for (auto& [to, T] : units_) {
+                bool any = false;
+                for (uint8_t n : T.sens.memory) any = any || n;
+                if (!any) T.sens.seenBy &= uint8_t(~bit);
+                else if ((T.sens.seenBy & bit) && user && T.sens.memory[slot]) T.sens.memory[slot]--;
+            }
+            decayClock_ = 0;
+        }
+        // the visual sensor's axis (FUN_10110460 asks the owner, vtable +0x214, for its view matrix; the test takes
+        // row 2): Biped / Frame / ChickenWalker / Mount / Infantry (FUN_100352c0) the "pov" frame (+0x11ec, found
+        // by FUN_10035460 / FUN_10040f70 / FUN_1006ee80), Hover (FUN_10068580, +0x10bc) and Jeep (FUN_10082040,
+        // +0x19c8) the "hp1" frame, else "pov", Turret and Plane (FUN_100ec100) their first weapon's mount
+        // (FUN_100efbe0; the port: the "hp1" hardpoint); without such a frame, the object's own matrix
+        Vec3 fwd = sensorAxis(vo);
+        auto mark = [&](Unit& T) { T.sens.memory[slot] = 15, T.sens.seenBy |= bit; };
+        for (auto& kv : units_) {  // no structured bindings: the lambdas below capture these (C++20 only)
+            const int to = kv.first;
+            Unit& T = kv.second;
+            if (to == vo || T.hp <= 0 || to < 0 || size_t(to) >= objs.size() || scene_->objectHidden(to) || !T.sens.havePos) continue;
+            Vec3 dv = T.sens.lastPos - vs.lastPos;
+            float d2 = std::max(1e-5f, dot(dv, dv));
+            if (d2 > vs.reach * vs.reach) continue;
+            auto& ts = T.sens;
+            const bool tUser = to == playerObject_, other = objs[size_t(to)].team != tv;
+            float c = concealment(to);
+            if (ts.active) c *= 0.5f;
+            c = std::max(0.f, c);
+            // visual (FUN_10110070), not while the user's radar is jammed
+            if (S >= -4 && !(vs.off & 1) && !(user && vs.jammed)) do {
+                if (user && (ts.seenBy & bit) && ts.memory[slot]) break;  // already on the user's scope
+                if (d2 > clip2) break;
+                float r = 0.75f * d2 / 160000.f, lt = user ? light : 0.f;
+                float fogT = user && fog && d2 > fogMin2 ? (d2 - fogMin2) * fogK * fogFar : 0.f;
+                float v = c + 0.1f + fogT;
+                bool seen = v <= 1.f - (r + lt);
+                if (!seen && S >= -3) { v = c + 2.5f * fogT; seen = v <= (1.f - r) - 0.1f; }              // +0x1d0
+                if (!seen && S >= -2) { v = c; seen = v <= (1.f - r) - (1.f - ts.det[0]); }              // IR/UV
+                if (!seen && S >= 1 && !(T.perks & 0x3c0000u)) {                                         // heat
+                    v = c + 1.5f * fogT;
+                    seen = v <= (1.f - r) - (1.f - ts.det[2]);
+                }
+                if (!seen) break;
+                // in front (45 degrees of the sensor's axis) and in sight
+                float dl = std::sqrt(d2);
+                static const int dbgVo = getenv("HG2_SENSVO") ? atoi(getenv("HG2_SENSVO")) : -2;
+                if (vo == dbgVo)
+                    SDL_Log("vis %d->%d d %.0f axis %.2f,%.2f,%.2f cone %.2f los %.2f", vo, to, dl, fwd.x, fwd.y, fwd.z, dot(dv * (1.f / dl), fwd),
+                            scene_->terrainRay(vs.lastPos + Vec3(0, 3, 0), ts.lastPos + Vec3(0, 3, 0)));
+                if (dot(dv * (1.f / dl), fwd) <= 0.707f) break;  // DAT_1014c780, the full 3D direction
+                if (scene_->terrainRay(vs.lastPos + Vec3(0, 3, 0), ts.lastPos + Vec3(0, 3, 0)) <= 0.98f) break;
+                float sig = 1.f - (r + lt);
+                ts.memory[slot] = 15;
+                if (!other) break;
+                if (ts.signal < sig) raise(ts, sig);
+                if (double(c) < ts.signal && d2 < (1.f - v) * 90000.f) ts.seenBy |= bit;
+            } while (false);
+            // ultrasonic / motion / magnetic (FUN_10110b60 / FUN_10110630 / FUN_101108b0), not while jammed
+            auto pick = [&](float sig, bool raiseIt) {
+                if (!vs.active && user) sig *= 0.5f;
+                sig = std::min(sig, 1.f);
+                if (other && ts.signal < sig && raiseIt) raise(ts, sig);
+                if (tUser) sig = float(ts.signal);
+                if (c <= sig) mark(T);
+            };
+            bool probe = vs.active || (ts.active && V.sensors <= T.sensors);
+            if (!vs.jammed && S >= 2 && !(vs.off & 2) && d2 < 10000.f && probe)
+                pick(sens01(0.05f * float(S) + 0.6f) * (1.f - d2 * 1e-4f) - (1.f - ts.det[5]), true);
+            if (!vs.jammed && S >= 3 && !(vs.off & 4) && d2 < 2500.f && ts.speed > 1e-5f)
+                pick(sens01(0.05f * float(S) + 0.65f) * (1.f - d2 * 0.0004f) - (1.f - ts.det[4]), vs.active);
+            if (!vs.jammed && S >= 5 && !(vs.off & 8) && d2 < 90000.f && probe)
+                pick(sens01(0.05f * float(S) + 0.75f) * (1.f - d2 / 90000.f) - (1.f - ts.det[5]), vs.active);
+            // the radar (FUN_101113e0): confirms a unit some sensor remembers but the team hasn't detected
+            if (S >= -1 && !(ts.seenBy & bit) && ts.memory[slot]) {
+                float sens = sens01(0.05f * float(S) + 0.45f);
+                float sig = (vs.active ? sens : 0.25f * sens) - d2 * 6.25e-6f;
+                float thr = (1.f - ts.det[1]) + c;
+                if (thr <= sig && ts.signal < sig) raise(ts, sig);
+                bool det = (tUser && double(thr) <= ts.signal) || thr < sig;
+                if (!det && S >= 4) {  // +0x755: a second look with a quarter of the concealment
+                    float t2 = (1.f - ts.det[1]) + 0.25f * c;
+                    if (user && fog && d2 > fogMin2) t2 += (d2 - fogMin2) * fogK * 3.f * fogFar;
+                    det = (tUser && double(t2) <= ts.signal) || t2 < sig;
+                }
+                if (det) ts.seenBy |= bit;
+            }
+        }
+    }
 }
 }  // namespace hg2
